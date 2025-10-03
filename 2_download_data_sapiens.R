@@ -20,7 +20,6 @@ message(paste0("OmicSignature results will be saved to: ", omic_signature_output
 # Data Retrieval using cellxgene.census
 # This ID refers to the entire Tabula Sapiens Human dataset, allowing us to subset by tissue later
 collection_id_all_tissues <- "e5f58829-1a66-40b5-a624-9046778e74f5"
-dataset_id_all_tissues <- "946fa48d-a0ac-4e5b-80fc-1d96cb5083a7" # Tabula Sapiens - All Tissues (H5AD)
 
 message("Opening Cellxgene Census SOMA connection...")
 # Specify the census_version as recommended for consistency
@@ -28,19 +27,54 @@ census_release_version <- "2025-01-30" # Update this if the stable release chang
 census <- cellxgene.census::open_soma(census_version = census_release_version)
 message(paste0("Opened Census connection for version: ", census_release_version))
 
-message(paste0("Fetching Tabula Sapiens 'All Tissues' dataset (ID: ", dataset_id_all_tissues, ") into a Seurat object. This may take some time and significant memory on the cluster."))
+# Find Census-internal dataset_ids for Tabula Sapiens
+message("\n--- Identifying Tabula Sapiens datasets within the Census ---")
+tabula_sapiens_census_dataset_ids <- NULL
+
+tryCatch({
+  # Get the 'datasets' table from census_info
+  # Call $read() to get the iterator, then $concat() to get an Arrow Table,
+  # then wrap with as.data.frame() to convert to an R data.frame.
+  census_datasets_metadata <- as.data.frame(census$get("census_info")$get("datasets")$read()$concat())
+  
+  # Filter for datasets whose `collection_id` matches the Tabula Sapiens one
+  tabula_sapiens_datasets <- census_datasets_metadata %>%
+    dplyr::filter(collection_id == collection_id_all_tissues)
+  
+  if (nrow(tabula_sapiens_datasets) > 0) {
+    tabula_sapiens_census_dataset_ids <- unique(tabula_sapiens_datasets$dataset_id)
+    message(paste0("Found ", length(tabula_sapiens_census_dataset_ids), " Census dataset_ids corresponding to Tabula Sapiens collection (", collection_id_all_tissues, ")."))
+    message("First 5 identified Census dataset_ids:")
+    print(head(tabula_sapiens_census_dataset_ids, 5))
+  } else {
+    message(paste0("No datasets found in Census 'datasets' table matching collection_id: ", collection_id_all_tissues))
+    message("This means the collection might not be directly represented by this collection_id in the Census 'datasets' table.")
+  }
+}, error = function(e) {
+  message(paste0("Error during Census 'datasets' metadata retrieval: ", e$message))
+})
+
+# Proceed only if Tabula Sapiens Census dataset IDs were found
+if (is.null(tabula_sapiens_census_dataset_ids) || length(tabula_sapiens_census_dataset_ids) == 0) {
+  stop("Could not identify Tabula Sapiens dataset IDs within the Census. Cannot proceed with data fetching.")
+}
+
+# Construct the obs_value_filter using the identified Census dataset_ids
+ts_filter_string <- paste0("dataset_id %in% c('", paste(tabula_sapiens_census_dataset_ids, collapse = "', '"), "')")
+message(paste0("\nUsing filter string to fetch Tabula Sapiens data: ", ts_filter_string))
+
+message(paste0("Fetching Tabula Sapiens 'All Tissues' dataset into a Seurat object. This may take some time and significant memory on the cluster."))
 
 
 
 
 
-# 2. Fetch data for the specific dataset_id directly into a Seurat object.
-# The `obs_value_filter` argument is used for filtering cells based on metadata.
+# 2. Fetch data using the corrected `obs_value_filter`
 tryCatch({
   seurat_obj <- cellxgene.census::get_seurat(
     census = census,
     organism = "Homo sapiens",
-    obs_value_filter = paste0("dataset_id == '", dataset_id_all_tissues, "'") # --- !!! CORRECTED ARGUMENT !!! ---
+    obs_value_filter = ts_filter_string
   )
   message("Successfully fetched Seurat object from Cellxgene Census.")
 }, error = function(e) {
@@ -49,7 +83,7 @@ tryCatch({
   sce_obj <- cellxgene.census::get_single_cell_experiment(
     census = census,
     organism = "Homo sapiens",
-    obs_value_filter = paste0("dataset_id == '", dataset_id_all_tissues, "'") # --- !!! CORRECTED ARGUMENT !!! ---
+    obs_value_filter = ts_filter_string
   )
   # Convert to Seurat if SCE was fetched successfully
   # Ensure the assay name is correct if not "counts"
