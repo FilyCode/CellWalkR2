@@ -31,7 +31,7 @@
 # Setup R Environment
 # --------------------------------------------------------------------------------
 echo "Loading R module..."
-module load R/4.3.1 
+module load R/4.4.0 
 
 # If you installed your R packages in a non-standard location and R can't find them,
 # you might need to uncomment and set this environment variable:
