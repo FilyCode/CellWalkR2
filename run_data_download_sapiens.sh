@@ -33,10 +33,6 @@
 echo "Loading R module..."
 module load R/4.4.0 
 
-# If you installed your R packages in a non-standard location and R can't find them,
-# you might need to uncomment and set this environment variable:
-# export R_LIBS_USER="/path/to/your/custom/R/library"
-
 # --------------------------------------------------------------------------------
 # Prepare Working Directory
 # --------------------------------------------------------------------------------
