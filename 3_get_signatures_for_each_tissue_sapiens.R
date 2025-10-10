@@ -8,7 +8,7 @@ library(SingleCellExperiment)
 library(MAST)             
 library(OmicSignature)    
 library(Biobase)
-
+library(doParallel)
 
 
 # --- Define Paths and Variables ---
@@ -27,7 +27,15 @@ min_genes_after_filter <- 10        # Minimum number of genes to proceed with MA
 adj_p_cutoff <- 0.05                # Adjusted p-value cutoff for significant genes in signature
 score_cutoff <- 0.25                # Absolute logFC cutoff for significant genes in signature
 
+# Determine number of CPU cores for parallel processing with MAST's zlm
+num_cores <- as.numeric(Sys.getenv("NSLOTS", unset = 1)) 
 
+if (num_cores > 1) {
+  registerDoParallel(cores = num_cores)
+  message(paste0("\n  Registered parallel backend for MAST zlm with ", num_cores, " cores."))
+} else {
+  message("\n  Running MAST zlm in serial mode (1 core).")
+}
 
 # --- Initialize an OmicSignatureCollection ---
 message("\n--- Initializing OmicSignatureCollection ---")
@@ -122,6 +130,9 @@ for (file_path in tissue_files) {
   }
   sce_tissue_filtered <- sce_tissue[expressed_genes, ]
   
+  # Ensure primerid (gene ID) and wellKey (cell ID) are explicitly defined for MAST, ensures meaningful IDs
+  rowData(sce_tissue_filtered)$primerid <- rownames(sce_tissue_filtered)
+  colData(sce_tissue_filtered)$wellKey <- colnames(sce_tissue_filtered)
   
   # --- Perform MAST Analysis and OmicSignature Creation ---
   message(paste0("  Running MAST for '", current_tissue_name, "' with ", nrow(sce_tissue_filtered), " genes and ", ncol(sce_tissue_filtered), " cells."))
