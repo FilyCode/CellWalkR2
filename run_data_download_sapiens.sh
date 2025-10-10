@@ -21,11 +21,11 @@
 # Your email address for notifications
 #$ -M phitro@bu.edu
 
-# Request 1 core for this single-threaded R script.
-#$ -pe omp 1
+# Request cores.
+#$ -pe omp 2
 
 # Request total memory for the job.
-#$ -l mem_total=120G
+#$ -l mem_total=60G
 
 # --------------------------------------------------------------------------------
 # Setup R Environment
@@ -50,7 +50,7 @@ echo "Job started on host: $(hostname)"
 echo "Requested CPU cores (NSLOTS): $NSLOTS" 
 
 # Execute your R script using Rscript
-Rscript 2_download_data_sapiens.R
+Rscript 2_download_data_tabula_sapiens.R
 
 # --------------------------------------------------------------------------------
 # Post-job Cleanup

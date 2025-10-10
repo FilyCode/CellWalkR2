@@ -1,5 +1,5 @@
 
-# Phase 2: Load Individual Tissue Files and Perform Aging Signature Analysis
+# Load Individual Tissue Files and Perform Aging Signature Analysis
 
 # 1. Setup and Load Libraries
 library(tidyverse)        
@@ -12,20 +12,20 @@ library(Biobase)
 
 
 # --- Define Paths and Variables ---
-data_output_path <- file.path("/restricted/projectnb/agedisease/projects/challenge2025/data/sapiens/")
-omic_signature_output_path <- file.path("/restricted/projectnb/agedisease/projects/challenge2025/results/sapiens/")
+data_input_path <- file.path("/restricted/projectnb/agedisease/projects/challenge2025/data/Tabula_sapiens_test/")
+omic_signature_output_path <- file.path("/restricted/projectnb/agedisease/projects/challenge2025/results/Tabula_sapiens_test/")
 
 dir.create(omic_signature_output_path, recursive = TRUE, showWarnings = FALSE)
-message(paste0("Input tissue Seurat objects expected from: ", data_output_path))
+message(paste0("Input tissue Seurat objects expected from: ", data_input_path))
 message(paste0("OmicSignature results will be saved to: ", omic_signature_output_path))
 
 
 # Define analysis parameters
-min_cells_per_tissue <- 100 # Minimum cells required for MAST per tissue
-min_expressed_gene_threshold <- 0.1 # Gene expressed in at least 10% of cells
-min_genes_after_filter <- 10 # Minimum number of genes to proceed with MAST
-adj_p_cutoff <- 0.05 # Adjusted p-value cutoff for significant genes in signature
-score_cutoff <- 0.25 # Absolute logFC cutoff for significant genes in signature
+min_cells_per_tissue <- 100         # Minimum cells required for MAST per tissue
+min_expressed_gene_threshold <- 0.1 # Gene expressed in at least x% of cells
+min_genes_after_filter <- 10        # Minimum number of genes to proceed with MAST
+adj_p_cutoff <- 0.05                # Adjusted p-value cutoff for significant genes in signature
+score_cutoff <- 0.25                # Absolute logFC cutoff for significant genes in signature
 
 
 
@@ -33,12 +33,14 @@ score_cutoff <- 0.25 # Absolute logFC cutoff for significant genes in signature
 message("\n--- Initializing OmicSignatureCollection ---")
 omicsig_collection_metadata <- OmicSignature::createMetadata(
   signature_name = "Tabula Sapiens Human Aging Signatures - All Tissues",
-  organism = "Homo Sapiens",
-  direction_type = "bi-directional",
+  organism = "Homo sapiens",
+  direction_type = "uni-directional",
   phenotype = "Aging",
-  description = paste0("Collection of aging signatures derived from Tabula Sapiens human single-cell RNA-seq data, stratified by tissue, adjusted for sex and donor_id (subject). ",
+  assay_type = "transcriptomics",
+  platform = "transcriptomics by single-cell RNA-seq",
+  description = paste0("Collection of aging signatures derived from Tabula Sapiens human single-cell RNA-seq data, stratified by tissue, adjusted for sex and donor_id. ",
                        "MAST analysis used, with min cells: ", min_cells_per_tissue, ", min expressed gene threshold: ", min_expressed_gene_threshold * 100, "%, adj. p-value cutoff: ", adj_p_cutoff, ", |logFC| cutoff: ", score_cutoff, "."),
-  author = "ChallengeProject2025",
+  author = "BU_Bioinformatics_ChallengeProject2025",
   year = as.numeric(format(Sys.Date(), "%Y")),
   keywords = c("Aging", "Tabula Sapiens", "single-cell", "MAST", "human", "sapiens")
 )
@@ -50,13 +52,13 @@ aging_signature_collection <- OmicSignatureCollection$new(
 
 
 # --- Get list of saved tissue files ---
-tissue_files <- list.files(data_output_path, pattern = "^tabula_sapiens_.*\\.rds$", full.names = TRUE)
+tissue_files <- list.files(data_input_path, pattern = "TabulaSapiens_.*\\.rds$", full.names = TRUE)
 if (length(tissue_files) == 0) {
-  stop("No tissue Seurat object files found in ", data_output_path, ". Please run 'fetch_and_split_tissues.R' first.")
+  stop("No tissue Seurat object files found in ", data_input_path, ".")
 }
 message(paste0("Found ", length(tissue_files), " tissue files to analyze."))
 
-
+tissue_files <- list("/restricted/projectnb/agedisease/projects/challenge2025/data/Tabula_sapiens_test/TabulaSapiens_abdominal aorta.rds")
 
 # --- Loop through individual tissue files and perform analysis ---
 for (file_path in tissue_files) {
