@@ -31,8 +31,10 @@ score_cutoff <- 0.25                # Absolute logFC cutoff for significant gene
 num_cores <- as.numeric(Sys.getenv("NSLOTS", unset = 1)) 
 
 if (num_cores > 1) {
+  options(mc.cores = num_cores) 
   registerDoParallel(cores = num_cores)
   message(paste0("\n  Registered parallel backend for MAST zlm with ", num_cores, " cores."))
+  message(paste0("  Explicitly set options(mc.cores = ", num_cores, ") for MAST::zlm."))
 } else {
   message("\n  Running MAST zlm in serial mode (1 core).")
 }
@@ -140,7 +142,7 @@ for (file_path in tissue_files) {
   tryCatch({
     sca_mast <- SceToSingleCellAssay(sce_tissue_filtered, class = "SingleCellAssay")
     # Fit the ZLM model: gene ~ age + sex + donor_id
-    zlm_obj <- zlm(~ age + sex + donor_id, sca = sca_mast, method = 'glm', ebayes = TRUE)
+    zlm_obj <- zlm(~ age + sex + donor_id, sca = sca_mast, method = 'glm', ebayes = TRUE, parallel = TRUE)
     results_table_mast <- MAST::as.data.frame(logFC(zlm_obj, contrasts = "age"))
     
     if (is.null(results_table_mast) || nrow(results_table_mast) == 0) {
