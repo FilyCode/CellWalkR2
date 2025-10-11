@@ -70,7 +70,7 @@ for(t in unique_tissues) {
   
   # Construct the filter string for fetching specific cells from the Census API
   obs_value_string <- sprintf(
-    'tissue == "%s" & is_primary_data == TRUE & dataset_id %%in%% c("%s")',
+    'tissue_general == "%s" & is_primary_data == TRUE & dataset_id %%in%% c("%s")',
     t,
     paste(tabula_sapiens_census_dataset_ids, collapse = '","')
   )
@@ -89,10 +89,12 @@ for(t in unique_tissues) {
   }, error = function(e) {
     message("  Error fetching Seurat object using get_seurat. Attempting to fetch as SingleCellExperiment and convert.")
     message("  Error details: ", e$message)
-    temp_sce_obj <- cellxgene.census::get_single_cell_experiment(
-      census = census,
-      organism = "Homo sapiens",
-      obs_value_filter = obs_value_string
+    temp_sce_obj <- NULL
+    tryCatch({ # Nested tryCatch for get_single_cell_experiment to catch potential issues there too
+      temp_sce_obj <- cellxgene.census::get_single_cell_experiment(
+        census = census,
+        organism = "Homo sapiens",
+        obs_value_filter = obs_value_string
     )
     # Included memory management, make sure the objects not needed anymore are cleared from memory
     on.exit({ if (!is.null(temp_sce_obj)) { rm(temp_sce_obj); gc() } }, add = TRUE)
