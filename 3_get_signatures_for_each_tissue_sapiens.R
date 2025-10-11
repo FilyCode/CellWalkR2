@@ -71,7 +71,7 @@ tissue_files <- list("/restricted/projectnb/agedisease/projects/challenge2025/da
 
 # --- Loop through individual tissue files and perform analysis ---
 for (file_path in tissue_files) {
-  current_tissue_name <- sub("^tabula_sapiens_|_\\.rds$", "", basename(file_path))
+  current_tissue_name <- gsub("_", " ", gsub("TabulaSapiens_|_organ|\\.rds$", "", basename(file_path))) # get tissue name out of file name
   message(paste0("\n--- Analyzing tissue from file: ", basename(file_path), " (", current_tissue_name, ") ---"))
   
   # Load the tissue-specific Seurat object
@@ -154,13 +154,23 @@ for (file_path in tissue_files) {
     
     # Filter for the 'age' coefficient from the continuous component ('C')
     # Then select and rename columns to match what OmicSignature expects
+    # The 'coef' column in results_table_mast_raw contains the logFC for each contrast.
+    # The 'Pr(>Chisq)' column is the p-value from the LRT.
     results_table_mast <- results_table_mast_raw %>%
-      dplyr::filter(component == 'C' & coef == 'age') %>%
+      dplyr::filter(component == 'C' & contrast == 'age') %>% # Filter for the 'age' contrast
       dplyr::select(
-        PrimerID = primerid, # 'primerid' is the gene ID from your SingleCellExperiment
-        logFC = `logFC`,     # 'logFC' is the coefficient for 'age'
-        Pvalue = `Pvalue`,
-        FDR = `FDR`
+        PrimerID = primerid,          # Use 'primerid' as the gene ID
+        logFC_val = coef,             # 'coef' column contains the logFC value
+        Pvalue_val = `Pr(>Chisq)`     # 'Pr(>Chisq)' column contains the p-value
+      ) %>%
+      dplyr::mutate(
+        FDR_val = p.adjust(Pvalue_val, method = "fdr") # Calculate FDR from Pvalue
+      ) %>%
+      dplyr::select(
+        PrimerID = PrimerID,
+        logFC = logFC_val,
+        Pvalue = Pvalue_val,
+        FDR = FDR_val
       )
     
     # Now, the 'results_table_mast' will be correctly populated for the 'if' condition check
@@ -182,18 +192,52 @@ for (file_path in tissue_files) {
         dplyr::select(probe_id, feature_name, score, p_value, adj_p) %>%
         dplyr::mutate(
           # Define group_label for bi-directional signature (required by OmicSignature)
-          group_label = ifelse(score > 0, "Increased_with_Age", "Decreased_with_Age")
+          group_label = as.factor(ifelse(score > 0, "Increased_with_Age", "Decreased_with_Age"))
         )
+      
+      
+      # --- Automated BRENDA ontology lookup for sample_type ---
+      found_sample_type <- NULL
+      
+      # Perform a broad search for the current tissue name (case-insensitive)
+      brenda_results_all <- OmicSignature::searchSampleType(current_tissue_name, contain_all = FALSE)
+      
+      if (nrow(brenda_results_all) > 0) {
+        # If a direct "<tissue_name> tissue" match is found, use it.
+        found_sample_type <- brenda_results_all$Name[1]
+      } else {
+        # 2. If no direct match, perform a broader search for the tissue name.
+        brenda_results_broad <- OmicSignature::searchSampleType(current_tissue_name, contain_all = FALSE)
+        
+        if (nrow(brenda_results_broad) > 0) {
+          # If broad results are found, prioritize by the fewest words.
+          # We'll add a word count column and sort by it.
+          brenda_results_broad <- brenda_results_broad %>%
+            dplyr::mutate(word_count = sapply(strsplit(Name, "\\s+"), length)) %>%
+            dplyr::arrange(word_count) # Sort by least words first
+          
+          found_sample_type <- brenda_results_broad$Name[1] # Pick the one with the fewest words
+        }
+      }
+      
+      
+      if (is.null(found_sample_type)) {
+        # Fallback if no BRENDA terms were found at all
+        found_sample_type <- paste0(current_tissue_name, " cells")
+        message(paste0("  Warning: No suitable BRENDA ontology term found for '", current_tissue_name, "'. Using '", found_sample_type, "'."))
+      }
+      
       
       # Define metadata for the tissue-specific signature
       metadata_tissue_sig <- OmicSignature::createMetadata(
         signature_name = paste0("Aging Signature - ", current_tissue_name),
-        organism = "Homo Sapiens",
+        organism = "Homo sapiens",
         direction_type = "bi-directional",
         phenotype = paste0("Aging in ", current_tissue_name),
+        assay_type = "transcriptomics",
         covariates = "sex, donor_id",
-        platform = "Single-cell RNA-seq (cellxgene.census/Tabula Sapiens)",
-        sample_type = paste0(current_tissue_name, " cells"),
+        platform = "transcriptomics by single-cell RNA-seq",
+        sample_type = found_sample_type,
         adj_p_cutoff = adj_p_cutoff,
         score_cutoff = score_cutoff,
         keywords = c("Aging", current_tissue_name, "Tabula Sapiens", "single-cell", "MAST"),
