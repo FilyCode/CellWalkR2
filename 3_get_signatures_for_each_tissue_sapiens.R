@@ -155,6 +155,28 @@ for (file_path in tissue_files) {
   rowData(sce_tissue_filtered)$primerid <- rownames(sce_tissue_filtered)
   colData(sce_tissue_filtered)$wellKey <- colnames(sce_tissue_filtered)
   
+  # --- DEBUGGING CHECKS FOR DIMNAMES ERROR ---
+  # These checks help ensure consistency before MAST conversion
+  message(paste0("  DEBUG: Dimensions of sce_tissue_filtered: ", paste(dim(sce_tissue_filtered), collapse = "x")))
+  message(paste0("  DEBUG: Length of rownames(sce_tissue_filtered): ", length(rownames(sce_tissue_filtered))))
+  message(paste0("  DEBUG: Length of rowData(sce_tissue_filtered)$primerid: ", length(rowData(sce_tissue_filtered)$primerid)))
+  message(paste0("  DEBUG: Length of colnames(sce_tissue_filtered): ", length(colnames(sce_tissue_filtered))))
+  message(paste0("  DEBUG: Length of colData(sce_tissue_filtered)$wellKey: ", length(colData(sce_tissue_filtered)$wellKey)))
+  
+  if (!identical(length(rownames(sce_tissue_filtered)), length(rowData(sce_tissue_filtered)$primerid))) {
+    stop(paste0("DEBUG ERROR (", current_tissue_name, "): Rownames length (", length(rownames(sce_tissue_filtered)), ") does not match primerid length (", length(rowData(sce_tissue_filtered)$primerid), ")!"))
+  }
+  if (!identical(length(colnames(sce_tissue_filtered)), length(colData(sce_tissue_filtered)$wellKey))) {
+    stop(paste0("DEBUG ERROR (", current_tissue_name, "): Colnames length (", length(colnames(sce_tissue_filtered)), ") does not match wellKey length (", length(colData(sce_tissue_filtered)$wellKey), ")!"))
+  }
+  if (any(nchar(rownames(sce_tissue_filtered)) == 0)) {
+    stop(paste0("DEBUG ERROR (", current_tissue_name, "): Rownames contain empty strings!"))
+  }
+  if (any(is.na(rowData(sce_tissue_filtered)$primerid))) {
+    stop(paste0("DEBUG ERROR (", current_tissue_name, "): primerid contains NA values!"))
+  }
+  # --- END DEBUGGING CHECKS ---
+  
   # --- Perform MAST Analysis and OmicSignature Creation ---
   message(paste0("  Running MAST for '", current_tissue_name, "' with ", nrow(sce_tissue_filtered), " genes and ", ncol(sce_tissue_filtered), " cells."))
   
