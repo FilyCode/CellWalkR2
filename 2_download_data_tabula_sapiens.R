@@ -49,14 +49,14 @@ human_obs <- census$get("census_data")$get("homo_sapiens")$obs
 # Read only metadata columns to get all unique specific tissue names within Tabula Sapiens collection
 obs_df <- human_obs$read()$concat() |>
   as.data.frame() |>
-  dplyr::select(dataset_id, tissue) # Extract dataset_id and tissue
+  dplyr::select(dataset_id, tissue_general) # Extract dataset_id and tissue_general
 
 message("\nFiltering target dataset for Tabula Sapiens collection...")
 obs_tabula <- obs_df |> filter(dataset_id %in% tabula_sapiens_census_dataset_ids)
 
 message("\nExtracting unique specific tissues in the Tabula Sapiens collection...")
 # List all available specific tissues within the Tabula Sapiens collection
-unique_tissues <- sort(unique(obs_tabula$tissue))
+unique_tissues <- sort(unique(obs_tabula$tissue_general))
 message(paste0("Found ", length(unique_tissues), " unique specific tissues in Tabula Sapiens collection:"))
 print(unique_tissues)
 
