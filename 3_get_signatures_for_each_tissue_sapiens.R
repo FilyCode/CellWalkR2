@@ -143,8 +143,27 @@ for (file_path in tissue_files) {
     sca_mast <- SceToSingleCellAssay(sce_tissue_filtered, class = "SingleCellAssay")
     # Fit the ZLM model: gene ~ age + sex + donor_id
     zlm_obj <- zlm(~ age + sex + donor_id, sca = sca_mast, method = 'glm', ebayes = TRUE, parallel = TRUE)
-    results_table_mast <- MAST::as.data.frame(logFC(zlm_obj, contrasts = "age"))
     
+    # Get summary results for the 'age' coefficient using doLRT
+    # This performs a Likelihood Ratio Test for the 'age' variable
+    summary_age_results <- summary(zlm_obj, doLRT = "age")
+    
+    # Extract the datatable, which contains the results for each coefficient
+    # This table has columns like 'primerid', 'component', 'coef', 'logFC', 'Pvalue', 'FDR'
+    results_table_mast_raw <- summary_age_results$datatable
+    
+    # Filter for the 'age' coefficient from the continuous component ('C')
+    # Then select and rename columns to match what OmicSignature expects
+    results_table_mast <- results_table_mast_raw %>%
+      dplyr::filter(component == 'C' & coef == 'age') %>%
+      dplyr::select(
+        PrimerID = primerid, # 'primerid' is the gene ID from your SingleCellExperiment
+        logFC = `logFC`,     # 'logFC' is the coefficient for 'age'
+        Pvalue = `Pvalue`,
+        FDR = `FDR`
+      )
+    
+    # Now, the 'results_table_mast' will be correctly populated for the 'if' condition check
     if (is.null(results_table_mast) || nrow(results_table_mast) == 0) {
       message(paste0("  No differential expression results found for 'age' in tissue: ", current_tissue_name))
       # Skip to cleanup and next file
