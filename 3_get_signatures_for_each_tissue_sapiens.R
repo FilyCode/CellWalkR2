@@ -81,15 +81,35 @@ for (file_path in tissue_files) {
   # Explicitly ensure the 'data' slot (log-normalized counts, typically used by MAST) is sparse 
   # before converting to SingleCellExperiment. This prevents large memory allocations.
   if ("RNA" %in% names(tissue_seurat@assays)) {
-    if ("data" %in% names(tissue_seurat@assays$RNA) && !inherits(Seurat::GetAssayData(tissue_seurat, slot = "data", assay = "RNA"), "Matrix")) {
-      message(paste0("  Converting 'data' assay (logcounts) for '", current_tissue_name, "' to sparse matrix to save memory."))
-      tissue_seurat@assays$RNA@data <- Matrix::Matrix(Seurat::GetAssayData(tissue_seurat, slot = "data", assay = "RNA"), sparse = TRUE)
-    } else if (!("data" %in% names(tissue_seurat@assays$RNA))) {
-      message(paste0("  Warning: 'data' assay slot not found in Seurat object for '", current_tissue_name, "'. Check Seurat object structure."))
+    # Attempt to retrieve the 'data' slot (log-normalized data) safely
+    current_data_matrix <- tryCatch(
+      expr = Seurat::GetAssayData(tissue_seurat, slot = "data", assay = "RNA"),
+      error = function(e) {
+        # If GetAssayData errors, it means the slot is likely missing or inaccessible.
+        message(paste0("  Warning: Could not access 'data' slot from 'RNA' assay for '", current_tissue_name, "'. This may indicate missing normalized data. Error: ", e$message))
+        return(NULL) # Return NULL to indicate failure to retrieve data
+      }
+    )
+    
+    # Check if data matrix was successfully retrieved and is not empty
+    if (!is.null(current_data_matrix) && prod(dim(current_data_matrix)) > 0) {
+      # Check if it's currently a dense matrix (i.e., not inheriting from a sparse matrix class)
+      if (!inherits(current_data_matrix, "sparseMatrix")) {
+        message(paste0("  Converting 'data' assay (logcounts) for '", current_tissue_name, "' to sparse matrix to save memory."))
+        # Assign the sparse version back to the Seurat object's data slot
+        tissue_seurat@assays$RNA@data <- Matrix::Matrix(current_data_matrix, sparse = TRUE)
+      } else {
+        message(paste0("  'data' assay (logcounts) for '", current_tissue_name, "' is already sparse. No conversion needed."))
+      }
+    } else {
+      # This 'else' block means current_data_matrix was NULL (from tryCatch error) or empty.
+      # This is the correct place to issue a warning if 'data' is truly missing or empty.
+      message(paste0("  Warning: 'data' slot in 'RNA' assay is missing or empty for '", current_tissue_name, "'. Skipping sparse conversion check. Please ensure data is normalized before analysis."))
     }
   } else {
-    message(paste0("  Warning: 'RNA' assay not found in Seurat object for '", current_tissue_name, "'. Check Seurat object structure."))
+    message(paste0("  Warning: 'RNA' assay not found in Seurat object for '", current_tissue_name, "'. Skipping sparse conversion check. Please ensure 'RNA' assay exists."))
   }
+  
   
   # Ensure the object is not empty after loading (shouldn't be if saved correctly)
   if (ncol(tissue_seurat) == 0) {
