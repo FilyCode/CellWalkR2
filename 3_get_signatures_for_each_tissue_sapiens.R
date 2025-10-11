@@ -9,6 +9,7 @@ library(MAST)
 library(OmicSignature)    
 library(Biobase)
 library(doParallel)
+library(Matrix)
 
 
 # --- Define Paths and Variables ---
@@ -77,12 +78,30 @@ for (file_path in tissue_files) {
   # Load the tissue-specific Seurat object
   tissue_seurat <- readRDS(file_path)
   
+  # Explicitly ensure the 'data' slot (log-normalized counts, typically used by MAST) is sparse 
+  # before converting to SingleCellExperiment. This prevents large memory allocations.
+  if ("RNA" %in% names(tissue_seurat@assays)) {
+    if ("data" %in% names(tissue_seurat@assays$RNA) && !inherits(Seurat::GetAssayData(tissue_seurat, slot = "data", assay = "RNA"), "Matrix")) {
+      message(paste0("  Converting 'data' assay (logcounts) for '", current_tissue_name, "' to sparse matrix to save memory."))
+      tissue_seurat@assays$RNA@data <- Matrix::Matrix(Seurat::GetAssayData(tissue_seurat, slot = "data", assay = "RNA"), sparse = TRUE)
+    } else if (!("data" %in% names(tissue_seurat@assays$RNA))) {
+      message(paste0("  Warning: 'data' assay slot not found in Seurat object for '", current_tissue_name, "'. Check Seurat object structure."))
+    }
+  } else {
+    message(paste0("  Warning: 'RNA' assay not found in Seurat object for '", current_tissue_name, "'. Check Seurat object structure."))
+  }
+  
   # Ensure the object is not empty after loading (shouldn't be if saved correctly)
   if (ncol(tissue_seurat) == 0) {
     message(paste0("  Skipping '", current_tissue_name, "': loaded object is empty."))
     rm(tissue_seurat); gc(); next
   }
   
+  # Ensure the object is not empty after loading (shouldn't be if saved correctly)
+  if (ncol(tissue_seurat) == 0) {
+    message(paste0("  Skipping '", current_tissue_name, "': loaded object is empty."))
+    rm(tissue_seurat); gc(); next
+  }
   
   
   # --- Data Checks for MAST ---
