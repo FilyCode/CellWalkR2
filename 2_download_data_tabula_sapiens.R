@@ -89,24 +89,29 @@ for(t in unique_tissues) {
   }, error = function(e) {
     message("  Error fetching Seurat object using get_seurat. Attempting to fetch as SingleCellExperiment and convert.")
     message("  Error details: ", e$message)
-    temp_sce_obj <- NULL
+    temp_sce_obj <- NULL # Initialize to NULL
     tryCatch({ # Nested tryCatch for get_single_cell_experiment to catch potential issues there too
       temp_sce_obj <- cellxgene.census::get_single_cell_experiment(
         census = census,
         organism = "Homo sapiens",
         obs_value_filter = obs_value_string
-    )
-    # Included memory management, make sure the objects not needed anymore are cleared from memory
-    on.exit({ if (!is.null(temp_sce_obj)) { rm(temp_sce_obj); gc() } }, add = TRUE)
-    
-    # Check if SCE object has data before converting
-    if (is.null(temp_sce_obj) || ncol(temp_sce_obj) == 0) {
-      message("  No cells retrieved with SingleCellExperiment either. Skipping this tissue.")
-      return(NULL) # Skip to next iteration, as this block is inside a tryCatch
-    }
-    seu_tissue <- as.Seurat(temp_sce_obj, counts = "counts", data = "logcounts")
-    message(paste0("  Successfully converted SingleCellExperiment to Seurat object (", ncol(seu_tissue), " cells)."))
-    rm(temp_sce_obj); gc() # Clear memory
+      )
+      # Included memory management, make sure the objects not needed anymore are cleared from memory
+      on.exit({ if (!is.null(temp_sce_obj)) { rm(temp_sce_obj); gc() } }, add = TRUE)
+      
+      # Check if SCE object has data before converting
+      if (is.null(temp_sce_obj) || ncol(temp_sce_obj) == 0) {
+        message("  No cells retrieved with SingleCellExperiment either. Skipping this tissue.")
+        return(NULL) # Skip to next iteration, as this block is inside a tryCatch
+      }
+      seu_tissue <- as.Seurat(temp_sce_obj, counts = "counts", data = "logcounts")
+      message(paste0("  Successfully converted SingleCellExperiment to Seurat object (", ncol(seu_tissue), " cells)."))
+      rm(temp_sce_obj); gc() # Clear memory
+    }, error = function(sce_e) {
+      message(paste0("  Error fetching with SingleCellExperiment for tissue '", t, "': ", sce_e$message))
+      message("  Skipping this tissue.")
+      return(NULL) # Ensures seu_tissue remains NULL or invalid to be caught by next check
+    })
   })
   
   # Skip if no Seurat object was successfully created or it's empty
