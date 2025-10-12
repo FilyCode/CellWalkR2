@@ -98,6 +98,9 @@ if (length(tissue_files) == 0) {
 }
 message(paste0("Found ", length(tissue_files), " tissue files to analyze."))
 
+
+
+
 # --- Loop through individual tissue files and perform analysis (Parallelized with foreach) ---
 # Each iteration of this loop runs on a separate worker in parallel.
 all_tissue_results <- foreach(file_path = tissue_files, 
