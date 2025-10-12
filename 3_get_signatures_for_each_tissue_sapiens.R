@@ -68,8 +68,6 @@ if (length(tissue_files) == 0) {
 }
 message(paste0("Found ", length(tissue_files), " tissue files to analyze."))
 
-tissue_files <- list("/restricted/projectnb/agedisease/projects/challenge2025/data/Tabula_sapiens/TabulaSapiens_bladder_organ.rds")
-
 # --- Loop through individual tissue files and perform analysis ---
 for (file_path in tissue_files) {
   current_tissue_name <- gsub("_", " ", gsub("TabulaSapiens_|_organ|\\.rds$", "", basename(file_path))) # get tissue name out of file name
@@ -78,15 +76,15 @@ for (file_path in tissue_files) {
   # Load the tissue-specific Seurat object
   tissue_seurat <- readRDS(file_path)
   
-  # Explicitly ensure the 'data' slot (log-normalized counts, typically used by MAST) is sparse 
+  # Explicitly ensure the 'data' layer (log-normalized counts, typically used by MAST) is sparse 
   # before converting to SingleCellExperiment. This prevents large memory allocations.
   if ("RNA" %in% names(tissue_seurat@assays)) {
-    # Attempt to retrieve the 'data' slot (log-normalized data) safely
+    # Attempt to retrieve the 'data' layer (log-normalized data) safely
     current_data_matrix <- tryCatch(
-      expr = Seurat::GetAssayData(tissue_seurat, slot = "data", assay = "RNA"),
+      expr = Seurat::GetAssayData(tissue_seurat, layer = "data", assay = "RNA"),
       error = function(e) {
-        # If GetAssayData errors, it means the slot is likely missing or inaccessible.
-        message(paste0("  Warning: Could not access 'data' slot from 'RNA' assay for '", current_tissue_name, "'. This may indicate missing normalized data. Error: ", e$message))
+        # If GetAssayData errors, it means the layer is likely missing or inaccessible.
+        message(paste0("  Warning: Could not access 'data' layer from 'RNA' assay for '", current_tissue_name, "'. This may indicate missing normalized data. Error: ", e$message))
         return(NULL) # Return NULL to indicate failure to retrieve data
       }
     )
@@ -96,7 +94,7 @@ for (file_path in tissue_files) {
       # Check if it's currently a dense matrix (i.e., not inheriting from a sparse matrix class)
       if (!inherits(current_data_matrix, "sparseMatrix")) {
         message(paste0("  Converting 'data' assay (logcounts) for '", current_tissue_name, "' to sparse matrix to save memory."))
-        # Assign the sparse version back to the Seurat object's data slot
+        # Assign the sparse version back to the Seurat object's data layer
         tissue_seurat@assays$RNA@data <- Matrix::Matrix(current_data_matrix, sparse = TRUE)
       } else {
         message(paste0("  'data' assay (logcounts) for '", current_tissue_name, "' is already sparse. No conversion needed."))
@@ -104,7 +102,7 @@ for (file_path in tissue_files) {
     } else {
       # This 'else' block means current_data_matrix was NULL (from tryCatch error) or empty.
       # This is the correct place to issue a warning if 'data' is truly missing or empty.
-      message(paste0("  Warning: 'data' slot in 'RNA' assay is missing or empty for '", current_tissue_name, "'. Skipping sparse conversion check. Please ensure data is normalized before analysis."))
+      message(paste0("  Warning: 'data' layer in 'RNA' assay is missing or empty for '", current_tissue_name, "'. Skipping sparse conversion check. Please ensure data is normalized before analysis."))
     }
   } else {
     message(paste0("  Warning: 'RNA' assay not found in Seurat object for '", current_tissue_name, "'. Skipping sparse conversion check. Please ensure 'RNA' assay exists."))
@@ -201,7 +199,23 @@ for (file_path in tissue_files) {
   message(paste0("  Running MAST for '", current_tissue_name, "' with ", nrow(sce_tissue_filtered), " genes and ", ncol(sce_tissue_filtered), " cells."))
   
   tryCatch({
+    # Diagnostic check for sparse/dense matrix before SceToSingleCellAssay
+    if (inherits(assay(sce_tissue_filtered, "logcounts"), "sparseMatrix")) {
+      message(paste0("  DEBUG: 'logcounts' assay in sce_tissue_filtered is sparse before SceToSingleCellAssay."))
+    } else {
+      message(paste0("  DEBUG: 'logcounts' assay in sce_tissue_filtered is dense before SceToSingleCellAssay. This might trigger coercion."))
+    }
+    
+    
     sca_mast <- SceToSingleCellAssay(sce_tissue_filtered, class = "SingleCellAssay")
+    
+    # Diagnostic check if the SingleCellAssay object's assayData is sparse
+    if (inherits(assay(sca_mast, "logcounts"), "sparseMatrix")) {
+      message(paste0("  DEBUG: 'logcounts' assay in sca_mast is sparse after SceToSingleCellAssay."))
+    } else {
+      message(paste0("  DEBUG: 'logcounts' assay in sca_mast is dense after SceToSingleCellAssay. This is where dense conversion for MAST occurs."))
+    }
+    
     # Fit the ZLM model: gene ~ age + sex + donor_id
     zlm_obj <- zlm(~ age + sex + donor_id, sca = sca_mast, method = 'glm', ebayes = TRUE, parallel = TRUE)
     
