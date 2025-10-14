@@ -14,7 +14,7 @@ library(Matrix)     # Required for efficient sparse matrix operations
 
 
 # --- Define Paths and Variables ---
-data_input_path <- file.path("/restricted/projectnb/agedisease/projects/challenge2025/data/Tabula_sapiens/")
+data_input_path <- file.path("/restricted/projectnb/agedisease/projects/challenge2025/data/Tabula_sapiens")
 omic_signature_output_path <- file.path("/restricted/projectnb/agedisease/projects/challenge2025/results/Tabula_sapiens/")
 
 dir.create(omic_signature_output_path, recursive = TRUE, showWarnings = FALSE)
@@ -39,7 +39,7 @@ sge_total_slots <- as.numeric(Sys.getenv("NSLOTS", unset = 1)) # Get total CPU s
 
 # Number of tissue analyses to run concurrently (outer loop parallelization).
 # This divides the total SGE slots into independent parallel tasks.
-n_concurrent_tissues <- 4
+n_concurrent_tissues <- 1
 
 # Number of CPU cores for MAST zlm to use within each concurrent tissue analysis.
 # This ensures each individual MAST run gets a dedicated set of cores.
