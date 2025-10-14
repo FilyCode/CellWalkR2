@@ -313,11 +313,30 @@ all_tissue_results <- foreach(file_path = tissue_files,
                                       dplyr::filter(adj_p <= adj_p_cutoff & abs(score) >= score_cutoff) %>%
                                       dplyr::select(probe_id, feature_name, score, group_label)
                                     
+                                    # --- START CHANGE for "No Significant Genes" ---
                                     if (nrow(sig_genes) == 0) {
-                                      message_to_worker_log(paste0("  No significant genes found for 'age' in tissue: ", current_tissue_name, " with current cutoffs (adj_p <= ", adj_p_cutoff, ", |logFC| >= ", score_cutoff, ")."))
-                                      worker_result$status <<- "Skipped_NoSignificantGenes"
-                                      stop("ControlledExit") 
+                                      message_to_worker_log(paste0("  No significant genes found for 'age' in tissue: ", current_tissue_name, " with current cutoffs (adj_p <= ", adj_p_cutoff, ", |logFC| >= ", score_cutoff, "). Creating empty OmicSignature object."))
+                                      
+                                      # Create an empty signature data frame with correct columns and factor levels
+                                      empty_sig_genes_df <- data.frame(
+                                        probe_id = character(0), 
+                                        feature_name = character(0), 
+                                        score = numeric(0), 
+                                        group_label = factor(levels=c("Increased_with_Age", "Decreased_with_Age"))
+                                      )
+                                      
+                                      omic_sig_object_local <- OmicSignature$new( 
+                                        metadata = metadata_tissue_sig,
+                                        signature = empty_sig_genes_df, # Use the empty data frame
+                                        difexp = results_table_omic # Still store the full diff exp results
+                                      )
+                                      
+                                      worker_result$omicSig <<- omic_sig_object_local 
+                                      worker_result$status <<- "No_Significant_Genes_Found" # New status
+                                      
+                                      # DO NOT stop("ControlledExit") here. Let it flow to the end.
                                     } else {
+                                      # This block handles cases where significant genes ARE found
                                       omic_sig_object_local <- OmicSignature$new( 
                                         metadata = metadata_tissue_sig,
                                         signature = sig_genes,
@@ -330,6 +349,7 @@ all_tissue_results <- foreach(file_path = tissue_files,
                                       worker_result$omicSig <<- omic_sig_object_local 
                                       worker_result$status <<- "Success"
                                     }
+                                    # --- END CHANGE ---
                                   } 
                                 }, error = function(e) {
                                   if (grepl("ControlledExit", e$message)) {
@@ -373,7 +393,9 @@ for (worker_res in all_tissue_results) { # worker_res is now the structured list
   }
   
   # If an OmicSignature object was successfully generated, add it to the main collection list
-  if (!is.null(worker_res$omicSig) && !is.null(worker_res$tissueName)) {
+  # This check now relies on worker_res$omicSig being an OmicSignature object (even an empty one)
+  # instead of checking for NULL. It implicitly handles NULL for other skipped/error states.
+  if (inherits(worker_res$omicSig, "OmicSignature") && !is.null(worker_res$tissueName)) {
     all_tissue_omicsigs[[worker_res$tissueName]] <- worker_res$omicSig
   }
   
