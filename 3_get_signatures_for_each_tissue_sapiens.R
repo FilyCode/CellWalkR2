@@ -424,11 +424,10 @@ all_tissue_results <- foreach(file_path = tissue_files,
                                   cat(error_message, file = worker_log_file, append = TRUE) # Write to worker log file for immediate visibility
                                   return(list(omicSig = NULL, tissueName = current_tissue_name, status = "Error")) 
                                 }, warning = function(w) {
-                                  # Catches warnings. `invokeRestart("muffleWarning")` prevents it from showing up twice.
+                                  # Catches warnings.
                                   warning_message <- paste0(Sys.time(), "  WARNING: for tissue '", current_tissue_name, "': ", w$message, "\n")
                                   message(warning_message) # This message goes into `captured_output_string`
                                   cat(warning_message, file = worker_log_file, append = TRUE) # Write to worker log file for immediate visibility
-                                  invokeRestart("muffleWarning") # Prevents the warning from being printed to stderr after capture
                                   # Warnings do not typically stop processing, so we don't return here unless it's a critical warning.
                                   # If the warning is critical enough to stop, uncomment `stop(w)`
                                 }) 
