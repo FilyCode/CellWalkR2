@@ -25,7 +25,7 @@
 #$ -pe omp 8
 
 # Request total memory for the job.
-#$ -l mem_total=400G
+#$ -l mem_total=500G
 
 # --------------------------------------------------------------------------------
 # Setup R Environment
