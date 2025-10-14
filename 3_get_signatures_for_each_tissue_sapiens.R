@@ -210,6 +210,10 @@ all_tissue_results <- foreach(file_path = tissue_files,
                                   cat(paste0(Sys.time(), " [PROGRESS] Converting to SingleCellExperiment for ", current_tissue_name, ".\n"), file = worker_log_file, append = TRUE)
                                   sce_tissue <- as.SingleCellExperiment(tissue_seurat, assay = "RNA")
                                   
+                                  # MEMORY OPTIMIZATION: Remove the original Seurat object as it's no longer needed
+                                  rm(tissue_seurat)
+                                  gc(verbose = FALSE) # Force garbage collection
+                                  
                                   # Drop unused factor levels to prevent issues in downstream models.
                                   colData(sce_tissue)$donor_id <- droplevels(colData(sce_tissue)$donor_id)
                                   colData(sce_tissue)$sex <- droplevels(colData(sce_tissue)$sex)
@@ -241,6 +245,10 @@ all_tissue_results <- foreach(file_path = tissue_files,
                                     return(list(omicSig = NULL, tissueName = current_tissue_name, status = "Skipped_InsufficientGenes"))
                                   }
                                   sce_tissue_filtered <- sce_tissue[expressed_genes, ]
+                                  
+                                  # MEMORY OPTIMIZATION: Remove the unfiltered SCE object
+                                  rm(sce_tissue)
+                                  gc(verbose = FALSE) 
                                   
                                   # Explicitly define primerid (gene ID) and wellKey (cell ID) for MAST.
                                   rowData(sce_tissue_filtered)$primerid <- rownames(sce_tissue_filtered)
@@ -279,6 +287,10 @@ all_tissue_results <- foreach(file_path = tissue_files,
                                   
                                   sca_mast <- SceToSingleCellAssay(sce_tissue_filtered, class = "SingleCellAssay")
                                   
+                                  # MEMORY OPTIMIZATION: Remove the filtered SCE object after conversion to SCA
+                                  rm(sce_tissue_filtered)
+                                  gc(verbose = FALSE) 
+                                  
                                   # Confirm sparsity after conversion to SingleCellAssay.
                                   if (inherits(assay(sca_mast, "logcounts"), "sparseMatrix")) {
                                     message(paste0("  DEBUG: 'logcounts' assay in sca_mast is sparse after SceToSingleCellAssay."))
@@ -290,9 +302,17 @@ all_tissue_results <- foreach(file_path = tissue_files,
                                   # 'parallel = TRUE' tells MAST to use the cores set by options(mc.cores) for this worker.
                                   zlm_obj <- zlm(~ age + sex + donor_id, sca = sca_mast, method = 'glm', ebayes = TRUE, parallel = TRUE) 
                                   
+                                  # MEMORY OPTIMIZATION: Remove the SingleCellAssay object now that the model is fit
+                                  rm(sca_mast)
+                                  gc(verbose = FALSE)
+                                  
                                   # Get summary results for the 'age' coefficient using a Likelihood Ratio Test (doLRT).
                                   summary_age_results <- summary(zlm_obj, doLRT = "age")
                                   results_table_mast_raw <- summary_age_results$datatable
+                                  
+                                  # MEMORY OPTIMIZATION: Remove the zlm_obj now that summary is extracted
+                                  rm(zlm_obj)
+                                  gc(verbose = FALSE)
                                   
                                   # Filter for the 'age' contrast and calculate FDR.
                                   results_table_mast <- results_table_mast_raw %>%
@@ -306,6 +326,10 @@ all_tissue_results <- foreach(file_path = tissue_files,
                                     dplyr::select(
                                       PrimerID = PrimerID, logFC = logFC_val, Pvalue = Pvalue_val, FDR = FDR_val
                                     )
+                                  
+                                  # MEMORY OPTIMIZATION: Remove the raw MAST results table
+                                  rm(results_table_mast_raw)
+                                  gc(verbose = FALSE)
                                   
                                   # Skip if no differential expression results found for 'age'.
                                   if (is.null(results_table_mast) || nrow(results_table_mast) == 0) {
@@ -324,6 +348,10 @@ all_tissue_results <- foreach(file_path = tissue_files,
                                         # Define group_label for bi-directional signature (required by OmicSignature).
                                         group_label = as.factor(ifelse(score > 0, "Increased_with_Age", "Decreased_with_Age"))
                                       )
+                                    
+                                    # MEMORY OPTIMIZATION: Remove results_table_mast
+                                    rm(results_table_mast)
+                                    gc(verbose = FALSE)
                                     
                                     # --- Automated BRENDA ontology lookup for sample_type ---
                                     found_sample_type <- NULL
@@ -363,6 +391,9 @@ all_tissue_results <- foreach(file_path = tissue_files,
                                     # Skip if no significant genes found after filtering.
                                     if (nrow(sig_genes) == 0) {
                                       message(paste0("  No significant genes found for 'age' in tissue: ", current_tissue_name, " with current cutoffs (adj_p <= ", adj_p_cutoff, ", |logFC| >= ", score_cutoff, ")."))
+                                      # MEMORY OPTIMIZATION: Remove results_table_omic before returning NULL
+                                      rm(results_table_omic)
+                                      gc(verbose = FALSE)
                                       # --- Early Exit Point ---
                                       return(list(omicSig = NULL, tissueName = current_tissue_name, status = "Skipped_NoSignificantGenes"))
                                     } else {
@@ -372,6 +403,11 @@ all_tissue_results <- foreach(file_path = tissue_files,
                                         signature = sig_genes,
                                         difexp = results_table_omic # Store the full differential expression results
                                       )
+                                      
+                                      # MEMORY OPTIMIZATION: results_table_omic and sig_genes are now inside omic_sig_object
+                                      # so they can be removed if they are not needed as separate objects
+                                      rm(results_table_omic, sig_genes)
+                                      gc(verbose = FALSE)
                                       
                                       # Save individual OmicSignature object (for easier access) within each worker.
                                       saveRDS(omic_sig_object, file = file.path(omic_signature_output_path, paste0("aging_signature_", safe_tissue_name, "_oSig.rds")))
@@ -410,6 +446,14 @@ all_tissue_results <- foreach(file_path = tissue_files,
                                   cat(paste0(Sys.time(), " --- Worker finished for ", current_tissue_name, " (UNKNOWN_FAILURE) ---\n"), file = worker_log_file, append = TRUE)
                                   result <- list(omicSig = NULL, tissueName = current_tissue_name, status = "Unknown_Failure", messages = paste(captured_output_string, collapse = "\n"))
                                 }
+                                
+                                # Final MEMORY OPTIMIZATION for the worker process
+                                # Clean up all objects created within this worker's scope before returning.
+                                # This ensures the worker returns only what's necessary and frees up its memory.
+                                # This is especially important for FORK clusters, where workers start as copies.
+                                rm(list=ls(all.names=TRUE)) # Removes all objects in the worker's environment
+                                gc(verbose = FALSE) # Force garbage collection
+                                
                                 return(result)
                               } # End foreach loop
 
@@ -447,9 +491,8 @@ for (worker_result in all_tissue_results) {
 # Print all captured messages from workers to the main log file.
 if (length(all_captured_messages) > 0) {
   message("\n--- Captured messages from parallel workers ---")
-  for (msg in all_captured_messages) {
-    message(msg) # These messages will now appear in your main SGE .o/.e output files
-  }
+  # Use cat() for messages that might be very long and to ensure they are written immediately, message() can buffer.
+  cat(paste(all_captured_messages, collapse = "\n"), "\n") 
   message("--- End captured messages ---\n")
 }
 
