@@ -15,7 +15,7 @@ library(Matrix)     # Required for efficient sparse matrix operations
 
 # --- Define Paths and Variables ---
 data_input_path <- file.path("/restricted/projectnb/agedisease/projects/challenge2025/data/Tabula_sapiens")
-omic_signature_output_path <- file.path("/restricted/projectnb/agedisease/projects/challenge2025/results/Tabula_sapiens/")
+omic_signature_output_path <- file.path("/restricted/projectnb/agedisease/projects/challenge2025/results/Tabula_sapiens")
 
 dir.create(omic_signature_output_path, recursive = TRUE, showWarnings = FALSE)
 message(paste0("Input tissue Seurat objects expected from: ", data_input_path))
@@ -117,7 +117,7 @@ all_tissue_results <- foreach(file_path = tissue_files,
                               .packages = c("tidyverse", "Seurat", "SingleCellExperiment", "MAST", "OmicSignature", "Biobase", "Matrix"),
                               .combine = 'list',
                               .init = list(),
-                              .verbose = TRUE) %dopar% { # Keep .verbose = TRUE for foreach progress
+                              .verbose = TRUE) %dopar% {
                                 
                                 # Set mc.cores for MAST's internal parallelism for THIS specific worker/tissue task.
                                 options(mc.cores = mast_cores_per_tissue) 
@@ -127,11 +127,6 @@ all_tissue_results <- foreach(file_path = tissue_files,
                                 
                                 # Define worker-specific log file for immediate progress feedback
                                 worker_log_file <- file.path(omic_signature_output_path, paste0("log_worker_", safe_tissue_name, ".txt"))
-                                
-                                # Initialize result with a default structure for robustness
-                                # This ensures 'result' always exists as a list, even if tryCatch is aborted externally
-                                result <- list(omicSig = NULL, tissueName = current_tissue_name, 
-                                               status = "External_Crash_Before_Processing", messages = character(0))
                                 
                                 # This variable will collect ALL messages/output for return to the main process
                                 captured_output_vec <- character(0) 
@@ -144,15 +139,26 @@ all_tissue_results <- foreach(file_path = tissue_files,
                                 sink(temp_captured_conn, type = "output")
                                 sink(temp_captured_conn, type = "message")
                                 
-                                # Use tryCatch for robust error handling and warning capturing
-                                # The value returned by this tryCatch block will OVERWRITE 'result' if successful
+                                # Initialize a placeholder for the result. This will be returned at the end.
+                                final_result_for_worker <- list(
+                                  omicSig = NULL, 
+                                  tissueName = current_tissue_name, 
+                                  status = "Processing_Failed_Unspecified", # Default status if nothing else sets it
+                                  messages = character(0) # Will be filled from captured_output_vec
+                                )
+                                
+                                # Start memory profiling for this worker.
+                                # Profile to a unique file for each worker, so we can analyze it if it dies.
+                                mem_profile_file <- file.path(omic_signature_output_path, paste0("mem_profile_", safe_tissue_name, ".Rprof"))
+                                Rprof(mem_profile_file, memory.profiling = TRUE, interval = 0.1)
+                                
+                                # Use tryCatch for robust error handling and warning capturing for the main logic
                                 tryCatch({
                                   
                                   message(paste0("\n--- Analyzing tissue from file: ", basename(file_path), " (", current_tissue_name, ") ---"))
                                   cat(paste0(Sys.time(), " [PROGRESS] Analyzing tissue: ", current_tissue_name, "\n"), file = worker_log_file, append = TRUE)
                                   
                                   cat(paste0(Sys.time(), " [PROGRESS] Loading tissue-specific Seurat object: ", basename(file_path), "\n"), file = worker_log_file, append = TRUE)
-                                  # Load the tissue-specific Seurat object
                                   tissue_seurat <- readRDS(file_path)
                                   
                                   # --- Memory Optimization: Ensure Seurat 'data' assay is a sparse matrix ---
@@ -161,13 +167,10 @@ all_tissue_results <- foreach(file_path = tissue_files,
                                       expr = Seurat::GetAssayData(tissue_seurat, layer = "data", assay = "RNA"), 
                                       error = function(e) {
                                         message(paste0("  Warning: Could not access 'data' layer from 'RNA' assay for '", current_tissue_name, "'. Error: ", e$message))
-                                        # IMPORTANT: Assign to 'result' directly instead of returning from inner tryCatch
-                                        result <<- list(omicSig = NULL, tissueName = current_tissue_name, status = "Skipped_NoData_Access") 
-                                        return(NULL) # Indicate failure for the current_data_matrix call
+                                        final_result_for_worker$status <<- "Skipped_NoData_Access"
+                                        stop("ControlledExit") # Use a custom error to exit this block
                                       }
                                     )
-                                    # If previous tryCatch assigned a result, immediately jump out of the main tryCatch
-                                    if (!is.null(result$omicSig) || result$status != "External_Crash_Before_Processing") stop("EarlyExit") # Use a custom error signal
                                     
                                     if (!is.null(current_data_matrix) && prod(dim(current_data_matrix)) > 0) {
                                       if (!inherits(current_data_matrix, "sparseMatrix")) {
@@ -178,32 +181,28 @@ all_tissue_results <- foreach(file_path = tissue_files,
                                       }
                                     } else {
                                       message(paste0("  Warning: 'data' layer in 'RNA' assay is missing or empty for '", current_tissue_name, "'. Skipping sparse conversion check. Please ensure data is normalized before analysis."))
-                                      # --- Early Exit Point --- Assign to 'result' and signal early exit
-                                      result <<- list(omicSig = NULL, tissueName = current_tissue_name, status = "Skipped_NoData")
-                                      stop("EarlyExit") 
+                                      final_result_for_worker$status <<- "Skipped_NoData"
+                                      stop("ControlledExit") 
                                     }
                                   } else {
                                     message(paste0("  Warning: 'RNA' assay not found in Seurat object for '", current_tissue_name, "'. Skipping sparse conversion check. Please ensure 'RNA' assay exists."))
-                                    # --- Early Exit Point --- Assign to 'result' and signal early exit
-                                    result <<- list(omicSig = NULL, tissueName = current_tissue_name, status = "Skipped_NoRNAAssay")
-                                    stop("EarlyExit") 
+                                    final_result_for_worker$status <<- "Skipped_NoRNAAssay"
+                                    stop("ControlledExit") 
                                   }
                                   
                                   # Skip if loaded object is empty
                                   if (ncol(tissue_seurat) == 0) {
                                     message(paste0("  Skipping '", current_tissue_name, "': loaded object is empty."))
-                                    # --- Early Exit Point --- Assign to 'result' and signal early exit
-                                    result <<- list(omicSig = NULL, tissueName = current_tissue_name, status = "Skipped_EmptyObject")
-                                    stop("EarlyExit") 
+                                    final_result_for_worker$status <<- "Skipped_EmptyObject"
+                                    stop("ControlledExit") 
                                   }
                                   
                                   # --- Pre-MAST Data Checks and Filtering ---
                                   cat(paste0(Sys.time(), " [PROGRESS] Performing pre-MAST checks for ", current_tissue_name, ".\n"), file = worker_log_file, append = TRUE)
                                   if (ncol(tissue_seurat) < min_cells_per_tissue) {
                                     message(paste0("  Skipping '", current_tissue_name, "' due to insufficient cells (", ncol(tissue_seurat), " < ", min_cells_per_tissue, ")."))
-                                    # --- Early Exit Point --- Assign to 'result' and signal early exit
-                                    result <<- list(omicSig = NULL, tissueName = current_tissue_name, status = "Skipped_InsufficientCells")
-                                    stop("EarlyExit") 
+                                    final_result_for_worker$status <<- "Skipped_InsufficientCells"
+                                    stop("ControlledExit") 
                                   }
                                   
                                   num_subjects <- length(levels(tissue_seurat@meta.data$donor_id))
@@ -212,9 +211,8 @@ all_tissue_results <- foreach(file_path = tissue_files,
                                   
                                   if (num_subjects < 2 || num_sex_groups < 2 || num_distinct_ages < 2) {
                                     message(paste0("  Skipping '", current_tissue_name, "' due to insufficient variation for regression (Subjects: ", num_subjects, ", Sex groups: ", num_sex_groups, ", Distinct ages: ", num_distinct_ages, ")."))
-                                    # --- Early Exit Point --- Assign to 'result' and signal early exit
-                                    result <<- list(omicSig = NULL, tissueName = current_tissue_name, status = "Skipped_InsufficientVariation")
-                                    stop("EarlyExit") 
+                                    final_result_for_worker$status <<- "Skipped_InsufficientVariation"
+                                    stop("ControlledExit") 
                                   }
                                   
                                   # Convert Seurat object to SingleCellExperiment (SCE) for MAST compatibility.
@@ -235,9 +233,8 @@ all_tissue_results <- foreach(file_path = tissue_files,
                                   
                                   if (length(subjects_to_keep) < 2) {
                                     message(paste0("  Skipping '", current_tissue_name, "' due to insufficient subjects with more than one cell (after filtering)."))
-                                    # --- Early Exit Point --- Assign to 'result' and signal early exit
-                                    result <<- list(omicSig = NULL, tissueName = current_tissue_name, status = "Skipped_InsufficientSubjectsPostFilter")
-                                    stop("EarlyExit") 
+                                    final_result_for_worker$status <<- "Skipped_InsufficientSubjectsPostFilter"
+                                    stop("ControlledExit") 
                                   }
                                   
                                   sce_tissue <- sce_tissue[, colData(sce_tissue)$donor_id %in% subjects_to_keep]
@@ -245,18 +242,16 @@ all_tissue_results <- foreach(file_path = tissue_files,
                                   
                                   if (ncol(sce_tissue) < min_cells_per_tissue) {
                                     message(paste0("  Skipping '", current_tissue_name, "' due to insufficient cells (", ncol(sce_tissue), " < ", min_cells_per_tissue, ") after subject filtering."))
-                                    # --- Early Exit Point --- Assign to 'result' and signal early exit
-                                    result <<- list(omicSig = NULL, tissueName = current_tissue_name, status = "Skipped_InsufficientCellsPostFilter")
-                                    stop("EarlyExit") 
+                                    final_result_for_worker$status <<- "Skipped_InsufficientCellsPostFilter"
+                                    stop("ControlledExit") 
                                   }
                                   
                                   # Filter genes: keep only those expressed in a minimum percentage of cells.
                                   expressed_genes <- rowSums(assay(sce_tissue, "logcounts") > 0) / ncol(sce_tissue) > min_expressed_gene_threshold
                                   if (sum(expressed_genes) < min_genes_after_filter) {
                                     message(paste0("  Skipping '", current_tissue_name, "' due to insufficient highly expressed genes (", sum(expressed_genes), " < ", min_genes_after_filter, ")."))
-                                    # --- Early Exit Point --- Assign to 'result' and signal early exit
-                                    result <<- list(omicSig = NULL, tissueName = current_tissue_name, status = "Skipped_InsufficientGenes")
-                                    stop("EarlyExit") 
+                                    final_result_for_worker$status <<- "Skipped_InsufficientGenes"
+                                    stop("ControlledExit") 
                                   }
                                   sce_tissue_filtered <- sce_tissue[expressed_genes, ]
                                   
@@ -270,23 +265,10 @@ all_tissue_results <- foreach(file_path = tissue_files,
                                   
                                   # --- DEBUGGING CHECKS: Verify data consistency before MAST processing ---
                                   message(paste0("  DEBUG: Dimensions of sce_tissue_filtered: ", paste(dim(sce_tissue_filtered), collapse = "x")))
-                                  message(paste0("  DEBUG: Length of rownames(sce_tissue_filtered): ", length(rownames(sce_tissue_filtered))))
-                                  message(paste0("  DEBUG: Length of rowData(sce_tissue_filtered)$primerid: ", length(rowData(sce_tissue_filtered)$primerid)))
-                                  message(paste0("  DEBUG: Length of colnames(sce_tissue_filtered): ", length(colnames(sce_tissue_filtered))))
-                                  message(paste0("  DEBUG: Length of colData(sce_tissue_filtered)$wellKey: ", length(colData(sce_tissue_filtered)$wellKey)))
-                                  
-                                  if (!identical(length(rownames(sce_tissue_filtered)), length(rowData(sce_tissue_filtered)$primerid))) {
-                                    stop(paste0("DEBUG ERROR (", current_tissue_name, "): Rownames length (", length(rownames(sce_tissue_filtered)), ") does not match primerid length (", length(rowData(sce_tissue_filtered)$primerid), ")!"))
-                                  }
-                                  if (!identical(length(colnames(sce_tissue_filtered)), length(colData(sce_tissue_filtered)$wellKey))) {
-                                    stop(paste0("DEBUG ERROR (", current_tissue_name, "): Colnames length (", length(colnames(sce_tissue_filtered)), ") does not match wellKey length (", length(colData(sce_tissue_filtered)$wellKey), ")!"))
-                                  }
-                                  if (any(nchar(rownames(sce_tissue_filtered)) == 0)) {
-                                    stop(paste0("DEBUG ERROR (", current_tissue_name, "): Rownames contain empty strings!"))
-                                  }
-                                  if (any(is.na(rowData(sce_tissue_filtered)$primerid))) {
-                                    stop(paste0("DEBUG ERROR (", current_tissue_name, "): primerid contains NA values!"))
-                                  }
+                                  if (!identical(length(rownames(sce_tissue_filtered)), length(rowData(sce_tissue_filtered)$primerid))) stop("DEBUG ERROR: Rownames/primerid mismatch!")
+                                  if (!identical(length(colnames(sce_tissue_filtered)), length(colData(sce_tissue_filtered)$wellKey))) stop("DEBUG ERROR: Colnames/wellKey mismatch!")
+                                  if (any(nchar(rownames(sce_tissue_filtered)) == 0)) stop("DEBUG ERROR: Rownames contain empty strings!")
+                                  if (any(is.na(rowData(sce_tissue_filtered)$primerid))) stop("DEBUG ERROR: primerid contains NA values!")
                                   # --- END DEBUGGING CHECKS ---
                                   
                                   # --- Perform MAST Analysis and OmicSignature Creation ---
@@ -313,7 +295,8 @@ all_tissue_results <- foreach(file_path = tissue_files,
                                   }
                                   
                                   # Fit the ZLM model: gene ~ age + sex + donor_id.
-                                  zlm_obj <- zlm(~ age + sex + donor_id, sca = sca_mast, method = 'glm', ebayes = TRUE, parallel = TRUE) 
+                                  # Explicitly setting exprs_value to 'logcounts' to prevent any ambiguity.
+                                  zlm_obj <- zlm(~ age + sex + donor_id, sca = sca_mast, method = 'glm', ebayes = TRUE, parallel = TRUE, exprs_value = 'logcounts') 
                                   
                                   # MEMORY OPTIMIZATION: Remove the SingleCellAssay object now that the model is fit
                                   rm(sca_mast)
@@ -347,9 +330,8 @@ all_tissue_results <- foreach(file_path = tissue_files,
                                   # Skip if no differential expression results found for 'age'.
                                   if (is.null(results_table_mast) || nrow(results_table_mast) == 0) {
                                     message(paste0("  No differential expression results found for 'age' in tissue: ", current_tissue_name))
-                                    # --- Early Exit Point --- Assign to 'result' and signal early exit
-                                    result <<- list(omicSig = NULL, tissueName = current_tissue_name, status = "Skipped_NoDEResults")
-                                    stop("EarlyExit")
+                                    final_result_for_worker$status <<- "Skipped_NoDEResults"
+                                    stop("ControlledExit") 
                                   } else {
                                     # Prepare results for OmicSignature object (difexp data frame).
                                     results_table_omic <- results_table_mast %>%
@@ -407,12 +389,11 @@ all_tissue_results <- foreach(file_path = tissue_files,
                                       # MEMORY OPTIMIZATION: Remove results_table_omic before returning NULL
                                       rm(results_table_omic)
                                       gc(verbose = FALSE)
-                                      # --- Early Exit Point --- Assign to 'result' and signal early exit
-                                      result <<- list(omicSig = NULL, tissueName = current_tissue_name, status = "Skipped_NoSignificantGenes")
-                                      stop("EarlyExit")
+                                      final_result_for_worker$status <<- "Skipped_NoSignificantGenes"
+                                      stop("ControlledExit") 
                                     } else {
                                       # Create the OmicSignature object for the current tissue.
-                                      omic_sig_object <- OmicSignature$new(
+                                      omic_sig_object_local <- OmicSignature$new( # Use a local name
                                         metadata = metadata_tissue_sig,
                                         signature = sig_genes,
                                         difexp = results_table_omic # Store the full differential expression results
@@ -423,50 +404,51 @@ all_tissue_results <- foreach(file_path = tissue_files,
                                       gc(verbose = FALSE)
                                       
                                       # Save individual OmicSignature object (for easier access) within each worker.
-                                      saveRDS(omic_sig_object, file = file.path(omic_signature_output_path, paste0("aging_signature_", safe_tissue_name, "_oSig.rds")))
-                                      cat(paste0(Sys.time(), " [SAVED] Successfully created and added aging signature for ", current_tissue_name, ". (", nrow(sig_genes), " significant genes)\n"), file = worker_log_file, append = TRUE)
+                                      saveRDS(omic_sig_object_local, file = file.path(omic_signature_output_path, paste0("aging_signature_", safe_tissue_name, "_oSig.rds")))
+                                      cat(paste0(Sys.time(), " [SAVED] Successfully created and added aging signature for ", current_tissue_name, ". (", nrow(omic_sig_object_local$signature), " significant genes)\n"), file = worker_log_file, append = TRUE)
                                       
-                                      # Final success assignment
-                                      result <<- list(omicSig = omic_sig_object, tissueName = current_tissue_name, status = "Success")
+                                      # Final success assignment to the placeholder
+                                      final_result_for_worker$omicSig <<- omic_sig_object_local # Assign to the outer placeholder
+                                      final_result_for_worker$status <<- "Success"
                                     }
                                   } 
                                 }, error = function(e) {
-                                  if (grepl("EarlyExit", e$message)) {
-                                    # This is our controlled early exit, 'result' is already set
-                                    # No action needed here, just prevent further error handling.
-                                    return() 
+                                  if (grepl("ControlledExit", e$message)) {
+                                    # This is our controlled early exit, status is already set.
+                                    # No action needed, final_result_for_worker is already set.
                                   } else {
-                                    # This is a genuine, unhandled error
+                                    # This is a genuine, unhandled error within the tryCatch block
                                     error_message <- paste0(Sys.time(), "  ERROR: An unhandled error occurred for tissue '", current_tissue_name, "': ", e$message, "\n")
                                     message(error_message) # This message goes into `captured_output_vec`
                                     cat(error_message, file = worker_log_file, append = TRUE) # Write to worker log file for immediate visibility
-                                    result <<- list(omicSig = NULL, tissueName = current_tissue_name, status = "Error")
+                                    final_result_for_worker$status <<- "Error"
                                   }
                                 }, warning = function(w) {
-                                  # Do NOT return here. Just log. The processing continues.
-                                  # If the warning leads to a crash, the 'error' handler will catch it.
+                                  # Just log warnings, do not stop or change status here.
                                   warning_message <- paste0(Sys.time(), "  WARNING: for tissue '", current_tissue_name, "': ", w$message, "\n")
                                   message(warning_message) # This message goes into `captured_output_vec`
                                   cat(warning_message, file = worker_log_file, append = TRUE) # Write to worker log file for immediate visibility
-                                }) 
+                                }) # End of tryCatch
+                                
+                                # Stop memory profiling.
+                                Rprof(NULL)
                                 
                                 # IMPORTANT: Close the sinks for this worker's `textConnection`
                                 sink(type = "message")
                                 sink(type = "output")
                                 close(temp_captured_conn)
                                 
-                                # Append the collected messages to the final result
-                                result$messages <- paste(captured_output_vec, collapse = "\n")
-                                cat(paste0(Sys.time(), " --- Worker finished for ", current_tissue_name, " (", result$status, ") ---\n"), file = worker_log_file, append = TRUE)
+                                # Finalize the result to be returned using the captured output
+                                final_result_for_worker$messages <- paste(captured_output_vec, collapse = "\n")
+                                
+                                cat(paste0(Sys.time(), " --- Worker finished for ", current_tissue_name, " (", final_result_for_worker$status, ") ---\n"), file = worker_log_file, append = TRUE)
                                 
                                 # Final MEMORY OPTIMIZATION for the worker process
                                 rm(list=ls(all.names=TRUE)) 
                                 gc(verbose = FALSE) 
                                 
-                                return(result) # Now 'result' is always a valid, structured list.
+                                return(final_result_for_worker) # Always returns a valid, structured list
                               } # End foreach loop
-
-
 
 
 # --- Post-Processing of Results ---
@@ -500,7 +482,6 @@ for (worker_result in all_tissue_results) {
 # Print all captured messages from workers to the main log file.
 if (length(all_captured_messages) > 0) {
   message("\n--- Captured messages from parallel workers ---")
-  # Use cat() for messages that might be very long and to ensure they are written immediately, message() can buffer.
   cat(paste(all_captured_messages, collapse = "\n"), "\n") 
   message("--- End captured messages ---\n")
 }
