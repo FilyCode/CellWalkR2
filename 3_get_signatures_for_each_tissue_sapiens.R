@@ -37,12 +37,10 @@ score_cutoff <- 0.25                # Absolute logFC cutoff for significant gene
 
 sge_total_slots <- as.numeric(Sys.getenv("NSLOTS", unset = 1)) # Get total CPU slots from SGE job
 
-# Number of tissue analyses to run concurrently (outer loop parallelization).
-# This divides the total SGE slots into independent parallel tasks.
-n_concurrent_tissues <- 1
+# Re-enable 4 concurrent workers to test parallel behavior
+n_concurrent_tissues <- 4
 
 # Number of CPU cores for MAST zlm to use within each concurrent tissue analysis.
-# This ensures each individual MAST run gets a dedicated set of cores.
 mast_cores_per_tissue <- max(1, floor(sge_total_slots / n_concurrent_tissues))
 
 # Adjust if total slots are not perfectly divisible, or if too few slots are requested
@@ -60,10 +58,7 @@ message(paste0("  Number of concurrent tissue analyses (outer loop): ", n_concur
 message(paste0("  MAST zlm will use ", mast_cores_per_tissue, " cores per tissue analysis (inner loop)."))
 
 # Set up parallel backend for the OUTER loop (foreach).
-# We register 'n_concurrent_tissues' workers to process different tissue files simultaneously.
 if (n_concurrent_tissues > 1) {
-  # Using 'FORK' type is generally more memory-efficient on Linux/Unix (like SCC)
-  # as it copies the parent R session rather than creating new ones.
   cl <- makeCluster(n_concurrent_tissues, type = "FORK") 
   registerDoParallel(cl)
   message(paste0("  Registered parallel backend for external tissue loop with ", n_concurrent_tissues, " workers."))
@@ -74,7 +69,6 @@ if (n_concurrent_tissues > 1) {
 
 
 # --- Initialize an OmicSignatureCollection Metadata ---
-# This metadata defines the overarching collection of signatures.
 message("\n--- Initializing OmicSignatureCollection ---")
 omicsig_collection_metadata <- list(
   collection_name = "Tabula Sapiens Human Aging Signatures - All Tissues", 
@@ -92,28 +86,21 @@ omicsig_collection_metadata <- list(
 
 
 # --- Get list of saved tissue files ---
-tissue_files <- list.files(data_input_path, pattern = "TabulaSapiens_.*\\.rds$", full.names = TRUE)
+tissue_file_names <- list.files(data_input_path, pattern = "TabulaSapiens_.*\\.rds$", full.names = FALSE)
+tissue_files <- file.path(data_input_path, tissue_file_names) 
+
 if (length(tissue_files) == 0) {
   stop("No tissue Seurat object files found in ", data_input_path, ".")
 }
 message(paste0("Found ", length(tissue_files), " tissue files to analyze."))
 
 
-
-
-
 # --- Loop through individual tissue files and perform analysis (Parallelized with foreach) ---
-# Each iteration of this loop runs on a separate worker in parallel.
-# .export: Variables needed by each parallel worker from the main R session.
-# .packages: Libraries each parallel worker needs to load.
-# .combine = 'list': Crucially, this keeps results from each worker as separate list items.
-# .init = list(): Initializes the combined result with an empty list.
-# .verbose = TRUE: Provides detailed status messages from the foreach loop itself.
+# .export is simplified. Let foreach handle most auto-exports based on usage.
 all_tissue_results <- foreach(file_path = tissue_files, 
-                              .export = c("data_input_path", "omic_signature_output_path",
+                              .export = c("omic_signature_output_path", "mast_cores_per_tissue", 
                                           "min_cells_per_tissue", "min_expressed_gene_threshold", 
-                                          "min_genes_after_filter", "adj_p_cutoff", "score_cutoff",
-                                          "mast_cores_per_tissue"), 
+                                          "min_genes_after_filter", "adj_p_cutoff", "score_cutoff"), 
                               .packages = c("tidyverse", "Seurat", "SingleCellExperiment", "MAST", "OmicSignature", "Biobase", "Matrix"),
                               .combine = 'list',
                               .init = list(),
@@ -123,36 +110,33 @@ all_tissue_results <- foreach(file_path = tissue_files,
                                 options(mc.cores = mast_cores_per_tissue) 
                                 
                                 current_tissue_name <- gsub("_", " ", gsub("TabulaSapiens_|_organ|\\.rds$", "", basename(file_path)))
-                                safe_tissue_name <- gsub("[^[:alnum:]_]", "_", current_tissue_name) # Ensure safe name for filename
+                                safe_tissue_name <- gsub("[^[:alnum:]_]", "_", current_tissue_name) 
                                 
-                                # Define worker-specific log file for immediate progress feedback
+                                # Define worker-specific log file for direct output (no sink/textConnection for this run)
                                 worker_log_file <- file.path(omic_signature_output_path, paste0("log_worker_", safe_tissue_name, ".txt"))
                                 
-                                # This variable will collect ALL messages/output for return to the main process
-                                captured_output_vec <- character(0) 
+                                # All messages/cat calls will now go directly to this file for this run.
+                                # Capture all output to a temporary variable for later return.
+                                # This is a simplified way to ensure the worker returns *something* structured,
+                                # even if it gets killed abruptly, and lets us see output in the log file immediately.
+                                # This is a hybrid approach, closer to your original "working" code.
+                                captured_output_temp <- character(0)
                                 
-                                # Start logging to worker-specific file for immediate feedback
-                                cat(paste0(Sys.time(), " --- Starting analysis for tissue: ", current_tissue_name, " ---\n"), file = worker_log_file, append = FALSE)
-                                
-                                # --- Set up temporary textConnection to capture ALL messages/output for return ---
-                                temp_captured_conn <- textConnection("captured_output_vec", "w", local = TRUE)
-                                sink(temp_captured_conn, type = "output")
-                                sink(temp_captured_conn, type = "message")
+                                # Re-route message and output to a temporary connection, then return it.
+                                # This mimics the `sink()` behavior but might be less prone to issues with foreach.
+                                current_conn <- textConnection("captured_output_temp", "w")
+                                sink(current_conn, type="output", append=TRUE)
+                                sink(current_conn, type="message", append=TRUE)
                                 
                                 # Initialize a placeholder for the result. This will be returned at the end.
                                 final_result_for_worker <- list(
                                   omicSig = NULL, 
                                   tissueName = current_tissue_name, 
                                   status = "Processing_Failed_Unspecified", # Default status if nothing else sets it
-                                  messages = character(0) # Will be filled from captured_output_vec
+                                  messages = character(0) # Will be filled from captured_output_temp
                                 )
                                 
-                                # Start memory profiling for this worker.
-                                # Profile to a unique file for each worker, so we can analyze it if it dies.
-                                mem_profile_file <- file.path(omic_signature_output_path, paste0("mem_profile_", safe_tissue_name, ".Rprof"))
-                                Rprof(mem_profile_file, memory.profiling = TRUE, interval = 0.1)
-                                
-                                # Use tryCatch for robust error handling and warning capturing for the main logic
+                                # Use tryCatch for robust error handling for the main logic
                                 tryCatch({
                                   
                                   message(paste0("\n--- Analyzing tissue from file: ", basename(file_path), " (", current_tissue_name, ") ---"))
@@ -168,7 +152,7 @@ all_tissue_results <- foreach(file_path = tissue_files,
                                       error = function(e) {
                                         message(paste0("  Warning: Could not access 'data' layer from 'RNA' assay for '", current_tissue_name, "'. Error: ", e$message))
                                         final_result_for_worker$status <<- "Skipped_NoData_Access"
-                                        stop("ControlledExit") # Use a custom error to exit this block
+                                        stop("ControlledExit") 
                                       }
                                     )
                                     
@@ -295,7 +279,6 @@ all_tissue_results <- foreach(file_path = tissue_files,
                                   }
                                   
                                   # Fit the ZLM model: gene ~ age + sex + donor_id.
-                                  # Explicitly setting exprs_value to 'logcounts' to prevent any ambiguity.
                                   zlm_obj <- zlm(~ age + sex + donor_id, sca = sca_mast, method = 'glm', ebayes = TRUE, parallel = TRUE, exprs_value = 'logcounts') 
                                   
                                   # MEMORY OPTIMIZATION: Remove the SingleCellAssay object now that the model is fit
@@ -419,27 +402,24 @@ all_tissue_results <- foreach(file_path = tissue_files,
                                   } else {
                                     # This is a genuine, unhandled error within the tryCatch block
                                     error_message <- paste0(Sys.time(), "  ERROR: An unhandled error occurred for tissue '", current_tissue_name, "': ", e$message, "\n")
-                                    message(error_message) # This message goes into `captured_output_vec`
-                                    cat(error_message, file = worker_log_file, append = TRUE) # Write to worker log file for immediate visibility
+                                    message(error_message) 
+                                    cat(error_message, file = worker_log_file, append = TRUE) 
                                     final_result_for_worker$status <<- "Error"
                                   }
                                 }, warning = function(w) {
                                   # Just log warnings, do not stop or change status here.
                                   warning_message <- paste0(Sys.time(), "  WARNING: for tissue '", current_tissue_name, "': ", w$message, "\n")
-                                  message(warning_message) # This message goes into `captured_output_vec`
-                                  cat(warning_message, file = worker_log_file, append = TRUE) # Write to worker log file for immediate visibility
+                                  message(warning_message) 
+                                  cat(warning_message, file = worker_log_file, append = TRUE) 
                                 }) # End of tryCatch
                                 
-                                # Stop memory profiling.
-                                Rprof(NULL)
-                                
-                                # IMPORTANT: Close the sinks for this worker's `textConnection`
+                                # Close the captured output connection explicitly
                                 sink(type = "message")
                                 sink(type = "output")
-                                close(temp_captured_conn)
+                                close(current_conn) # Close the textConnection
                                 
                                 # Finalize the result to be returned using the captured output
-                                final_result_for_worker$messages <- paste(captured_output_vec, collapse = "\n")
+                                final_result_for_worker$messages <- captured_output_temp # Assign the collected output
                                 
                                 cat(paste0(Sys.time(), " --- Worker finished for ", current_tissue_name, " (", final_result_for_worker$status, ") ---\n"), file = worker_log_file, append = TRUE)
                                 
