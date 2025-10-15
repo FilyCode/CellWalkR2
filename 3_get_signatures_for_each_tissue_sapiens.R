@@ -316,9 +316,6 @@ all_tissue_results <- foreach(file_path = tissue_files[2:5],
                                   worker_return_list$status <<- status_detail
                                   # omicSig slot remains NULL
                                   
-                                }, warning = function(w) {
-                                  message(paste0("  WARNING: for tissue '", current_tissue_name, "': ", w$message))
-                                  # Warnings don't block further execution or return, they are just logged.
                                 }) 
                                 
                                 # Final cleanup for the worker's environment.
