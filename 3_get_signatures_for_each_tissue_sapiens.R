@@ -15,7 +15,7 @@ library(Matrix)     # Required for efficient sparse matrix operations
 
 # --- Define Paths and Variables ---
 data_input_path <- file.path("/restricted/projectnb/agedisease/projects/challenge2025/data/Tabula_sapiens")
-omic_signature_output_path <- file.path("/restricted/projectnb/agedisease/projects/challenge2025/results/Tabula_sapiens")
+omic_signature_output_path <- file.path("/restricted/projectnb/agedisease/projects/challenge2025/results/Tabula_sapiens_test")
 
 dir.create(omic_signature_output_path, recursive = TRUE, showWarnings = FALSE)
 message(paste0("Input tissue Seurat objects expected from: ", data_input_path))
@@ -96,7 +96,7 @@ message(paste0("Found ", length(tissue_files), " tissue files to analyze."))
 
 
 # --- Loop through individual tissue files and perform analysis (Parallelized with foreach) ---
-all_tissue_results <- foreach(file_path = tissue_files, 
+all_tissue_results <- foreach(file_path = tissue_files[2:5], 
                               # .export: Variables needed by each parallel worker from the main R session.
                               # Rely on auto-export for most, explicitly include complex ones.
                               .export = c("omic_signature_output_path", "min_cells_per_tissue", "min_expressed_gene_threshold", 
@@ -354,10 +354,18 @@ all_tissue_results <- foreach(file_path = tissue_files,
                                       message_to_worker_log(paste0("  No significant genes found for 'age' in tissue: ", current_tissue_name, " with current cutoffs (adj_p <= ", adj_p_cutoff, ", |logFC| >= ", score_cutoff, ")."))
                                       reason <<- paste0("No significant genes found with current cutoffs (adj_p <= ", adj_p_cutoff, ", |logFC| >= ", score_cutoff, ")")
                                       
+                                      # Assign the newly created OmicSignature object to omic_sig_object
+                                      omic_sig_object <- OmicSignature$new(
+                                        metadata = metadata_tissue_sig, # Keep metadata even if signature is empty
+                                        signature = data.frame(probe_id=character(0), feature_name=character(0), score=numeric(0), group_label=factor()), # Empty signature df
+                                        difexp = results_table_omic # Store the full differential expression results even if no sig genes
+                                      )
+                                      
                                       status <- "Success (No Sig Genes)"
                                       significant_genes_count <- 0
                                       output_file_path <- file.path(omic_signature_output_path, paste0("aging_signature_", safe_tissue_name, "_oSig.rds"))
                                       saveRDS(omic_sig_object, file = output_file_path)
+                                      message_to_worker_log(paste0("  Created OmicSignature object with 0 significant genes for ", current_tissue_name, "."))
                                       rm(results_table_omic, sig_genes); gc(verbose = FALSE) # Clear intermediate data frames
                                       # Proceed to finally block to return summary
                                       
