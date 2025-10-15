@@ -324,6 +324,10 @@ all_tissue_results <- foreach(file_path = tissue_files[1:4],
                                         signature = empty_sig_df, # Empty signature data frame
                                         difexp = results_table_omic # Still store the full diff exp results
                                       )
+                                      
+                                      # Update description with specific status for later parsing
+                                      omic_sig_result_obj$metadata$description <- paste0(omic_sig_result_obj$metadata$description, " | Status: No_Significant_Genes_Found")
+                                      
                                       saveRDS(omic_sig_result_obj, file = file.path(omic_signature_output_path, paste0("aging_signature_", safe_tissue_name, "_oSig.rds")))
                                       message_to_worker_log(paste0("  Saved empty aging signature for ", current_tissue_name, "."))
                                       
@@ -335,6 +339,9 @@ all_tissue_results <- foreach(file_path = tissue_files[1:4],
                                         signature = sig_genes,
                                         difexp = results_table_omic # Store the full differential expression results
                                       )
+                                      
+                                      # Update description with specific status for later parsing
+                                      omic_sig_result_obj$metadata$description <- paste0(omic_sig_result_obj$metadata$description, " | Status: Success")
                                       
                                       # Save individual OmicSignature object (for easier access) within each worker.
                                       saveRDS(omic_sig_result_obj, file = file.path(omic_signature_output_path, paste0("aging_signature_", safe_tissue_name, "_oSig.rds")))
