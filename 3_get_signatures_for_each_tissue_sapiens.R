@@ -96,7 +96,7 @@ message(paste0("Found ", length(tissue_files), " tissue files to analyze."))
 
 
 # --- Loop through individual tissue files and perform analysis (Parallelized with foreach) ---
-all_tissue_results <- foreach(file_path = tissue_files[2:5], 
+all_tissue_results <- foreach(file_path = tissue_files, 
                               # .export: Variables needed by each parallel worker from the main R session.
                               # Rely on auto-export for most, explicitly include complex ones.
                               .export = c("omic_signature_output_path", "min_cells_per_tissue", "min_expressed_gene_threshold", 
