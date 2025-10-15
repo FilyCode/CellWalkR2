@@ -123,13 +123,28 @@ all_tissue_results <- foreach(file_path = tissue_files,
                                 
                                 message_to_worker_log(paste0("--- Starting analysis for tissue: ", current_tissue_name, " ---"), append = FALSE) # Clear file
                                 
+                                # Define base metadata template (local to worker for modification)
+                                current_tissue_metadata_template <- OmicSignature::createMetadata(
+                                  signature_name = paste0("Aging Signature - ", current_tissue_name),
+                                  organism = omicsig_collection_metadata$organism, 
+                                  direction_type = omicsig_collection_metadata$direction_type,
+                                  phenotype = paste0("Aging in ", current_tissue_name),
+                                  assay_type = omicsig_collection_metadata$assay_type,
+                                  platform = omicsig_collection_metadata$platform,
+                                  author = omicsig_collection_metadata$author,
+                                  year = omicsig_collection_metadata$year,
+                                  keywords = c(omicsig_collection_metadata$keywords, current_tissue_name),
+                                  covariates = "sex, donor_id", 
+                                  adj_p_cutoff = adj_p_cutoff, score_cutoff = score_cutoff,
+                                  sample_type = paste0(current_tissue_name, " cells"), # Placeholder, updated later
+                                  description = paste0("Aging signature derived from Tabula Sapiens human single-cell RNA-seq data for the ", current_tissue_name, " tissue. Differential expression calculated with MAST, adjusting for sex and donor_id. Filters: min cells=",min_cells_per_tissue,", min gene expr=",min_expressed_gene_threshold*100,"%, adj.p<=",adj_p_cutoff,", |logFC|>=",score_cutoff,".")
+                                )
+                                
                                 # Initialize a structured list for worker return
                                 worker_return_list <- list(
                                   omicSig = NULL, # This will be the actual OmicSignature object OR NULL
                                   tissueName = current_tissue_name,
-                                  status = "Processing_Failed_Unspecified",
-                                  # Collect messages for primary logging (will be concatenated from here)
-                                  messages = character(0) 
+                                  status = "Processing_Failed_Unspecified" # Will be updated
                                 )
                                 
                                 tryCatch({
@@ -274,7 +289,7 @@ all_tissue_results <- foreach(file_path = tissue_files,
                                     }
                                     
                                     # Create metadata for the tissue-specific OmicSignature.
-                                    metadata_for_current_omicSig <- base_metadata_for_omicSig_template
+                                    metadata_for_current_omicSig <- current_tissue_metadata_template
                                     if (!is.null(found_sample_type)) {
                                       metadata_for_current_omicSig$sample_type <- found_sample_type
                                     } else {
