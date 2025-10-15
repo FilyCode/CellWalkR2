@@ -194,7 +194,7 @@ all_tissue_results <- foreach(file_path = tissue_files,
                                   num_sex_groups <- length(levels(tissue_seurat@meta.data$sex))
                                   num_distinct_ages <- length(unique(tissue_seurat@meta.data$age))
                                   
-                                  if (num_subjects < 2 || num_sex_groups < 2 || num_distinct_ages < 2) {
+                                  if (num_subjects < 2 || num_sex_groups < 2 || num_distinct_ages < 3) {
                                     message_to_worker_log(paste0("  Skipping '", current_tissue_name, "' due to insufficient variation for regression (Subjects: ", num_subjects, ", Sex groups: ", num_sex_groups, ", Distinct ages: ", num_distinct_ages, ")."))
                                     reason <<- paste0("Insufficient variation for regression (Subjects: ", num_subjects, ", Sex groups: ", num_sex_groups, ", Distinct ages: ", num_distinct_ages, ")")
                                     return(NULL)
@@ -235,6 +235,7 @@ all_tissue_results <- foreach(file_path = tissue_files,
                                     return(NULL)
                                   }
                                   sce_tissue_filtered <- sce_tissue[expressed_genes, ]
+                                  rm(sce_tissue); gc(verbose = FALSE) # Clear original SCE object after filtering
                                   
                                   final_cell_count <- ncol(sce_tissue_filtered)
                                   final_gene_count <- nrow(sce_tissue_filtered)
@@ -262,6 +263,7 @@ all_tissue_results <- foreach(file_path = tissue_files,
                                   }
                                   
                                   sca_mast <- SceToSingleCellAssay(sce_tissue_filtered, class = "SingleCellAssay")
+                                  rm(sce_tissue_filtered); gc(verbose = FALSE) # Clear filtered SCE object after conversion to SCA
                                   
                                   # Confirm sparsity after conversion to SingleCellAssay.
                                   if (inherits(assay(sca_mast, "logcounts"), "sparseMatrix")) {
@@ -273,10 +275,12 @@ all_tissue_results <- foreach(file_path = tissue_files,
                                   # Fit the ZLM model: gene ~ age + sex + donor_id.
                                   # 'parallel = TRUE' tells MAST to use the cores set by options(mc.cores) for this worker.
                                   zlm_obj <- zlm(~ age + sex + donor_id, sca = sca_mast, method = 'glm', ebayes = TRUE, parallel = TRUE, exprs_value = 'logcounts') 
+                                  rm(sca_mast); gc(verbose = FALSE) # Clear SCA object after ZLM model creation
                                   
                                   # Get summary results for the 'age' coefficient using a Likelihood Ratio Test (doLRT).
                                   summary_age_results <- summary(zlm_obj, doLRT = "age")
                                   results_table_mast_raw <- summary_age_results$datatable
+                                  rm(zlm_obj, summary_age_results); gc(verbose = FALSE) # Clear ZLM object and summary after extracting datatable
                                   
                                   # Filter for the 'age' contrast and calculate FDR.
                                   results_table_mast <- results_table_mast_raw %>%
@@ -290,6 +294,7 @@ all_tissue_results <- foreach(file_path = tissue_files,
                                     dplyr::select(
                                       PrimerID = PrimerID, logFC = logFC_val, Pvalue = Pvalue_val, FDR = FDR_val
                                     )
+                                  rm(results_table_mast_raw); gc(verbose = FALSE) # Clear raw MAST results after filtering
                                   
                                   # Skip if no differential expression results found for 'age'.
                                   if (is.null(results_table_mast) || nrow(results_table_mast) == 0) {
@@ -307,6 +312,7 @@ all_tissue_results <- foreach(file_path = tissue_files,
                                       dplyr::mutate(
                                         group_label = as.factor(ifelse(score > 0, "Increased_with_Age", "Decreased_with_Age"))
                                       )
+                                    rm(results_table_mast); gc(verbose = FALSE) # Clear results_table_mast after conversion to Omic format
                                     
                                     # --- Automated BRENDA ontology lookup for sample_type ---
                                     found_sample_type <- NULL
@@ -347,7 +353,14 @@ all_tissue_results <- foreach(file_path = tissue_files,
                                     if (nrow(sig_genes) == 0) {
                                       message_to_worker_log(paste0("  No significant genes found for 'age' in tissue: ", current_tissue_name, " with current cutoffs (adj_p <= ", adj_p_cutoff, ", |logFC| >= ", score_cutoff, ")."))
                                       reason <<- paste0("No significant genes found with current cutoffs (adj_p <= ", adj_p_cutoff, ", |logFC| >= ", score_cutoff, ")")
-                                      return(NULL) 
+                                      
+                                      status <- "Success (No Sig Genes)"
+                                      significant_genes_count <- 0
+                                      output_file_path <- file.path(omic_signature_output_path, paste0("aging_signature_", safe_tissue_name, "_oSig.rds"))
+                                      saveRDS(omic_sig_object, file = output_file_path)
+                                      rm(results_table_omic, sig_genes); gc(verbose = FALSE) # Clear intermediate data frames
+                                      # Proceed to finally block to return summary
+                                      
                                     } else {
                                       # Create the OmicSignature object for the current tissue.
                                       omic_sig_tissue <- OmicSignature$new(
