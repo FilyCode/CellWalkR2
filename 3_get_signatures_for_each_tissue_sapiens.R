@@ -366,9 +366,6 @@ all_tissue_results <- foreach(file_path = tissue_files[1:4],
                                   )
                                   
                                   return(list(setNames(list(omic_sig_result_obj), current_tissue_name))) # Return empty OmicSig object for error
-                                }, warning = function(w) {
-                                  message_to_worker_log(paste0("  WARNING: for tissue '", current_tissue_name, "': ", w$message))
-                                  # Warnings don't block further execution or return, they are just logged.
                                 }) 
                                 
                                 # Final cleanup for the worker's environment.
