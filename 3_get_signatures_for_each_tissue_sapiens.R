@@ -134,7 +134,7 @@ all_tissue_results <- foreach(file_path = tissue_files[2:5],
                                 
                                 tryCatch({
                                   
-                                  message(paste0("\n--- Analyzing tissue from file: ", basename(file_path), " (", current_tissue_name, ") ---")) 
+                                  message_to_worker_log(paste0("\n--- Analyzing tissue from file: ", basename(file_path), " (", current_tissue_name, ") ---")) 
                                   
                                   tissue_seurat <- readRDS(file_path)
                                   
@@ -142,35 +142,35 @@ all_tissue_results <- foreach(file_path = tissue_files[2:5],
                                     current_data_matrix <- tryCatch(
                                       expr = Seurat::GetAssayData(tissue_seurat, layer = "data", assay = "RNA"), 
                                       error = function(e) {
-                                        message(paste0("  Warning: Could not access 'data' layer from 'RNA' assay for '", current_tissue_name, "'. Error: ", e$message))
+                                        message_to_worker_log(paste0("  Warning: Could not access 'data' layer from 'RNA' assay for '", current_tissue_name, "'. Error: ", e$message))
                                         worker_return_list$status <<- "Skipped_NoData_Access"
                                         stop("ControlledExit") 
                                       }
                                     )
                                     if (!is.null(current_data_matrix) && prod(dim(current_data_matrix)) > 0) {
                                       if (!inherits(current_data_matrix, "sparseMatrix")) {
-                                        message(paste0("  Converting 'data' assay (logcounts) for '", current_tissue_name, "' to sparse matrix."))
+                                        message_to_worker_log(paste0("  Converting 'data' assay (logcounts) for '", current_tissue_name, "' to sparse matrix."))
                                         tissue_seurat@assays$RNA@data <- Matrix::Matrix(current_data_matrix, sparse = TRUE)
                                       }
                                     } else {
-                                      message(paste0("  Warning: 'data' layer in 'RNA' assay is missing or empty for '", current_tissue_name, "'."))
+                                      message_to_worker_log(paste0("  Warning: 'data' layer in 'RNA' assay is missing or empty for '", current_tissue_name, "'."))
                                       worker_return_list$status <<- "Skipped_NoData"
                                       stop("ControlledExit") 
                                     }
                                   } else {
-                                    message(paste0("  Warning: 'RNA' assay not found in Seurat object for '", current_tissue_name, "'."))
+                                    message_to_worker_log(paste0("  Warning: 'RNA' assay not found in Seurat object for '", current_tissue_name, "'."))
                                     worker_return_list$status <<- "Skipped_NoRNAAssay"
                                     stop("ControlledExit") 
                                   }
                                   
                                   if (ncol(tissue_seurat) == 0) {
-                                    message(paste0("  Skipping '", current_tissue_name, "': loaded object is empty."))
+                                    message_to_worker_log(paste0("  Skipping '", current_tissue_name, "': loaded object is empty."))
                                     worker_return_list$status <<- "Skipped_EmptyObject"
                                     stop("ControlledExit") 
                                   }
                                   
                                   if (ncol(tissue_seurat) < min_cells_per_tissue) {
-                                    message(paste0("  Skipping '", current_tissue_name, "' due to insufficient cells (", ncol(tissue_seurat), " < ", min_cells_per_tissue, ")."))
+                                    message_to_worker_log(paste0("  Skipping '", current_tissue_name, "' due to insufficient cells (", ncol(tissue_seurat), " < ", min_cells_per_tissue, ")."))
                                     worker_return_list$status <<- "Skipped_InsufficientCells"
                                     stop("ControlledExit") 
                                   }
@@ -180,7 +180,7 @@ all_tissue_results <- foreach(file_path = tissue_files[2:5],
                                   num_distinct_ages <- length(unique(tissue_seurat@meta.data$age))
                                   
                                   if (num_subjects < 2 || num_sex_groups < 2 || num_distinct_ages < 2) {
-                                    message(paste0("  Skipping '", current_tissue_name, "' due to insufficient variation for regression (Subjects: ", num_subjects, ", Sex groups: ", num_sex_groups, ", Distinct ages: ", num_distinct_ages, ")."))
+                                    message_to_worker_log(paste0("  Skipping '", current_tissue_name, "' due to insufficient variation for regression (Subjects: ", num_subjects, ", Sex groups: ", num_sex_groups, ", Distinct ages: ", num_distinct_ages, ")."))
                                     worker_return_list$status <<- "Skipped_InsufficientVariation"
                                     stop("ControlledExit") 
                                   }
@@ -192,7 +192,7 @@ all_tissue_results <- foreach(file_path = tissue_files[2:5],
                                   subject_counts <- table(colData(sce_tissue)$donor_id)
                                   subjects_to_keep <- names(subject_counts[subject_counts > 1])
                                   if (length(subjects_to_keep) < 2) {
-                                    message(paste0("  Skipping '", current_tissue_name, "' due to insufficient subjects with more than one cell (after filtering)."))
+                                    message_to_worker_log(paste0("  Skipping '", current_tissue_name, "' due to insufficient subjects with more than one cell (after filtering)."))
                                     worker_return_list$status <<- "Skipped_InsufficientSubjectsPostFilter"
                                     stop("ControlledExit") 
                                   }
@@ -200,14 +200,14 @@ all_tissue_results <- foreach(file_path = tissue_files[2:5],
                                   colData(sce_tissue)$donor_id <- droplevels(colData(sce_tissue)$donor_id)
                                   
                                   if (ncol(sce_tissue) < min_cells_per_tissue) {
-                                    message(paste0("  Skipping '", current_tissue_name, "' due to insufficient cells (", ncol(sce_tissue), " < ", min_cells_per_tissue, ") after subject filtering."))
+                                    message_to_worker_log(paste0("  Skipping '", current_tissue_name, "' due to insufficient cells (", ncol(sce_tissue), " < ", min_cells_per_tissue, ") after subject filtering."))
                                     worker_return_list$status <<- "Skipped_InsufficientCellsPostFilter"
                                     stop("ControlledExit") 
                                   }
                                   
                                   expressed_genes <- rowSums(assay(sce_tissue, "logcounts") > 0) / ncol(sce_tissue) > min_expressed_gene_threshold
                                   if (sum(expressed_genes) < min_genes_after_filter) {
-                                    message(paste0("  Skipping '", current_tissue_name, "' due to insufficient highly expressed genes (", sum(expressed_genes), " < ", min_genes_after_filter, ")."))
+                                    message_to_worker_log(paste0("  Skipping '", current_tissue_name, "' due to insufficient highly expressed genes (", sum(expressed_genes), " < ", min_genes_after_filter, ")."))
                                     worker_return_list$status <<- "Skipped_InsufficientGenes"
                                     stop("ControlledExit") 
                                   }
@@ -222,7 +222,7 @@ all_tissue_results <- foreach(file_path = tissue_files[2:5],
                                   if (any(nchar(rownames(sce_tissue_filtered)) == 0)) stop("DEBUG ERROR: Rownames contain empty strings!")
                                   if (any(is.na(rowData(sce_tissue_filtered)$primerid))) stop("DEBUG ERROR: primerid contains NA values!")
                                   
-                                  message(paste0("  Running MAST for '", current_tissue_name, "' with ", nrow(sce_tissue_filtered), " genes and ", ncol(sce_tissue_filtered), " cells."))
+                                  message_to_worker_log(paste0("  Running MAST for '", current_tissue_name, "' with ", nrow(sce_tissue_filtered), " genes and ", ncol(sce_tissue_filtered), " cells."))
                                   
                                   sca_mast <- SceToSingleCellAssay(sce_tissue_filtered, class = "SingleCellAssay")
                                   
@@ -245,7 +245,7 @@ all_tissue_results <- foreach(file_path = tissue_files[2:5],
                                     )
                                   
                                   if (is.null(results_table_mast) || nrow(results_table_mast) == 0) {
-                                    message(paste0("  No differential expression results found for 'age' in tissue: ", current_tissue_name))
+                                    message_to_worker_log(paste0("  No differential expression results found for 'age' in tissue: ", current_tissue_name))
                                     worker_return_list$status <<- "Skipped_NoDEResults"
                                     stop("ControlledExit") 
                                   } else {
@@ -278,7 +278,7 @@ all_tissue_results <- foreach(file_path = tissue_files[2:5],
                                     if (!is.null(found_sample_type)) {
                                       metadata_for_current_omicSig$sample_type <- found_sample_type
                                     } else {
-                                      message(paste0("  Warning: No suitable BRENDA ontology term found for '", current_tissue_name, "'. Using default '", metadata_for_current_omicSig$sample_type, "'."))
+                                      message_to_worker_log(paste0("  Warning: No suitable BRENDA ontology term found for '", current_tissue_name, "'. Using default '", metadata_for_current_omicSig$sample_type, "'."))
                                     }
                                     
                                     sig_genes <- results_table_omic %>%
@@ -286,7 +286,7 @@ all_tissue_results <- foreach(file_path = tissue_files[2:5],
                                       dplyr::select(probe_id, feature_name, score, group_label)
                                     
                                     if (nrow(sig_genes) == 0) {
-                                      message(paste0("  No significant genes found for 'age' in tissue: ", current_tissue_name, ". Returning NULL OmicSignature object."))
+                                      message_to_worker_log(paste0("  No significant genes found for 'age' in tissue: ", current_tissue_name, ". Returning NULL OmicSignature object."))
                                       worker_return_list$status <<- "No_Significant_Genes_Found" 
                                       # omicSig slot remains NULL
                                       
@@ -298,7 +298,7 @@ all_tissue_results <- foreach(file_path = tissue_files[2:5],
                                       )
                                       
                                       saveRDS(omic_sig_object_local, file = file.path(omic_signature_output_path, paste0("aging_signature_", safe_tissue_name, "_oSig.rds")))
-                                      message(paste0("  Successfully created and added aging signature for ", current_tissue_name, ". (", nrow(sig_genes), " significant genes)"))
+                                      message_to_worker_log(paste0("  Successfully created and added aging signature for ", current_tissue_name, ". (", nrow(sig_genes), " significant genes)"))
                                       
                                       worker_return_list$omicSig <<- omic_sig_object_local 
                                       worker_return_list$status <<- "Success"
@@ -309,9 +309,9 @@ all_tissue_results <- foreach(file_path = tissue_files[2:5],
                                   status_detail <- "Error" 
                                   if (grepl("^Skipped_", error_message_text)) {
                                     status_detail <- sub("^Skipped_", "", error_message_text)
-                                    message(paste0("  Processing skipped for '", current_tissue_name, "' due to: ", status_detail))
+                                    message_to_worker_log(paste0("  Processing skipped for '", current_tissue_name, "' due to: ", status_detail))
                                   } else {
-                                    message(paste0("  ERROR: An unhandled error occurred for tissue '", current_tissue_name, "': ", error_message_text))
+                                    message_to_worker_log(paste0("  ERROR: An unhandled error occurred for tissue '", current_tissue_name, "': ", error_message_text))
                                   }
                                   worker_return_list$status <<- status_detail
                                   # omicSig slot remains NULL
