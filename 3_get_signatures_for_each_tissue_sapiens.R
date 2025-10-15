@@ -153,7 +153,7 @@ all_tissue_results <- foreach(file_path = tissue_files,
                                       error = function(e) {
                                         message_to_worker_log(paste0("  Warning: Could not access 'data' layer from 'RNA' assay for '", current_tissue_name, "'. Error: ", e$message))
                                         reason <<- paste0("Error accessing RNA data layer: ", e$message)
-                                        return(NULL) # Return NULL on this specific error
+                                        stop(reason) # Return NULL on this specific error
                                       }
                                     )
                                     
@@ -167,19 +167,19 @@ all_tissue_results <- foreach(file_path = tissue_files,
                                     } else {
                                       message_to_worker_log(paste0("  Warning: 'data' layer in 'RNA' assay is missing or empty for '", current_tissue_name, "'. Skipping sparse conversion check. Please ensure data is normalized before analysis."))
                                       reason <<- "RNA 'data' layer missing or empty"
-                                      return(NULL) # Return NULL on this specific skip condition
+                                      stop(reason) 
                                     }
                                   } else {
                                     message_to_worker_log(paste0("  Warning: 'RNA' assay not found in Seurat object for '", current_tissue_name, "'. Skipping sparse conversion check. Please ensure 'RNA' assay exists."))
                                     reason <<- "RNA assay not found in Seurat object"
-                                    return(NULL) # Return NULL on this specific skip condition
+                                    stop(reason) 
                                   }
                                   
                                   # Skip if loaded object is empty
                                   if (ncol(tissue_seurat) == 0) {
                                     message_to_worker_log(paste0("  Skipping '", current_tissue_name, "': loaded object is empty."))
                                     reason <<- "Loaded Seurat object is empty"
-                                    return(NULL) 
+                                    stop(reason) 
                                   }
                                   
                                   # --- Pre-MAST Data Checks and Filtering ---
@@ -187,7 +187,7 @@ all_tissue_results <- foreach(file_path = tissue_files,
                                   if (ncol(tissue_seurat) < min_cells_per_tissue) {
                                     message_to_worker_log(paste0("  Skipping '", current_tissue_name, "' due to insufficient cells (", ncol(tissue_seurat), " < ", min_cells_per_tissue, ")."))
                                     reason <<- paste0("Insufficient cells (", ncol(tissue_seurat), " < ", min_cells_per_tissue, ")")
-                                    return(NULL)
+                                    stop(reason)
                                   }
                                   
                                   num_subjects <- length(levels(tissue_seurat@meta.data$donor_id))
@@ -197,7 +197,7 @@ all_tissue_results <- foreach(file_path = tissue_files,
                                   if (num_subjects < 2 || num_sex_groups < 2 || num_distinct_ages < 3) {
                                     message_to_worker_log(paste0("  Skipping '", current_tissue_name, "' due to insufficient variation for regression (Subjects: ", num_subjects, ", Sex groups: ", num_sex_groups, ", Distinct ages: ", num_distinct_ages, ")."))
                                     reason <<- paste0("Insufficient variation for regression (Subjects: ", num_subjects, ", Sex groups: ", num_sex_groups, ", Distinct ages: ", num_distinct_ages, ")")
-                                    return(NULL)
+                                    stop(reason)
                                   }
                                   
                                   # Convert Seurat object to SingleCellExperiment (SCE) for MAST compatibility.
@@ -215,7 +215,7 @@ all_tissue_results <- foreach(file_path = tissue_files,
                                   if (length(subjects_to_keep) < 2) {
                                     message_to_worker_log(paste0("  Skipping '", current_tissue_name, "' due to insufficient subjects with more than one cell (after filtering)."))
                                     reason <<- "Insufficient subjects with more than one cell after filtering"
-                                    return(NULL)
+                                    stop(reason)
                                   }
                                   
                                   sce_tissue <- sce_tissue[, colData(sce_tissue)$donor_id %in% subjects_to_keep]
@@ -224,7 +224,7 @@ all_tissue_results <- foreach(file_path = tissue_files,
                                   if (ncol(sce_tissue) < min_cells_per_tissue) {
                                     message_to_worker_log(paste0("  Skipping '", current_tissue_name, "' due to insufficient cells (", ncol(sce_tissue), " < ", min_cells_per_tissue, ") after subject filtering."))
                                     reason <<- paste0("Insufficient cells (", ncol(sce_tissue), " < ", min_cells_per_tissue, ") after subject filtering")
-                                    return(NULL)
+                                    stop(reason)
                                   }
                                   
                                   # Filter genes: keep only those expressed in a minimum percentage of cells.
@@ -232,7 +232,7 @@ all_tissue_results <- foreach(file_path = tissue_files,
                                   if (sum(expressed_genes) < min_genes_after_filter) {
                                     message_to_worker_log(paste0("  Skipping '", current_tissue_name, "' due to insufficient highly expressed genes (", sum(expressed_genes), " < ", min_genes_after_filter, ")."))
                                     reason <<- paste0("Insufficient highly expressed genes (", sum(expressed_genes), " < ", min_genes_after_filter, ")")
-                                    return(NULL)
+                                    stop(reason)
                                   }
                                   sce_tissue_filtered <- sce_tissue[expressed_genes, ]
                                   rm(sce_tissue); gc(verbose = FALSE) # Clear original SCE object after filtering
@@ -300,7 +300,7 @@ all_tissue_results <- foreach(file_path = tissue_files,
                                   if (is.null(results_table_mast) || nrow(results_table_mast) == 0) {
                                     message_to_worker_log(paste0("  No differential expression results found for 'age' in tissue: ", current_tissue_name))
                                     reason <<- "No differential expression results found for 'age'"
-                                    return(NULL) 
+                                    stop(reason) 
                                   } else {
                                     # Prepare results for OmicSignature object (difexp data frame).
                                     results_table_omic <- results_table_mast %>%
