@@ -94,20 +94,44 @@ if (length(tissue_files) == 0) {
 }
 message(paste0("Found ", length(tissue_files), " tissue files to analyze."))
 
+# --- Helper function to build a consistent result structure for each foreach worker ---
+# This function prepares the return object for foreach, it does NOT contain 'return' itself.
+build_structured_result_for_foreach <- function(current_tissue_name, status_val, reason_val, 
+                                                initial_cells, final_cells_before_mast, 
+                                                initial_genes, final_genes_before_mast, 
+                                                significant_genes, omic_signature_file, 
+                                                omic_sig_object) {
+  
+  current_tissue_summary <- data.frame(
+    TissueName = current_tissue_name,
+    Status = status_val,
+    Reason = reason_val,
+    InitialCells = initial_cells,
+    FinalCellsBeforeMAST = final_cells_before_mast,
+    InitialGenes = initial_genes,
+    FinalGenesBeforeMAST = final_genes_before_mast,
+    SignificantGenes = significant_genes,
+    OmicSignatureFile = omic_signature_file,
+    stringsAsFactors = FALSE
+  )
+  
+  # Ensure omic_sig part is always a named list, even if NULL
+  named_omic_sig_list <- setNames(list(omic_sig_object), current_tissue_name)
+  
+  return(list(omic_sig = named_omic_sig_list, summary = current_tissue_summary))
+}
+
 
 # --- Loop through individual tissue files and perform analysis (Parallelized with foreach) ---
-all_tissue_results <- foreach(file_path = tissue_files[2:5], 
-                              # .export: Variables needed by each parallel worker from the main R session.
-                              # Rely on auto-export for most, explicitly include complex ones.
+all_tissue_results <- foreach(file_path = tissue_files[2:5], # Keep [2:5] for testing, remove for full run
                               .export = c("omic_signature_output_path", "min_cells_per_tissue", "min_expressed_gene_threshold", 
                                           "min_genes_after_filter", "adj_p_cutoff", "score_cutoff",
-                                          "mast_cores_per_tissue"), 
+                                          "mast_cores_per_tissue", "build_structured_result_for_foreach"), # Export the helper
                               .packages = c("tidyverse", "Seurat", "SingleCellExperiment", "MAST", "OmicSignature", "Biobase", "Matrix"),
                               .combine = 'list', # Use 'list' to collect all results, including NULLs
                               .init = list(),
                               .verbose = TRUE) %dopar% {
                                 
-                                # Set mc.cores for MAST's internal parallelism for THIS specific worker/tissue task.
                                 options(mc.cores = mast_cores_per_tissue) 
                                 
                                 current_tissue_name <- gsub("_", " ", gsub("TabulaSapiens_|_organ|\\.rds$", "", basename(file_path)))
@@ -123,44 +147,22 @@ all_tissue_results <- foreach(file_path = tissue_files[2:5],
                                 
                                 message_to_worker_log(paste0("--- Starting analysis for tissue: ", current_tissue_name, " ---"), append = FALSE) # Clear file
                                 
-                                # Initialize summary variables for the current tissue
-                                status <- "Skipped"
-                                reason <- "Unknown reason"
-                                initial_cell_count <- 0
-                                final_cell_count <- 0
-                                initial_gene_count <- 0
-                                final_gene_count <- 0
-                                significant_genes_count <- 0
-                                output_file_path <- "N/A"
-                                omic_sig_object <- NULL # Placeholder for the OmicSignature object
+                                # Initialize ALL variables that need to be captured for the final summary or OmicSignature object
+                                omic_sig_object_for_return <- NULL
+                                status_for_return <- "Processing" # Default to processing, will change on skips/errors/success
+                                reason_for_return <- "Initialized"
+                                initial_cell_count_for_return <- 0
+                                final_cell_count_for_return <- 0
+                                initial_gene_count_for_return <- 0
+                                final_gene_count_for_return <- 0
+                                significant_genes_count_for_return <- 0
+                                output_file_path_for_return <- "N/A"
                                 
-                                # Define a helper to return consistent structure for skips/errors
-                                return_structured_result <- function(omic_sig = NULL, status_val, reason_val) {
-                                  current_tissue_summary <- data.frame(
-                                    TissueName = current_tissue_name,
-                                    Status = status_val,
-                                    Reason = reason_val,
-                                    InitialCells = initial_cell_count,
-                                    FinalCellsBeforeMAST = final_cell_count,
-                                    InitialGenes = initial_gene_count,
-                                    FinalGenesBeforeMAST = final_gene_count,
-                                    SignificantGenes = significant_genes_count,
-                                    OmicSignatureFile = output_file_path,
-                                    stringsAsFactors = FALSE
-                                  )
-                                  
-                                  # Ensure omic_sig part is always a named list, even if NULL
-                                  named_omic_sig_list <- setNames(list(omic_sig), current_tissue_name)
-                                  
-                                  # Perform worker-local cleanup
-                                  rm(list=ls(all.names=TRUE)) 
-                                  gc(verbose = FALSE) 
-                                  
-                                  return(list(omic_sig = named_omic_sig_list, summary = current_tissue_summary))
-                                }
+                                # Use a flag to control whether processing continues (for early skips)
+                                continue_processing <- TRUE
                                 
-                                # Use tryCatch for robust error handling.
-                                tryCatch({
+                                # Wrap the entire processing logic in a tryCatch to handle unexpected errors gracefully
+                                final_worker_output <- tryCatch({
                                   
                                   message_to_worker_log(paste0("Analyzing tissue from file: ", basename(file_path), " (", current_tissue_name, ")"))
                                   message_to_worker_log(paste0("Loading tissue-specific Seurat object: ", basename(file_path)))
@@ -168,8 +170,8 @@ all_tissue_results <- foreach(file_path = tissue_files[2:5],
                                   # Load the tissue-specific Seurat object
                                   tissue_seurat <- readRDS(file_path)
                                   
-                                  initial_cell_count <- ncol(tissue_seurat)
-                                  initial_gene_count <- nrow(tissue_seurat)
+                                  initial_cell_count_for_return <<- ncol(tissue_seurat)
+                                  initial_gene_count_for_return <<- nrow(tissue_seurat)
                                   
                                   # --- Memory Optimization: Ensure Seurat 'data' assay is a sparse matrix ---
                                   if ("RNA" %in% names(tissue_seurat@assays)) {
@@ -177,237 +179,276 @@ all_tissue_results <- foreach(file_path = tissue_files[2:5],
                                       expr = Seurat::GetAssayData(tissue_seurat, layer = "data", assay = "RNA"), 
                                       error = function(e) {
                                         message_to_worker_log(paste0("  Warning: Could not access 'data' layer from 'RNA' assay for '", current_tissue_name, "'. Error: ", e$message))
-                                        reason <- paste0("Error accessing RNA data layer: ", e$message)
-                                        return(NULL) # Indicate failure, will fall through to outer error handler/finally
+                                        status_for_return <<- "Skipped" # Use <<- to assign to outer scope
+                                        reason_for_return <<- paste0("Error accessing RNA data layer: ", e$message)
+                                        continue_processing <<- FALSE
+                                        return(NULL) # Indicate failure for the inner tryCatch, but outer tryCatch handles final return
                                       }
                                     )
                                     
-                                    if (is.null(current_data_matrix) || prod(dim(current_data_matrix)) == 0) {
+                                    if (!is.null(current_data_matrix) && prod(dim(current_data_matrix)) == 0) {
                                       message_to_worker_log(paste0("  Warning: 'data' layer in 'RNA' assay is missing or empty or access error for '", current_tissue_name, "'. Skipping analysis."))
-                                      return(return_structured_result(NULL, "Skipped", "RNA 'data' layer missing/empty or access error"))
-                                    }
-                                    
-                                    if (!inherits(current_data_matrix, "sparseMatrix")) {
+                                      status_for_return <<- "Skipped"
+                                      reason_for_return <<- "RNA 'data' layer missing/empty or access error"
+                                      continue_processing <<- FALSE
+                                    } else if (inherits(current_data_matrix, "sparseMatrix")) {
+                                      message_to_worker_log(paste0("  'data' assay (logcounts) for '", current_tissue_name, "' is already sparse. No conversion needed."))
+                                    } else if (continue_processing) { # Only convert if still processing
                                       message_to_worker_log(paste0("  Converting 'data' assay (logcounts) for '", current_tissue_name, "' to sparse matrix to save memory."))
                                       tissue_seurat@assays$RNA@data <- Matrix::Matrix(current_data_matrix, sparse = TRUE)
-                                    } else {
-                                      message_to_worker_log(paste0("  'data' assay (logcounts) for '", current_tissue_name, "' is already sparse. No conversion needed."))
                                     }
                                   } else {
                                     message_to_worker_log(paste0("  Warning: 'RNA' assay not found in Seurat object for '", current_tissue_name, "'. Skipping analysis."))
-                                    return(return_structured_result(NULL, "Skipped", "RNA assay not found in Seurat object"))
+                                    status_for_return <<- "Skipped"
+                                    reason_for_return <<- "RNA assay not found in Seurat object"
+                                    continue_processing <<- FALSE
                                   }
                                   
                                   # Skip if loaded object is empty
-                                  if (ncol(tissue_seurat) == 0) {
+                                  if (continue_processing && ncol(tissue_seurat) == 0) {
                                     message_to_worker_log(paste0("  Skipping '", current_tissue_name, "': loaded object is empty."))
-                                    return(return_structured_result(NULL, "Skipped", "Loaded Seurat object is empty"))
+                                    status_for_return <<- "Skipped"
+                                    reason_for_return <<- "Loaded Seurat object is empty"
+                                    continue_processing <<- FALSE
                                   }
                                   
                                   # --- Pre-MAST Data Checks and Filtering ---
-                                  message_to_worker_log(paste0("Performing pre-MAST checks for ", current_tissue_name, "."))
-                                  if (ncol(tissue_seurat) < min_cells_per_tissue) {
-                                    message_to_worker_log(paste0("  Skipping '", current_tissue_name, "' due to insufficient cells (", ncol(tissue_seurat), " < ", min_cells_per_tissue, ")."))
-                                    return(return_structured_result(NULL, "Skipped", paste0("Insufficient cells (", ncol(tissue_seurat), " < ", min_cells_per_tissue, ")")))
+                                  if (continue_processing) {
+                                    message_to_worker_log(paste0("Performing pre-MAST checks for ", current_tissue_name, "."))
+                                    if (ncol(tissue_seurat) < min_cells_per_tissue) {
+                                      message_to_worker_log(paste0("  Skipping '", current_tissue_name, "' due to insufficient cells (", ncol(tissue_seurat), " < ", min_cells_per_tissue, ")."))
+                                      status_for_return <<- "Skipped"
+                                      reason_for_return <<- paste0("Insufficient cells (", ncol(tissue_seurat), " < ", min_cells_per_tissue, ")")
+                                      continue_processing <<- FALSE
+                                    }
                                   }
                                   
-                                  num_subjects <- length(levels(tissue_seurat@meta.data$donor_id))
-                                  num_sex_groups <- length(levels(tissue_seurat@meta.data$sex))
-                                  num_distinct_ages <- length(unique(tissue_seurat@meta.data$age))
-                                  
-                                  if (num_subjects < 2 || num_sex_groups < 2 || num_distinct_ages < 3) {
-                                    message_to_worker_log(paste0("  Skipping '", current_tissue_name, "' due to insufficient variation for regression (Subjects: ", num_subjects, ", Sex groups: ", num_sex_groups, ", Distinct ages: ", num_distinct_ages, ")."))
-                                    return(return_structured_result(NULL, "Skipped", paste0("Insufficient variation for regression (Subjects: ", num_subjects, ", Sex groups: ", num_sex_groups, ", Distinct ages: ", num_distinct_ages, ")")))
-                                  }
-                                  
-                                  # Convert Seurat object to SingleCellExperiment (SCE) for MAST compatibility.
-                                  message_to_worker_log(paste0("Converting to SingleCellExperiment for ", current_tissue_name, "."))
-                                  sce_tissue <- as.SingleCellExperiment(tissue_seurat, assay = "RNA")
-                                  rm(tissue_seurat); gc(verbose = FALSE) # Clear Seurat object after conversion
-                                  
-                                  # Drop unused factor levels to prevent issues in downstream models.
-                                  colData(sce_tissue)$donor_id <- droplevels(colData(sce_tissue)$donor_id)
-                                  colData(sce_tissue)$sex <- droplevels(colData(sce_tissue)$sex)
-                                  
-                                  # Filter out subjects with only one cell for MAST stability.
-                                  subject_counts <- table(colData(sce_tissue)$donor_id)
-                                  subjects_to_keep <- names(subject_counts[subject_counts > 1])
-                                  
-                                  if (length(subjects_to_keep) < 2) {
-                                    message_to_worker_log(paste0("  Skipping '", current_tissue_name, "' due to insufficient subjects with more than one cell (after filtering)."))
-                                    return(return_structured_result(NULL, "Skipped", "Insufficient subjects with more than one cell after filtering"))
-                                  }
-                                  
-                                  sce_tissue <- sce_tissue[, colData(sce_tissue)$donor_id %in% subjects_to_keep]
-                                  colData(sce_tissue)$donor_id <- droplevels(colData(sce_tissue)$donor_id)
-                                  
-                                  if (ncol(sce_tissue) < min_cells_per_tissue) {
-                                    message_to_worker_log(paste0("  Skipping '", current_tissue_name, "' due to insufficient cells (", ncol(sce_tissue), " < ", min_cells_per_tissue, ") after subject filtering."))
-                                    return(return_structured_result(NULL, "Skipped", paste0("Insufficient cells (", ncol(sce_tissue), " < ", min_cells_per_tissue, ") after subject filtering")))
-                                  }
-                                  
-                                  # Filter genes: keep only those expressed in a minimum percentage of cells.
-                                  expressed_genes <- rowSums(assay(sce_tissue, "logcounts") > 0) / ncol(sce_tissue) > min_expressed_gene_threshold
-                                  if (sum(expressed_genes) < min_genes_after_filter) {
-                                    message_to_worker_log(paste0("  Skipping '", current_tissue_name, "' due to insufficient highly expressed genes (", sum(expressed_genes), " < ", min_genes_after_filter, ")."))
-                                    return(return_structured_result(NULL, "Skipped", paste0("Insufficient highly expressed genes (", sum(expressed_genes), " < ", min_genes_after_filter, ")")))
-                                  }
-                                  sce_tissue_filtered <- sce_tissue[expressed_genes, ]
-                                  rm(sce_tissue); gc(verbose = FALSE) # Clear original SCE object after filtering
-                                  
-                                  final_cell_count <- ncol(sce_tissue_filtered)
-                                  final_gene_count <- nrow(sce_tissue_filtered)
-                                  
-                                  # Explicitly define primerid (gene ID) and wellKey (cell ID) for MAST.
-                                  rowData(sce_tissue_filtered)$primerid <- rownames(sce_tissue_filtered)
-                                  colData(sce_tissue_filtered)$wellKey <- colnames(sce_tissue_filtered)
-                                  
-                                  # --- DEBUGGING CHECKS: Verify data consistency before MAST processing ---
-                                  message_to_worker_log(paste0("  DEBUG: Dimensions of sce_tissue_filtered: ", paste(dim(sce_tissue_filtered), collapse = "x")))
-                                  if (!identical(length(rownames(sce_tissue_filtered)), length(rowData(sce_tissue_filtered)$primerid))) stop("DEBUG ERROR: Rownames/primerid mismatch!")
-                                  if (!identical(length(colnames(sce_tissue_filtered)), length(colData(sce_tissue_filtered)$wellKey))) stop("DEBUG ERROR: Colnames/wellKey mismatch!")
-                                  if (any(nchar(rownames(sce_tissue_filtered)) == 0)) stop("DEBUG ERROR: Rownames contain empty strings!")
-                                  if (any(is.na(rowData(sce_tissue_filtered)$primerid))) stop("DEBUG ERROR: primerid contains NA values!")
-                                  # --- END DEBUGGING CHECKS ---
-                                  
-                                  # --- Perform MAST Analysis and OmicSignature Creation ---
-                                  message_to_worker_log(paste0("Running MAST for '", current_tissue_name, "' with ", nrow(sce_tissue_filtered), " genes and ", ncol(sce_tissue_filtered), " cells."))
-                                  
-                                  # Confirm sparsity before conversion to SingleCellAssay (MAST's required format).
-                                  if (inherits(assay(sce_tissue_filtered, "logcounts"), "sparseMatrix")) {
-                                    message_to_worker_log(paste0("  DEBUG: 'logcounts' assay in sce_tissue_filtered is sparse before SceToSingleCellAssay."))
-                                  } else {
-                                    message_to_worker_log(paste0("  DEBUG: 'logcounts' assay in sce_tissue_filtered is dense before SceToSingleCellAssay. This might trigger coercion."))
-                                  }
-                                  
-                                  sca_mast <- SceToSingleCellAssay(sce_tissue_filtered, class = "SingleCellAssay")
-                                  rm(sce_tissue_filtered); gc(verbose = FALSE) # Clear filtered SCE object after conversion to SCA
-                                  
-                                  # Confirm sparsity after conversion to SingleCellAssay.
-                                  if (inherits(assay(sca_mast, "logcounts"), "sparseMatrix")) {
-                                    message_to_worker_log(paste0("  DEBUG: 'logcounts' assay in sca_mast is sparse after SceToSingleCellAssay."))
-                                  } else {
-                                    message_to_worker_log(paste0("  DEBUG: 'logcounts' assay in sca_mast is dense after SceToSingleCellAssay. This is where dense conversion for MAST occurs."))
-                                  }
-                                  
-                                  # Fit the ZLM model: gene ~ age + sex + donor_id.
-                                  # 'parallel = TRUE' tells MAST to use the cores set by options(mc.cores) for this worker.
-                                  if (safe_tissue_name %in% list('ovary', 'prostate gland', 'testis')) {
-                                    zlm_obj <- zlm(~ age + donor_id, sca = sca_mast, method = 'glm', ebayes = TRUE, parallel = TRUE, exprs_value = 'logcounts') 
-                                  } else {
-                                    zlm_obj <- zlm(~ age + sex + donor_id, sca = sca_mast, method = 'glm', ebayes = TRUE, parallel = TRUE, exprs_value = 'logcounts') 
-                                  }
-                                  rm(sca_mast); gc(verbose = FALSE) # Clear SCA object after ZLM model creation
-                                  
-                                  # Get summary results for the 'age' coefficient using a Likelihood Ratio Test (doLRT).
-                                  summary_age_results <- summary(zlm_obj, doLRT = "age")
-                                  results_table_mast_raw <- summary_age_results$datatable
-                                  rm(zlm_obj, summary_age_results); gc(verbose = FALSE) # Clear ZLM object and summary after extracting datatable
-                                  
-                                  # Filter for the 'age' contrast and calculate FDR.
-                                  results_table_mast <- results_table_mast_raw %>%
-                                    dplyr::filter(component == 'C' & contrast == 'age') %>% 
-                                    dplyr::select(
-                                      PrimerID = primerid, logFC_val = coef, Pvalue_val = `Pr(>Chisq)`     
-                                    ) %>%
-                                    dplyr::mutate(
-                                      FDR_val = p.adjust(Pvalue_val, method = "fdr") 
-                                    ) %>%
-                                    dplyr::select(
-                                      PrimerID = PrimerID, logFC = logFC_val, Pvalue = Pvalue_val, FDR = FDR_val
-                                    )
-                                  rm(results_table_mast_raw); gc(verbose = FALSE) # Clear raw MAST results after filtering
-                                  
-                                  # Skip if no differential expression results found for 'age'.
-                                  if (is.null(results_table_mast) || nrow(results_table_mast) == 0) {
-                                    message_to_worker_log(paste0("  No differential expression results found for 'age' in tissue: ", current_tissue_name))
-                                    return(return_structured_result(NULL, "Skipped", "No differential expression results found for 'age'"))
-                                  } else {
-                                    # Prepare results for OmicSignature object (difexp data frame).
-                                    results_table_omic <- results_table_mast %>%
-                                      dplyr::mutate(
-                                        probe_id = PrimerID, feature_name = PrimerID, score = `logFC`,
-                                        p_value = `Pvalue`, adj_p = `FDR`
-                                      ) %>%
-                                      dplyr::select(probe_id, feature_name, score, p_value, adj_p) %>%
-                                      dplyr::mutate(
-                                        group_label = as.factor(ifelse(score > 0, "Increased_with_Age", "Decreased_with_Age"))
-                                      )
-                                    rm(results_table_mast); gc(verbose = FALSE) # Clear results_table_mast after conversion to Omic format
+                                  if (continue_processing) {
+                                    num_subjects <- length(levels(tissue_seurat@meta.data$donor_id))
+                                    num_sex_groups <- length(levels(tissue_seurat@meta.data$sex))
+                                    num_distinct_ages <- length(unique(tissue_seurat@meta.data$age))
                                     
-                                    # --- Automated BRENDA ontology lookup for sample_type ---
-                                    found_sample_type <- NULL
-                                    brenda_results_all <- OmicSignature::searchSampleType(current_tissue_name, contain_all = FALSE)
-                                    if (nrow(brenda_results_all) > 0) {
-                                      found_sample_type <- brenda_results_all$Name[1]
-                                    } else {
-                                      brenda_results_broad <- OmicSignature::searchSampleType(current_tissue_name, contain_all = FALSE)
-                                      if (nrow(brenda_results_broad) > 0) {
-                                        brenda_results_broad <- brenda_results_broad %>%
-                                          dplyr::mutate(word_count = sapply(strsplit(Name, "\\s+"), length)) %>%
-                                          dplyr::arrange(word_count)
-                                        found_sample_type <- brenda_results_broad$Name[1]
+                                    if (num_subjects < 2 || num_sex_groups < 2 || num_distinct_ages < 3) {
+                                      message_to_worker_log(paste0("  Skipping '", current_tissue_name, "' due to insufficient variation for regression (Subjects: ", num_subjects, ", Sex groups: ", num_sex_groups, ", Distinct ages: ", num_distinct_ages, ")."))
+                                      status_for_return <<- "Skipped"
+                                      reason_for_return <<- paste0("Insufficient variation for regression (Subjects: ", num_subjects, ", Sex groups: ", num_sex_groups, ", Distinct ages: ", num_distinct_ages, ")")
+                                      continue_processing <<- FALSE
+                                    }
+                                  }
+                                  
+                                  # --- Core Processing (only if 'continue_processing' is still TRUE) ---
+                                  if (continue_processing) {
+                                    # Convert Seurat object to SingleCellExperiment (SCE) for MAST compatibility.
+                                    message_to_worker_log(paste0("Converting to SingleCellExperiment for ", current_tissue_name, "."))
+                                    sce_tissue <- as.SingleCellExperiment(tissue_seurat, assay = "RNA")
+                                    rm(tissue_seurat); gc(verbose = FALSE) # Clear Seurat object after conversion
+                                    
+                                    # Drop unused factor levels to prevent issues in downstream models.
+                                    colData(sce_tissue)$donor_id <- droplevels(colData(sce_tissue)$donor_id)
+                                    colData(sce_tissue)$sex <- droplevels(colData(sce_tissue)$sex)
+                                    
+                                    # Filter out subjects with only one cell for MAST stability.
+                                    subject_counts <- table(colData(sce_tissue)$donor_id)
+                                    subjects_to_keep <- names(subject_counts[subject_counts > 1])
+                                    
+                                    if (length(subjects_to_keep) < 2) {
+                                      message_to_worker_log(paste0("  Skipping '", current_tissue_name, "' due to insufficient subjects with more than one cell (after filtering)."))
+                                      status_for_return <<- "Skipped"
+                                      reason_for_return <<- "Insufficient subjects with more than one cell after filtering"
+                                      continue_processing <<- FALSE
+                                    } else { # Only proceed if subjects are sufficient
+                                      sce_tissue <- sce_tissue[, colData(sce_tissue)$donor_id %in% subjects_to_keep]
+                                      colData(sce_tissue)$donor_id <- droplevels(colData(sce_tissue)$donor_id)
+                                      
+                                      if (ncol(sce_tissue) < min_cells_per_tissue) {
+                                        message_to_worker_log(paste0("  Skipping '", current_tissue_name, "' due to insufficient cells (", ncol(sce_tissue), " < ", min_cells_per_tissue, ") after subject filtering."))
+                                        status_for_return <<- "Skipped"
+                                        reason_for_return <<- paste0("Insufficient cells (", ncol(sce_tissue), " < ", min_cells_per_tissue, ") after subject filtering")
+                                        continue_processing <<- FALSE
+                                      } else { # Only proceed if cells are sufficient
+                                        # Filter genes: keep only those expressed in a minimum percentage of cells.
+                                        expressed_genes <- rowSums(assay(sce_tissue, "logcounts") > 0) / ncol(sce_tissue) > min_expressed_gene_threshold
+                                        if (sum(expressed_genes) < min_genes_after_filter) {
+                                          message_to_worker_log(paste0("  Skipping '", current_tissue_name, "' due to insufficient highly expressed genes (", sum(expressed_genes), " < ", min_genes_after_filter, ")."))
+                                          status_for_return <<- "Skipped"
+                                          reason_for_return <<- paste0("Insufficient highly expressed genes (", sum(expressed_genes), " < ", min_genes_after_filter, ")")
+                                          continue_processing <<- FALSE
+                                        } else { # All filters passed, proceed with MAST preparation
+                                          sce_tissue_filtered <- sce_tissue[expressed_genes, ]
+                                          rm(sce_tissue); gc(verbose = FALSE) # Clear original SCE object after filtering
+                                          
+                                          final_cell_count_for_return <<- ncol(sce_tissue_filtered)
+                                          final_gene_count_for_return <<- nrow(sce_tissue_filtered)
+                                          
+                                          # Explicitly define primerid (gene ID) and wellKey (cell ID) for MAST.
+                                          rowData(sce_tissue_filtered)$primerid <- rownames(sce_tissue_filtered)
+                                          colData(sce_tissue_filtered)$wellKey <- colnames(sce_tissue_filtered)
+                                          
+                                          # --- Perform MAST Analysis and OmicSignature Creation ---
+                                          message_to_worker_log(paste0("Running MAST for '", current_tissue_name, "' with ", nrow(sce_tissue_filtered), " genes and ", ncol(sce_tissue_filtered), " cells."))
+                                          
+                                          sca_mast <- SceToSingleCellAssay(sce_tissue_filtered, class = "SingleCellAssay")
+                                          rm(sce_tissue_filtered); gc(verbose = FALSE) # Clear filtered SCE object after conversion to SCA
+                                          
+                                          # Fit the ZLM model: gene ~ age + sex + donor_id.
+                                          # 'parallel = TRUE' tells MAST to use the cores set by options(mc.cores) for this worker.
+                                          # Corrected 'prostate gland' to 'prostate_gland' for safe_tissue_name check
+                                          if (safe_tissue_name %in% c('ovary', 'prostate_gland', 'testis')) {
+                                            zlm_obj <- zlm(~ age + donor_id, sca = sca_mast, method = 'glm', ebayes = TRUE, parallel = TRUE, exprs_value = 'logcounts') 
+                                          } else {
+                                            zlm_obj <- zlm(~ age + sex + donor_id, sca = sca_mast, method = 'glm', ebayes = TRUE, parallel = TRUE, exprs_value = 'logcounts') 
+                                          }
+                                          rm(sca_mast); gc(verbose = FALSE) # Clear SCA object after ZLM model creation
+                                          
+                                          # Get summary results for the 'age' coefficient using a Likelihood Ratio Test (doLRT).
+                                          summary_age_results <- summary(zlm_obj, doLRT = "age")
+                                          results_table_mast_raw <- summary_age_results$datatable
+                                          rm(zlm_obj, summary_age_results); gc(verbose = FALSE) # Clear ZLM object and summary after extracting datatable
+                                          
+                                          # Filter for the 'age' contrast and calculate FDR.
+                                          results_table_mast <- results_table_mast_raw %>%
+                                            dplyr::filter(component == 'C' & contrast == 'age') %>% 
+                                            dplyr::select(
+                                              PrimerID = primerid, logFC_val = coef, Pvalue_val = `Pr(>Chisq)`     
+                                            ) %>%
+                                            dplyr::mutate(
+                                              FDR_val = p.adjust(Pvalue_val, method = "fdr") 
+                                            ) %>%
+                                            dplyr::select(
+                                              PrimerID = PrimerID, logFC = logFC_val, Pvalue = Pvalue_val, FDR = FDR_val
+                                            )
+                                          rm(results_table_mast_raw); gc(verbose = FALSE) # Clear raw MAST results after filtering
+                                          
+                                          # Skip if no differential expression results found for 'age'.
+                                          if (is.null(results_table_mast) || nrow(results_table_mast) == 0) {
+                                            message_to_worker_log(paste0("  No differential expression results found for 'age' in tissue: ", current_tissue_name))
+                                            status_for_return <<- "Skipped"
+                                            reason_for_return <<- "No differential expression results found for 'age'"
+                                            continue_processing <<- FALSE # Set flag, but let flow continue to final return
+                                          } else {
+                                            # Prepare results for OmicSignature object (difexp data frame).
+                                            results_table_omic <- results_table_mast %>%
+                                              dplyr::mutate(
+                                                probe_id = PrimerID, feature_name = PrimerID, score = `logFC`,
+                                                p_value = `Pvalue`, adj_p = `FDR`
+                                              ) %>%
+                                              dplyr::select(probe_id, feature_name, score, p_value, adj_p) %>%
+                                              dplyr::mutate(
+                                                group_label = as.factor(ifelse(score > 0, "Increased_with_Age", "Decreased_with_Age"))
+                                              )
+                                            rm(results_table_mast); gc(verbose = FALSE) # Clear results_table_mast after conversion to Omic format
+                                            
+                                            # --- Automated BRENDA ontology lookup for sample_type ---
+                                            found_sample_type <- NULL
+                                            brenda_results_all <- OmicSignature::searchSampleType(current_tissue_name, contain_all = FALSE)
+                                            if (nrow(brenda_results_all) > 0) {
+                                              found_sample_type <- brenda_results_all$Name[1]
+                                            } else {
+                                              brenda_results_broad <- OmicSignature::searchSampleType(current_tissue_name, contain_all = FALSE)
+                                              if (nrow(brenda_results_broad) > 0) {
+                                                brenda_results_broad <- brenda_results_broad %>%
+                                                  dplyr::mutate(word_count = sapply(strsplit(Name, "\\s+"), length)) %>%
+                                                  dplyr::arrange(word_count)
+                                                found_sample_type <- brenda_results_broad$Name[1]
+                                              }
+                                            }
+                                            if (is.null(found_sample_type)) {
+                                              found_sample_type <- paste0(current_tissue_name, " cells")
+                                              message_to_worker_log(paste0("  Warning: No suitable BRENDA ontology term found for '", current_tissue_name, "'. Using '", found_sample_type, "'."))
+                                            }
+                                            
+                                            # Create metadata for the tissue-specific OmicSignature.
+                                            metadata_tissue_sig <- OmicSignature::createMetadata(
+                                              signature_name = paste0("Aging Signature - ", current_tissue_name),
+                                              organism = "Homo sapiens", direction_type = "bi-directional", phenotype = paste0("Aging in ", current_tissue_name),
+                                              assay_type = "transcriptomics", covariates = "sex, donor_id", platform = "transcriptomics by single-cell RNA-seq",
+                                              sample_type = found_sample_type, adj_p_cutoff = adj_p_cutoff, score_cutoff = score_cutoff,
+                                              keywords = c("Aging", current_tissue_name, "Tabula Sapiens", "single-cell", "MAST"),
+                                              author = "ChallengeProject2025", PMID = NULL, year = as.numeric(format(Sys.Date(), "%Y")),
+                                              description = paste0("Aging signature derived from Tabula Sapiens human single-cell RNA-seq data for the ", current_tissue_name, " tissue. Differential expression calculated with MAST, adjusting for sex and donor_id. Filters: min cells=",min_cells_per_tissue,", min gene expr=",min_expressed_gene_threshold*100,"%, adj.p<=",adj_p_cutoff,", |logFC|>=",score_cutoff,".")
+                                            )
+                                            
+                                            # Filter for significant genes based on defined cutoffs.
+                                            sig_genes <- results_table_omic %>%
+                                              dplyr::filter(adj_p <= adj_p_cutoff & abs(score) >= score_cutoff) %>%
+                                              dplyr::select(probe_id, feature_name, score, group_label)
+                                            
+                                            # Skip if no significant genes found after filtering.
+                                            if (nrow(sig_genes) == 0) {
+                                              message_to_worker_log(paste0("  No significant genes found for 'age' in tissue: ", current_tissue_name, " with current cutoffs (adj_p <= ", adj_p_cutoff, ", |logFC| >= ", score_cutoff, "). No OmicSignature object created."))
+                                              status_for_return <<- "Skipped (No Sig Genes)" 
+                                              reason_for_return <<- paste0("No significant genes found with current cutoffs (adj_p <= ", adj_p_cutoff, ", |logFC| >= ", score_cutoff, "). OmicSignature object not created.")
+                                              significant_genes_count_for_return <<- 0
+                                              output_file_path_for_return <<- "N/A"
+                                              omic_sig_object_for_return <<- NULL 
+                                              rm(results_table_omic, sig_genes); gc(verbose = FALSE) 
+                                            } else {
+                                              # Create the OmicSignature object for the current tissue.
+                                              omic_sig_tissue <- OmicSignature$new(
+                                                metadata = metadata_tissue_sig,
+                                                signature = sig_genes,
+                                                difexp = results_table_omic 
+                                              )
+                                              
+                                              # Save individual OmicSignature object (for easier access) within each worker.
+                                              current_output_file <- file.path(omic_signature_output_path, paste0("aging_signature_", safe_tissue_name, "_oSig.rds"))
+                                              saveRDS(omic_sig_tissue, file = current_output_file)
+                                              message_to_worker_log(paste0("  Successfully created and added aging signature for ", current_tissue_name, ". (", nrow(sig_genes), " significant genes)"))
+                                              
+                                              status_for_return <<- "Success"
+                                              reason_for_return <<- "OmicSignature created successfully"
+                                              significant_genes_count_for_return <<- nrow(sig_genes)
+                                              output_file_path_for_return <<- current_output_file
+                                              omic_sig_object_for_return <<- omic_sig_tissue
+                                            }
+                                          }
+                                        }
                                       }
                                     }
-                                    if (is.null(found_sample_type)) {
-                                      found_sample_type <- paste0(current_tissue_name, " cells")
-                                      message_to_worker_log(paste0("  Warning: No suitable BRENDA ontology term found for '", current_tissue_name, "'. Using '", found_sample_type, "'."))
-                                    }
-                                    
-                                    # Create metadata for the tissue-specific OmicSignature.
-                                    metadata_tissue_sig <- OmicSignature::createMetadata(
-                                      signature_name = paste0("Aging Signature - ", current_tissue_name),
-                                      organism = "Homo sapiens", direction_type = "bi-directional", phenotype = paste0("Aging in ", current_tissue_name),
-                                      assay_type = "transcriptomics", covariates = "sex, donor_id", platform = "transcriptomics by single-cell RNA-seq",
-                                      sample_type = found_sample_type, adj_p_cutoff = adj_p_cutoff, score_cutoff = score_cutoff,
-                                      keywords = c("Aging", current_tissue_name, "Tabula Sapiens", "single-cell", "MAST"),
-                                      author = "ChallengeProject2025", PMID = NULL, year = as.numeric(format(Sys.Date(), "%Y")),
-                                      description = paste0("Aging signature derived from Tabula Sapiens human single-cell RNA-seq data for the ", current_tissue_name, " tissue. Differential expression calculated with MAST, adjusting for sex and donor_id. Filters: min cells=",min_cells_per_tissue,", min gene expr=",min_expressed_gene_threshold*100,"%, adj.p<=",adj_p_cutoff,", |logFC|>=",score_cutoff,".")
-                                    )
-                                    
-                                    # Filter for significant genes based on defined cutoffs.
-                                    sig_genes <- results_table_omic %>%
-                                      dplyr::filter(adj_p <= adj_p_cutoff & abs(score) >= score_cutoff) %>%
-                                      dplyr::select(probe_id, feature_name, score, group_label)
-                                    
-                                    # Skip if no significant genes found after filtering.
-                                    if (nrow(sig_genes) == 0) {
-                                      message_to_worker_log(paste0("  No significant genes found for 'age' in tissue: ", current_tissue_name, " with current cutoffs (adj_p <= ", adj_p_cutoff, ", |logFC| >= ", score_cutoff, "). No OmicSignature object created."))
-                                      
-                                      status <- "Skipped (No Sig Genes)" # Corrected status to skipped
-                                      reason <- paste0("No significant genes found with current cutoffs (adj_p <= ", adj_p_cutoff, ", |logFC| >= ", score_cutoff, "). OmicSignature object not created.") # Changed <<- to <-
-                                      significant_genes_count <- 0
-                                      output_file_path <- "N/A" # No file saved
-                                      omic_sig_object <- NULL # Explicitly set to NULL if no signature is generated
-                                      rm(results_table_omic, sig_genes); gc(verbose = FALSE) # Clean up intermediate data frames
-                                      # Let it flow to finally block to return summary with NULL omic_sig_object
-                                      
-                                    } else {
-                                      # Create the OmicSignature object for the current tissue.
-                                      omic_sig_tissue <- OmicSignature$new(
-                                        metadata = metadata_tissue_sig,
-                                        signature = sig_genes,
-                                        difexp = results_table_omic # Store the full differential expression results
-                                      )
-                                      
-                                      # Save individual OmicSignature object (for easier access) within each worker.
-                                      current_output_file <- file.path(omic_signature_output_path, paste0("aging_signature_", safe_tissue_name, "_oSig.rds"))
-                                      saveRDS(omic_sig_tissue, file = current_output_file)
-                                      message_to_worker_log(paste0("  Successfully created and added aging signature for ", current_tissue_name, ". (", nrow(sig_genes), " significant genes)"))
-                                      
-                                      status <- "Success"
-                                      reason <- "OmicSignature created successfully"
-                                      significant_genes_count <- nrow(sig_genes)
-                                      output_file_path <- current_output_file
-                                      omic_sig_object <- omic_sig_tissue
-                                      # Let execution flow to finally block.
-                                    }
-                                  }
+                                  } # End of if (continue_processing) for core logic
+                                  
+                                  # Final cleanup within the worker before returning results.
+                                  # Only retain variables explicitly needed for the final return structure.
+                                  # Note: 'rm(list=ls(all.names=TRUE))' is very aggressive and might remove exported vars.
+                                  # Explicitly clearing known large objects is safer.
+                                  
+                                  # THIS MUST BE THE FINAL EXPRESSION OF THE tryCatch's expr block
+                                  # All outcomes (success, various skips) flow to this consistent return.
+                                  build_structured_result_for_foreach(
+                                    current_tissue_name = current_tissue_name,
+                                    status_val = status_for_return,
+                                    reason_val = reason_for_return,
+                                    initial_cells = initial_cell_count_for_return,
+                                    final_cells_before_mast = final_cell_count_for_return,
+                                    initial_genes = initial_gene_count_for_return,
+                                    final_genes_before_mast = final_gene_count_for_return,
+                                    significant_genes = significant_genes_count_for_return,
+                                    omic_signature_file = output_file_path_for_return,
+                                    omic_sig_object = omic_sig_object_for_return
+                                  )
+                                  
                                 }, error = function(e) {
-                                  # Catches any *unexpected* error during tissue analysis and logs it.
+                                  # This error handler catches any CRITICAL, unexpected errors during processing.
                                   message_to_worker_log(paste0("  CRITICAL ERROR during processing for tissue '", current_tissue_name, "': ", e$message))
-                                  return(return_structured_result(NULL, "Error", paste0("CRITICAL ERROR during processing: ", e$message)))
+                                  
+                                  # Ensure all variables used in build_structured_result_for_foreach are available.
+                                  # For initial/final counts, use the values captured before the error occurred.
+                                  build_structured_result_for_foreach(
+                                    current_tissue_name = current_tissue_name,
+                                    status_val = "Error",
+                                    reason_val = paste0("CRITICAL ERROR during processing: ", e$message),
+                                    initial_cells = initial_cell_count_for_return,
+                                    final_cells_before_mast = final_cell_count_for_return,
+                                    initial_genes = initial_gene_count_for_return,
+                                    final_genes_before_mast = final_gene_count_for_return,
+                                    significant_genes = 0, # No significant genes on error
+                                    omic_signature_file = "N/A", # No file saved on error
+                                    omic_sig_object = NULL # No OmicSignature object on error
+                                  )
                                 })
+                                
+                                # Explicitly return the result from the tryCatch block for the foreach combiner
+                                return(final_worker_output)
                               } # End foreach loop
 
 
@@ -472,3 +513,4 @@ if (length(all_tissue_omicsigs_filtered) > 0) {
 }
 
 message("\nScript finished.")
+
