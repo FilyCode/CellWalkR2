@@ -274,7 +274,11 @@ all_tissue_results <- foreach(file_path = tissue_files[2:5],
                                   
                                   # Fit the ZLM model: gene ~ age + sex + donor_id.
                                   # 'parallel = TRUE' tells MAST to use the cores set by options(mc.cores) for this worker.
-                                  zlm_obj <- zlm(~ age + sex + donor_id, sca = sca_mast, method = 'glm', ebayes = TRUE, parallel = TRUE, exprs_value = 'logcounts') 
+                                  if (safe_tissue_name %in% list('ovary', 'prostate gland', 'testis')) {
+                                    zlm_obj <- zlm(~ age + donor_id, sca = sca_mast, method = 'glm', ebayes = TRUE, parallel = TRUE, exprs_value = 'logcounts') 
+                                  } else {
+                                    zlm_obj <- zlm(~ age + sex + donor_id, sca = sca_mast, method = 'glm', ebayes = TRUE, parallel = TRUE, exprs_value = 'logcounts') 
+                                  }
                                   rm(sca_mast); gc(verbose = FALSE) # Clear SCA object after ZLM model creation
                                   
                                   # Get summary results for the 'age' coefficient using a Likelihood Ratio Test (doLRT).
