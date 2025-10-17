@@ -45,7 +45,7 @@ sge_total_slots <- as.numeric(Sys.getenv("NSLOTS", unset = 1))
 
 # Number of concurrent tissue analyses for the outer loop.
 # This value determines how many R processes run simultaneously.
-n_concurrent_tissues <- 2 
+n_concurrent_tissues <- 4
 
 # Number of CPU cores for MAST zlm to use within each concurrent tissue analysis.
 mast_cores_per_tissue <- max(1, floor(sge_total_slots / n_concurrent_tissues))
