@@ -18,7 +18,7 @@ library(Matrix)           # For efficient sparse matrix operations
 
 # --- Define Paths and Analysis Variables ---
 data_input_path <- file.path("/restricted/projectnb/agedisease/projects/challenge2025/data/Tabula_sapiens")
-omic_signature_output_path <- file.path("/restricted/projectnb/agedisease/projects/challenge2025/results/Tabula_sapiens_test")
+omic_signature_output_path <- file.path("/restricted/projectnb/agedisease/projects/challenge2025/results/Tabula_sapiens/MAST/advanced_regression")
 
 # Create output directory if it doesn't exist
 dir.create(omic_signature_output_path, recursive = TRUE, showWarnings = FALSE)
@@ -271,10 +271,11 @@ all_tissue_results <- foreach(file_path = tissue_files,
                                     rm(sce_tissue_filtered); gc(verbose = FALSE) # Free memory
                                     
                                     # Define regression model based on tissue type (sex is not always a relevant covariate)
+                                    # could maybe also add self_reported_ethnicity as a parameter
                                     if (safe_tissue_name %in% c('ovary', 'prostate_gland', 'testis')) {
-                                      zlm_obj <- zlm(~ age + donor_id, sca = sca_mast, method = 'glm', ebayes = TRUE, parallel = TRUE, exprs_value = 'logcounts') 
+                                      zlm_obj <- zlm(~ age + (1|donor_id) + assay , sca = sca_mast, method = 'glm', ebayes = TRUE, parallel = TRUE, exprs_value = 'logcounts') 
                                     } else {
-                                      zlm_obj <- zlm(~ age + sex + donor_id, sca = sca_mast, method = 'glm', ebayes = TRUE, parallel = TRUE, exprs_value = 'logcounts') 
+                                      zlm_obj <- zlm(~ age + sex + (age|sex) + (1|donor_id) + assay , sca = sca_mast, method = 'glm', ebayes = TRUE, parallel = TRUE, exprs_value = 'logcounts') 
                                     }
                                     rm(sca_mast); gc(verbose = FALSE) # Free memory
                                     
