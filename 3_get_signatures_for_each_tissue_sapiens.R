@@ -45,7 +45,7 @@ sge_total_slots <- as.numeric(Sys.getenv("NSLOTS", unset = 1))
 
 # Number of concurrent tissue analyses for the outer loop.
 # This value determines how many R processes run simultaneously.
-n_concurrent_tissues <- 4
+n_concurrent_tissues <- 2
 
 # Number of CPU cores for MAST zlm to use within each concurrent tissue analysis.
 mast_cores_per_tissue <- max(1, floor(sge_total_slots / n_concurrent_tissues))
@@ -272,10 +272,18 @@ all_tissue_results <- foreach(file_path = tissue_files,
                                     
                                     # Define regression model based on tissue type (sex is not always a relevant covariate)
                                     # could maybe also add self_reported_ethnicity as a parameter
-                                    if (safe_tissue_name %in% c('ovary', 'prostate_gland', 'testis')) {
-                                      zlm_obj <- zlm(~ age + (1|donor_id) + assay , sca = sca_mast, method = 'glm', ebayes = TRUE, parallel = TRUE, exprs_value = 'logcounts') 
-                                    } else {
-                                      zlm_obj <- zlm(~ age + sex + (age|sex) + (1|donor_id) + assay , sca = sca_mast, method = 'glm', ebayes = TRUE, parallel = TRUE, exprs_value = 'logcounts') 
+                                    if (length(unique(colData(sce_tissue_filtered)$assay)) < 2) {
+                                      if (safe_tissue_name %in% c('ovary', 'prostate_gland', 'testis')) {
+                                        zlm_obj <- zlm(~ age + (1|donor_id) , sca = sca_mast, method = 'glm', ebayes = TRUE, parallel = TRUE, exprs_value = 'logcounts') 
+                                      } else {
+                                        zlm_obj <- zlm(~ age + sex + (age|sex) + (1|donor_id) , sca = sca_mast, method = 'glm', ebayes = TRUE, parallel = TRUE, exprs_value = 'logcounts') 
+                                      }
+                                    } else { # Only use assay if we have different assay types in tissue dataset
+                                      if (safe_tissue_name %in% c('ovary', 'prostate_gland', 'testis')) {
+                                        zlm_obj <- zlm(~ age + (1|donor_id) + assay , sca = sca_mast, method = 'glm', ebayes = TRUE, parallel = TRUE, exprs_value = 'logcounts') 
+                                      } else {
+                                        zlm_obj <- zlm(~ age + sex + (age|sex) + (1|donor_id) + assay , sca = sca_mast, method = 'glm', ebayes = TRUE, parallel = TRUE, exprs_value = 'logcounts') 
+                                      }
                                     }
                                     rm(sca_mast); gc(verbose = FALSE) # Free memory
                                     
