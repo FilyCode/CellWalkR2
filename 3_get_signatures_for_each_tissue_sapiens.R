@@ -222,6 +222,7 @@ all_tissue_results <- foreach(file_path = tissue_files,
                                     num_subjects <- length(levels(tissue_seurat@meta.data$donor_id))
                                     num_sex_groups <- length(levels(tissue_seurat@meta.data$sex))
                                     num_distinct_ages <- length(unique(tissue_seurat@meta.data$age))
+                                    num_distinct_assays <- length(unique(tissue_seurat@meta.data$assay))
                                     
                                     if (num_subjects < 2 || num_sex_groups < 2 || num_distinct_ages < 3) {
                                       stop(paste0("Insufficient variation for regression (Subjects: ", num_subjects, ", Sex groups: ", num_sex_groups, ", Distinct ages: ", num_distinct_ages, ")."))
@@ -272,17 +273,17 @@ all_tissue_results <- foreach(file_path = tissue_files,
                                     
                                     # Define regression model based on tissue type (sex is not always a relevant covariate)
                                     # could maybe also add self_reported_ethnicity as a parameter
-                                    if (length(unique(colData(sce_tissue_filtered)$assay)) < 2) {
+                                    if (num_distinct_assays < 2) {
                                       if (safe_tissue_name %in% c('ovary', 'prostate_gland', 'testis')) {
-                                        zlm_obj <- zlm(~ age + (1|donor_id) , sca = sca_mast, method = 'glm', ebayes = TRUE, parallel = TRUE, exprs_value = 'logcounts') 
+                                        zlm_obj <- zlm(~ age + donor_id , sca = sca_mast, method = 'glm', ebayes = TRUE, parallel = TRUE, exprs_value = 'logcounts') 
                                       } else {
-                                        zlm_obj <- zlm(~ age + sex + (age|sex) + (1|donor_id) , sca = sca_mast, method = 'glm', ebayes = TRUE, parallel = TRUE, exprs_value = 'logcounts') 
+                                        zlm_obj <- zlm(~ age + sex + age:sex + donor_id , sca = sca_mast, method = 'glm', ebayes = TRUE, parallel = TRUE, exprs_value = 'logcounts') 
                                       }
                                     } else { # Only use assay if we have different assay types in tissue dataset
                                       if (safe_tissue_name %in% c('ovary', 'prostate_gland', 'testis')) {
-                                        zlm_obj <- zlm(~ age + (1|donor_id) + assay , sca = sca_mast, method = 'glm', ebayes = TRUE, parallel = TRUE, exprs_value = 'logcounts') 
+                                        zlm_obj <- zlm(~ age + donor_id + assay , sca = sca_mast, method = 'glm', ebayes = TRUE, parallel = TRUE, exprs_value = 'logcounts') 
                                       } else {
-                                        zlm_obj <- zlm(~ age + sex + (age|sex) + (1|donor_id) + assay , sca = sca_mast, method = 'glm', ebayes = TRUE, parallel = TRUE, exprs_value = 'logcounts') 
+                                        zlm_obj <- zlm(~ age + sex + age:sex + donor_id + assay , sca = sca_mast, method = 'glm', ebayes = TRUE, parallel = TRUE, exprs_value = 'logcounts') 
                                       }
                                     }
                                     rm(sca_mast); gc(verbose = FALSE) # Free memory
