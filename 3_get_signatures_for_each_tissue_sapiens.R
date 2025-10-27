@@ -275,15 +275,15 @@ all_tissue_results <- foreach(file_path = tissue_files,
                                     # could maybe also add self_reported_ethnicity as a parameter
                                     if (num_distinct_assays < 2) {
                                       if (safe_tissue_name %in% c('ovary', 'prostate_gland', 'testis')) {
-                                        zlm_obj <- zlm(~ age + donor_id , sca = sca_mast, method = 'glm', ebayes = TRUE, parallel = TRUE, exprs_value = 'logcounts') 
+                                        zlm_obj <- zlm(~ age + (1|donor_id) + final_gene_count, sca = sca_mast, method = 'glmer', ebayes = FALSE, parallel = TRUE, exprs_value = 'logcounts') 
                                       } else {
-                                        zlm_obj <- zlm(~ age + sex + age:sex + donor_id , sca = sca_mast, method = 'glm', ebayes = TRUE, parallel = TRUE, exprs_value = 'logcounts') 
+                                        zlm_obj <- zlm(~ age + sex + (1|donor_id) + final_gene_count, sca = sca_mast, method = 'glmer', ebayes = FALSE, parallel = TRUE, exprs_value = 'logcounts') 
                                       }
                                     } else { # Only use assay if we have different assay types in tissue dataset
                                       if (safe_tissue_name %in% c('ovary', 'prostate_gland', 'testis')) {
-                                        zlm_obj <- zlm(~ age + donor_id + assay , sca = sca_mast, method = 'glm', ebayes = TRUE, parallel = TRUE, exprs_value = 'logcounts') 
+                                        zlm_obj <- zlm(~ age + (1|donor_id) + assay + final_gene_count, sca = sca_mast, method = 'glmer', ebayes = FALSE, parallel = TRUE, exprs_value = 'logcounts') 
                                       } else {
-                                        zlm_obj <- zlm(~ age + sex + age:sex + donor_id + assay , sca = sca_mast, method = 'glm', ebayes = TRUE, parallel = TRUE, exprs_value = 'logcounts') 
+                                        zlm_obj <- zlm(~ age + sex + (1|donor_id) + assay + final_gene_count, sca = sca_mast, method = 'glmer', ebayes = FALSE, parallel = TRUE, exprs_value = 'logcounts')
                                       }
                                     }
                                     rm(sca_mast); gc(verbose = FALSE) # Free memory
