@@ -32,7 +32,7 @@ min_cells_per_tissue <- 100         # Minimum cells required for MAST analysis p
 min_expressed_gene_threshold <- 0.1 # Gene must be expressed in at least this percentage of cells
 min_genes_after_filter <- 10        # Minimum number of genes to proceed with MAST
 adj_p_cutoff <- 0.05                # Adjusted p-value cutoff for significant genes in signature
-score_cutoff <- 0.25                # Absolute logFC cutoff for significant genes in signature
+score_cutoff <- 2                   # Absolute z-score cutoff for significant genes in signature
 
 
 # --- PARALLELISM CONFIGURATION ---
@@ -45,7 +45,7 @@ sge_total_slots <- as.numeric(Sys.getenv("NSLOTS", unset = 1))
 
 # Number of concurrent tissue analyses for the outer loop.
 # This value determines how many R processes run simultaneously.
-n_concurrent_tissues <- 6
+n_concurrent_tissues <- 8
 
 # Number of CPU cores for MAST zlm to use within each concurrent tissue analysis.
 mast_cores_per_tissue <- max(1, floor(sge_total_slots / n_concurrent_tissues))
@@ -80,7 +80,7 @@ message("\n--- Initializing OmicSignatureCollection Metadata ---")
 omicsig_collection_metadata <- list(
   collection_name = "Tabula Sapiens Human Aging Signatures - All Tissues", 
   description = paste0("Collection of aging signatures derived from Tabula Sapiens human single-cell RNA-seq data, stratified by tissue, adjusted for sex and donor_id. ",
-                       "MAST analysis used, with min cells: ", min_cells_per_tissue, ", min expressed gene threshold: ", min_expressed_gene_threshold * 100, "%, adj. p-value cutoff: ", adj_p_cutoff, ", |logFC| cutoff: ", score_cutoff, "."),
+                       "MAST analysis used, with min cells: ", min_cells_per_tissue, ", min expressed gene threshold: ", min_expressed_gene_threshold * 100, "%, adj. p-value cutoff: ", adj_p_cutoff, ", |z-score| cutoff: ", score_cutoff, "."),
   organism = "Homo sapiens",
   direction_type = "bi-directional",
   phenotype = "Aging",

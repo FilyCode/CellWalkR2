@@ -7,7 +7,7 @@
 #$ -P agedisease
 
 # Hard time limit (hh:mm:ss). Adjust as needed.
-#$ -l h_rt=12:00:00
+#$ -l h_rt=48:00:00
 
 # Job name
 #$ -N RAgeSignatureCalculation
@@ -22,10 +22,10 @@
 #$ -M phitro@bu.edu
 
 # Request cores.
-#$ -pe omp 16
+#$ -pe omp 32
 
 # Request total memory for the job.
-#$ -l mem_total=500G
+#$ -l mem_total=400G
 
 # --------------------------------------------------------------------------------
 # Setup R Environment
