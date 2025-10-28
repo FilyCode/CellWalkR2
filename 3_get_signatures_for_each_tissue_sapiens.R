@@ -18,7 +18,7 @@ library(Matrix)           # For efficient sparse matrix operations
 
 # --- Define Paths and Analysis Variables ---
 data_input_path <- file.path("/restricted/projectnb/agedisease/projects/challenge2025/data/Tabula_sapiens")
-omic_signature_output_path <- file.path("/restricted/projectnb/agedisease/projects/challenge2025/results/Tabula_sapiens/MAST/advanced_regression")
+omic_signature_output_path <- file.path("/restricted/projectnb/agedisease/projects/challenge2025/results/Tabula_sapiens/MAST/consenus_regression")
 
 # Create output directory if it doesn't exist
 dir.create(omic_signature_output_path, recursive = TRUE, showWarnings = FALSE)
@@ -45,7 +45,7 @@ sge_total_slots <- as.numeric(Sys.getenv("NSLOTS", unset = 1))
 
 # Number of concurrent tissue analyses for the outer loop.
 # This value determines how many R processes run simultaneously.
-n_concurrent_tissues <- 4
+n_concurrent_tissues <- 6
 
 # Number of CPU cores for MAST zlm to use within each concurrent tissue analysis.
 mast_cores_per_tissue <- max(1, floor(sge_total_slots / n_concurrent_tissues))
@@ -286,6 +286,13 @@ all_tissue_results <- foreach(file_path = tissue_files,
                                     
                                     sca_mast <- SceToSingleCellAssay(sce_tissue_filtered, class = "SingleCellAssay")
                                     rm(sce_tissue_filtered); gc(verbose = FALSE) # Free memory
+                                    
+                                    # Sanitize the 'assay' column in sca_mast$colData if it's used in the model
+                                    if ("assay" %in% colnames(colData(sca_mast))) {
+                                      # Convert to factor first, then clean up levels
+                                      colData(sca_mast)$assay <- as.factor(colData(sca_mast)$assay)
+                                      levels(colData(sca_mast)$assay) <- make.names(levels(colData(sca_mast)$assay), unique = TRUE)
+                                    }
                                     
                                     # Define regression model based on tissue type (sex is not always a relevant covariate)
                                     # could maybe also add self_reported_ethnicity as a parameter
