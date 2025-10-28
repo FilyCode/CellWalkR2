@@ -310,18 +310,39 @@ all_tissue_results <- foreach(file_path = tissue_files,
                                     rm(zlm_obj, summary_age_results); gc(verbose = FALSE) # Free memory
                                     
                                     # Process MAST results into a standardized format
-                                    results_table_mast <- results_table_mast_raw %>%
-                                      dplyr::filter(component == 'C' & contrast == 'age_scaled') %>% 
+                                    # Extract marginal logFC and its z-score (component 'logFC')
+                                    marginal_results <- results_table_mast_raw %>%
+                                      dplyr::filter(component == 'logFC' & contrast == 'age_scaled') %>%
                                       dplyr::select(
-                                        PrimerID = primerid, logFC_val = coef, Pvalue_val = `Pr(>Chisq)`     
-                                      ) %>%
-                                      dplyr::mutate(
-                                        FDR_val = p.adjust(Pvalue_val, method = "fdr") 
-                                      ) %>%
-                                      dplyr::select(
-                                        PrimerID = PrimerID, logFC = logFC_val, Pvalue = Pvalue_val, FDR = FDR_val
+                                        PrimerID = primerid,
+                                        logFC_value = coef, # This is the marginal logFC estimate
+                                        z_stat_value = z    # This is the z-score for the marginal logFC (the 'stat' variable)
                                       )
-                                    rm(results_table_mast_raw); gc(verbose = FALSE) # Free memory
+                                    
+                                    # Extract Hurdle P-value (from component 'H' due to doLRT)
+                                    # Pr(>Chisq) is typically only present for component 'H' when doLRT is used.
+                                    hurdle_pvalue_data <- results_table_mast_raw %>%
+                                      dplyr::filter(component == 'H' & contrast == 'age_scaled') %>%
+                                      dplyr::select(
+                                        PrimerID = primerid,
+                                        Pvalue_value = `Pr(>Chisq)` # This is the Hurdle LRT p-value
+                                      )
+                                    
+                                    # Combine these results. Using an outer_join to ensure all PrimerIDs are kept,
+                                    # even if one component is missing for some reason.
+                                    results_table_mast <- marginal_results %>%
+                                      dplyr::full_join(hurdle_pvalue_data, by = "PrimerID") %>%
+                                      dplyr::mutate(
+                                        FDR_val = p.adjust(Pvalue_value, method = "fdr") 
+                                      ) %>%
+                                      dplyr::select(
+                                        PrimerID = PrimerID,
+                                        logFC = logFC_value,         # The marginal logFC for effect direction and magnitude
+                                        z_stat = z_stat_value,       # The z-score for marginal logFC (the new 'stat' metric)
+                                        Pvalue = Pvalue_value,       # The hurdle P-value
+                                        FDR = FDR_val
+                                      )
+                                    rm(results_table_mast_raw, marginal_results, hurdle_pvalue_data); gc(verbose = FALSE) # Free memory
                                     
                                     if (is.null(results_table_mast) || nrow(results_table_mast) == 0) {
                                       stop("No differential expression results found for 'age'.")
@@ -330,12 +351,16 @@ all_tissue_results <- foreach(file_path = tissue_files,
                                     # Prepare results for OmicSignature object
                                     results_table_omic <- results_table_mast %>%
                                       dplyr::mutate(
-                                        probe_id = PrimerID, feature_name = PrimerID, score = `logFC`,
-                                        p_value = `Pvalue`, adj_p = `FDR`
+                                        probe_id = PrimerID, 
+                                        feature_name = PrimerID, 
+                                        score = logFC,      # Use marginal logFC as the score for OmicSignature object
+                                        z_score_stat = z_stat, # Include z_stat as a separate column for filtering
+                                        p_value = Pvalue, 
+                                        adj_p = FDR
                                       ) %>%
-                                      dplyr::select(probe_id, feature_name, score, p_value, adj_p) %>%
+                                      dplyr::select(probe_id, feature_name, score, z_score_stat, p_value, adj_p) %>%
                                       dplyr::mutate(
-                                        group_label = as.factor(ifelse(score > 0, "Increased_with_Age", "Decreased_with_Age"))
+                                        group_label = as.factor(ifelse(score > 0, "Increased_with_Age", "Decreased_with_Age")) # 'score' is now marginal logFC
                                       )
                                     rm(results_table_mast); gc(verbose = FALSE) # Free memory
                                     
@@ -364,19 +389,18 @@ all_tissue_results <- foreach(file_path = tissue_files,
                                       signature_name = paste0("Aging Signature - ", current_tissue_name),
                                       organism = "Homo sapiens", direction_type = "bi-directional", phenotype = paste0("Aging in ", current_tissue_name),
                                       assay_type = "transcriptomics", covariates = "sex, donor_id", platform = "transcriptomics by single-cell RNA-seq",
-                                      sample_type = found_sample_type, adj_p_cutoff = adj_p_cutoff, score_cutoff = score_cutoff,
-                                      keywords = c("Aging", current_tissue_name, "Tabula Sapiens", "single-cell", "MAST"),
+                                      sample_type = found_sample_type, adj_p_cutoff = adj_p_cutoff, score_cutoff = score_cutoff, # score_cutoff is now interpreted as z-score cutoff                                      keywords = c("Aging", current_tissue_name, "Tabula Sapiens", "single-cell", "MAST"),
                                       author = "ChallengeProject2025", PMID = NULL, year = as.numeric(format(Sys.Date(), "%Y")),
                                       description = paste0("Aging signature derived from Tabula Sapiens human single-cell RNA-seq data for the ", current_tissue_name, " tissue. Differential expression calculated with MAST, adjusting for sex and donor_id. Filters: min cells=",min_cells_per_tissue,", min gene expr=",min_expressed_gene_threshold*100,"%, adj.p<=",adj_p_cutoff,", |logFC|>=",score_cutoff,".")
                                     )
                                     
                                     # Filter for significant genes based on defined cutoffs
                                     sig_genes <- results_table_omic %>%
-                                      dplyr::filter(adj_p <= adj_p_cutoff & abs(score) >= score_cutoff) %>%
-                                      dplyr::select(probe_id, feature_name, score, group_label)
+                                      dplyr::filter(adj_p <= adj_p_cutoff & abs(z_score_stat) >= score_cutoff) %>% # Filter using abs(z_score_stat) and the score_cutoff
+                                      dplyr::select(probe_id, feature_name, score, group_label) # Keep original 'score' (marginal logFC) and group_label for the OmicSignature object
                                     
                                     if (nrow(sig_genes) == 0) {
-                                      stop(paste0("No significant genes found with current cutoffs (adj_p <= ", adj_p_cutoff, ", |logFC| >= ", score_cutoff, "). No OmicSignature object created."))
+                                      stop(paste0("No significant genes found with current cutoffs (adj_p <= ", adj_p_cutoff, ", |z-score| >= ", score_cutoff, "). No OmicSignature object created.")) # Updated message
                                     } else {
                                       # Create OmicSignature object for the tissue and save it
                                       omic_sig_tissue <- OmicSignature$new(
