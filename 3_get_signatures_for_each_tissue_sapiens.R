@@ -224,7 +224,7 @@ all_tissue_results <- foreach(file_path = tissue_files,
                                     num_distinct_ages <- length(unique(tissue_seurat@meta.data$age))
                                     num_distinct_assays <- length(unique(tissue_seurat@meta.data$assay))
                                     
-                                    if (num_subjects < 2 || num_sex_groups < 2 || num_distinct_ages < 3) {
+                                    if (num_subjects < 2 || num_distinct_ages < 3) {
                                       stop(paste0("Insufficient variation for regression (Subjects: ", num_subjects, ", Sex groups: ", num_sex_groups, ", Distinct ages: ", num_distinct_ages, ")."))
                                     }
                                     
@@ -235,6 +235,14 @@ all_tissue_results <- foreach(file_path = tissue_files,
                                     # Ensure factor levels are dropped for correct model fitting
                                     colData(sce_tissue)$donor_id <- droplevels(colData(sce_tissue)$donor_id)
                                     colData(sce_tissue)$sex <- droplevels(colData(sce_tissue)$sex)
+                                    
+                                    # Ensure age is numeric before scaling
+                                    if (!is.numeric(colData(sce_tissue)$age)) {
+                                      colData(sce_tissue)$age <- as.numeric(as.character(colData(sce_tissue)$age))
+                                    }
+                                    message_to_worker_log("  Standardizing 'age' covariate.")
+                                    colData(sce_tissue)$age_scaled <- as.numeric(scale(colData(sce_tissue)$age)) # Need to scale it, makes problems with random effect fitting otherwise (does not converge)
+                                    
                                     
                                     # Filter out subjects with only one cell, as MAST requires >1 cell per subject for `donor_id` covariate
                                     subject_counts <- table(colData(sce_tissue)$donor_id)
@@ -262,6 +270,14 @@ all_tissue_results <- foreach(file_path = tissue_files,
                                     final_cell_count <- ncol(sce_tissue_filtered)
                                     final_gene_count <- nrow(sce_tissue_filtered)
                                     
+                                    # Calculate the number of expressed genes per cell
+                                    colData(sce_tissue_filtered)$n_genes_expressed <- colSums(assay(sce_tissue_filtered, "logcounts") > 0)
+                                    
+                                    # Standardize n_genes_expressed for numerical stability
+                                    message_to_worker_log("  Standardizing 'n_genes_expressed' covariate.")
+                                    n_genes_expressed_scaled <- scale(colData(sce_tissue_filtered)$n_genes_expressed)
+                                    colData(sce_tissue_filtered)$n_genes_expressed_scaled <- as.numeric(n_genes_expressed_scaled)
+
                                     # Prepare SingleCellExperiment for MAST
                                     rowData(sce_tissue_filtered)$primerid <- rownames(sce_tissue_filtered)
                                     colData(sce_tissue_filtered)$wellKey <- colnames(sce_tissue_filtered)
@@ -275,27 +291,27 @@ all_tissue_results <- foreach(file_path = tissue_files,
                                     # could maybe also add self_reported_ethnicity as a parameter
                                     if (num_distinct_assays < 2) {
                                       if (safe_tissue_name %in% c('ovary', 'prostate_gland', 'testis')) {
-                                        zlm_obj <- zlm(~ age + (1|donor_id) + final_gene_count, sca = sca_mast, method = 'glmer', ebayes = FALSE, parallel = TRUE, exprs_value = 'logcounts') 
+                                        zlm_obj <- zlm(~ age_scaled + (1|donor_id) + n_genes_expressed_scaled, sca = sca_mast, method = 'glmer', ebayes = FALSE, parallel = TRUE, exprs_value = 'logcounts') 
                                       } else {
-                                        zlm_obj <- zlm(~ age + sex + (1|donor_id) + final_gene_count, sca = sca_mast, method = 'glmer', ebayes = FALSE, parallel = TRUE, exprs_value = 'logcounts') 
+                                        zlm_obj <- zlm(~ age_scaled + sex + (1|donor_id) + n_genes_expressed_scaled, sca = sca_mast, method = 'glmer', ebayes = FALSE, parallel = TRUE, exprs_value = 'logcounts') 
                                       }
                                     } else { # Only use assay if we have different assay types in tissue dataset
                                       if (safe_tissue_name %in% c('ovary', 'prostate_gland', 'testis')) {
-                                        zlm_obj <- zlm(~ age + (1|donor_id) + assay + final_gene_count, sca = sca_mast, method = 'glmer', ebayes = FALSE, parallel = TRUE, exprs_value = 'logcounts') 
+                                        zlm_obj <- zlm(~ age_scaled + (1|donor_id) + assay + n_genes_expressed_scaled, sca = sca_mast, method = 'glmer', ebayes = FALSE, parallel = TRUE, exprs_value = 'logcounts') 
                                       } else {
-                                        zlm_obj <- zlm(~ age + sex + (1|donor_id) + assay + final_gene_count, sca = sca_mast, method = 'glmer', ebayes = FALSE, parallel = TRUE, exprs_value = 'logcounts')
+                                        zlm_obj <- zlm(~ age_scaled + sex + (1|donor_id) + assay + n_genes_expressed_scaled, sca = sca_mast, method = 'glmer', ebayes = FALSE, parallel = TRUE, exprs_value = 'logcounts')
                                       }
                                     }
                                     rm(sca_mast); gc(verbose = FALSE) # Free memory
                                     
                                     # Extract differential expression results for 'age'
-                                    summary_age_results <- summary(zlm_obj, doLRT = "age")
+                                    summary_age_results <- summary(zlm_obj, doLRT = "age_scaled")
                                     results_table_mast_raw <- summary_age_results$datatable
                                     rm(zlm_obj, summary_age_results); gc(verbose = FALSE) # Free memory
                                     
                                     # Process MAST results into a standardized format
                                     results_table_mast <- results_table_mast_raw %>%
-                                      dplyr::filter(component == 'C' & contrast == 'age') %>% 
+                                      dplyr::filter(component == 'C' & contrast == 'age_scaled') %>% 
                                       dplyr::select(
                                         PrimerID = primerid, logFC_val = coef, Pvalue_val = `Pr(>Chisq)`     
                                       ) %>%
