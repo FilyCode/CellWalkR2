@@ -18,7 +18,7 @@ library(Matrix)           # For efficient sparse matrix operations
 
 # --- Define Paths and Analysis Variables ---
 data_input_path <- file.path("/restricted/projectnb/agedisease/projects/challenge2025/data/Tabula_sapiens")
-omic_signature_output_path <- file.path("/restricted/projectnb/agedisease/projects/challenge2025/results/Tabula_sapiens/MAST/consenus_regression")
+omic_signature_output_path <- file.path("/restricted/projectnb/agedisease/projects/challenge2025/results/Tabula_sapiens/MAST/consenus_regression_test")
 
 # Create output directory if it doesn't exist
 dir.create(omic_signature_output_path, recursive = TRUE, showWarnings = FALSE)
@@ -397,15 +397,20 @@ all_tissue_results <- foreach(file_path = tissue_files,
                                     # Create metadata for the individual OmicSignature object
                                     metadata_tissue_sig <- OmicSignature::createMetadata(
                                       signature_name = paste0("Aging Signature - ", current_tissue_name),
-                                      organism = "Homo sapiens", direction_type = "bi-directional", phenotype = paste0("Aging in ", current_tissue_name),
-                                      assay_type = "transcriptomics", covariates = "sex, donor_id", platform = "transcriptomics by single-cell RNA-seq",
-                                      sample_type = found_sample_type, adj_p_cutoff = adj_p_cutoff, score_cutoff = log2fc_abs_cutoff, 
-                                      # Explicit cutoffs in metadata table:
-                                      logfc_cutoff = log2fc_abs_cutoff, # Use the defined Log2FC cutoff
+                                      organism = "Homo sapiens", 
+                                      direction_type = "bi-directional", 
+                                      phenotype = paste0("Aging in ", current_tissue_name),
+                                      assay_type = "transcriptomics", 
+                                      covariates = "sex, donor_id", 
+                                      platform = "transcriptomics by single-cell RNA-seq",
+                                      sample_type = found_sample_type, 
                                       adj_p_cutoff = adj_p_cutoff,      # Use the defined adjusted p-value cutoff
+                                      logfc_cutoff = log2fc_abs_cutoff, # Use the defined Log2FC cutoff
                                       score_cutoff = NULL,              # Set to NULL as we are ranking by z-score, not using a hard z-score cutoff
                                       keywords = c("Aging", current_tissue_name, "Tabula Sapiens", "single-cell", "MAST"),
-                                      author = "BU_Bioinformatics_ChallengeProject2025", PMID = NULL, year = as.numeric(format(Sys.Date(), "%Y")),
+                                      author = "BU_Bioinformatics_ChallengeProject2025", 
+                                      PMID = NULL, 
+                                      year = as.numeric(format(Sys.Date(), "%Y")),
                                       description = paste0("Aging signature derived from Tabula Sapiens human single-cell RNA-seq data for the ", current_tissue_name, " tissue. Differential expression calculated with MAST, adjusting for sex and donor_id. Filters: min cells=",min_cells_per_tissue,
                                                            ", min gene expr=",min_expressed_gene_threshold*100,"%, adj.p<=",adj_p_cutoff,", |Log2FC|>=",log2fc_abs_cutoff, ", max genes=",max_genes_in_signature,".")
                                     )
