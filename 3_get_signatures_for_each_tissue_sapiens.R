@@ -30,10 +30,10 @@ message(paste0("OmicSignature results will be saved to: ", omic_signature_output
 # Define analysis parameters for filtering and significance
 min_cells_per_tissue <- 100         # Minimum cells required for MAST analysis per tissue
 min_expressed_gene_threshold <- 0.1 # Gene must be expressed in at least this percentage of cells
-min_genes_after_filter <- 10        # Minimum number of genes to proceed with MAST
+min_genes_after_filter <- 100       # Minimum number of genes to proceed with MAST
 adj_p_cutoff <- 0.05                # Adjusted p-value cutoff for significant genes in signature
-score_cutoff <- 2                   # Absolute z-score cutoff for significant genes in signature
-
+log2fc_abs_cutoff <- 0.25           # Absolute log2FC cutoff for significant genes in signature
+max_genes_in_signature <- 500       # Max. number of significant genes saved in the signature part of the OmicSignature object
 
 # --- PARALLELISM CONFIGURATION ---
 # This script uses nested parallelization:
@@ -80,7 +80,8 @@ message("\n--- Initializing OmicSignatureCollection Metadata ---")
 omicsig_collection_metadata <- list(
   collection_name = "Tabula Sapiens Human Aging Signatures - All Tissues", 
   description = paste0("Collection of aging signatures derived from Tabula Sapiens human single-cell RNA-seq data, stratified by tissue, adjusted for sex and donor_id. ",
-                       "MAST analysis used, with min cells: ", min_cells_per_tissue, ", min expressed gene threshold: ", min_expressed_gene_threshold * 100, "%, adj. p-value cutoff: ", adj_p_cutoff, ", |z-score| cutoff: ", score_cutoff, "."),
+                       "MAST analysis used, with min cells: ", min_cells_per_tissue, ", min expressed gene threshold: ", min_expressed_gene_threshold * 100, "%, adj. p-value cutoff: ", adj_p_cutoff, 
+                       ", |Log2FC| cutoff: ", log2fc_abs_cutoff, ", max genes per signature: ", max_genes_in_signature, "."),
   organism = "Homo sapiens",
   direction_type = "bi-directional",
   phenotype = "Aging",
@@ -136,7 +137,7 @@ build_structured_result_for_foreach <- function(current_tissue_name, status_val,
 # and collects results from each parallel worker.
 all_tissue_results <- foreach(file_path = tissue_files,
                               .export = c("omic_signature_output_path", "min_cells_per_tissue", "min_expressed_gene_threshold", 
-                                          "min_genes_after_filter", "adj_p_cutoff", "score_cutoff",
+                                          "min_genes_after_filter", "adj_p_cutoff","log2fc_abs_cutoff", "max_genes_in_signature",
                                           "mast_cores_per_tissue", "build_structured_result_for_foreach"), 
                               .packages = c("tidyverse", "Seurat", "SingleCellExperiment", "MAST", "OmicSignature", "Biobase", "Matrix"),
                               .combine = 'c', # Combines results from each worker into a single list
@@ -298,15 +299,15 @@ all_tissue_results <- foreach(file_path = tissue_files,
                                     # could maybe also add self_reported_ethnicity as a parameter
                                     if (num_distinct_assays < 2) {
                                       if (safe_tissue_name %in% c('ovary', 'prostate_gland', 'testis')) {
-                                        zlm_obj <- zlm(~ age_scaled + (1|donor_id) + n_genes_expressed_scaled, sca = sca_mast, method = 'glmer', ebayes = FALSE, parallel = TRUE, exprs_value = 'logcounts') 
+                                        zlm_obj <- zlm(~ age_scaled + (1|donor_id) + n_genes_expressed_scaled, sca = sca_mast, method = 'glmer', ebayes = FALSE, parallel = TRUE, exprs_value = 'logcounts', fitArgsD = list(nAGQ = 0)) # nAGQ=0 uses a faster but less accurate approximation
                                       } else {
-                                        zlm_obj <- zlm(~ age_scaled + sex + (1|donor_id) + n_genes_expressed_scaled, sca = sca_mast, method = 'glmer', ebayes = FALSE, parallel = TRUE, exprs_value = 'logcounts') 
+                                        zlm_obj <- zlm(~ age_scaled + sex + (1|donor_id) + n_genes_expressed_scaled, sca = sca_mast, method = 'glmer', ebayes = FALSE, parallel = TRUE, exprs_value = 'logcounts', fitArgsD = list(nAGQ = 0)) # nAGQ=0 uses a faster but less accurate approximation
                                       }
                                     } else { # Only use assay if we have different assay types in tissue dataset
                                       if (safe_tissue_name %in% c('ovary', 'prostate_gland', 'testis')) {
-                                        zlm_obj <- zlm(~ age_scaled + (1|donor_id) + assay + n_genes_expressed_scaled, sca = sca_mast, method = 'glmer', ebayes = FALSE, parallel = TRUE, exprs_value = 'logcounts') 
+                                        zlm_obj <- zlm(~ age_scaled + (1|donor_id) + assay + n_genes_expressed_scaled, sca = sca_mast, method = 'glmer', ebayes = FALSE, parallel = TRUE, exprs_value = 'logcounts', fitArgsD = list(nAGQ = 0)) # nAGQ=0 uses a faster but less accurate approximation
                                       } else {
-                                        zlm_obj <- zlm(~ age_scaled + sex + (1|donor_id) + assay + n_genes_expressed_scaled, sca = sca_mast, method = 'glmer', ebayes = FALSE, parallel = TRUE, exprs_value = 'logcounts')
+                                        zlm_obj <- zlm(~ age_scaled + sex + (1|donor_id) + assay + n_genes_expressed_scaled, sca = sca_mast, method = 'glmer', ebayes = FALSE, parallel = TRUE, exprs_value = 'logcounts', fitArgsD = list(nAGQ = 0))# nAGQ=0 uses a faster but less accurate approximation
                                       }
                                     }
                                     rm(sca_mast); gc(verbose = FALSE) # Free memory
@@ -355,21 +356,23 @@ all_tissue_results <- foreach(file_path = tissue_files,
                                       stop("No differential expression results found for 'age'.")
                                     }
                                     
-                                    # Prepare results for OmicSignature object
-                                    results_table_omic <- results_table_mast %>%
+                                    # Prepare results for OmicSignature object (this will be the 'difexp' slot)
+                                    # The 'score' column in the OmicSignature object will be the z-score for ranking/analysis.
+                                    # LogFC is kept separate but also used for filtering and group direction.
+                                    results_for_omic_difexp <- results_table_mast %>%
                                       dplyr::mutate(
                                         probe_id = PrimerID, 
                                         feature_name = PrimerID, 
-                                        score = logFC,      # Use marginal logFC as the score for OmicSignature object
-                                        z_score_stat = z_stat, # Include z_stat as a separate column for filtering
+                                        score = z_stat,       # The main score for OmicSignature object (used for ranking)
+                                        logFC_val = logFC,    # Keep LogFC explicitly for filtering and group label
+                                        z_score_val = z_stat, # Keep z-score explicitly for filtering (redundant with score, but explicit)
                                         p_value = Pvalue, 
-                                        adj_p = FDR
+                                        adj_p = FDR,
+                                        group_label = as.factor(ifelse(logFC > 0, "Increased_with_Age", "Decreased_with_Age")) # Group label based on LogFC direction
                                       ) %>%
-                                      dplyr::select(probe_id, feature_name, score, z_score_stat, p_value, adj_p) %>%
-                                      dplyr::mutate(
-                                        group_label = as.factor(ifelse(score > 0, "Increased_with_Age", "Decreased_with_Age")) # 'score' is now marginal logFC
-                                      )
+                                      dplyr::select(probe_id, feature_name, score, logFC_val, z_score_val, p_value, adj_p, group_label)
                                     rm(results_table_mast); gc(verbose = FALSE) # Free memory
+                                    
                                     
                                     # Search for a suitable BRENDA ontology term for sample_type metadata
                                     found_sample_type <- NULL
@@ -396,24 +399,43 @@ all_tissue_results <- foreach(file_path = tissue_files,
                                       signature_name = paste0("Aging Signature - ", current_tissue_name),
                                       organism = "Homo sapiens", direction_type = "bi-directional", phenotype = paste0("Aging in ", current_tissue_name),
                                       assay_type = "transcriptomics", covariates = "sex, donor_id", platform = "transcriptomics by single-cell RNA-seq",
-                                      sample_type = found_sample_type, adj_p_cutoff = adj_p_cutoff, score_cutoff = score_cutoff, # score_cutoff is now interpreted as z-score cutoff                                      keywords = c("Aging", current_tissue_name, "Tabula Sapiens", "single-cell", "MAST"),
-                                      author = "ChallengeProject2025", PMID = NULL, year = as.numeric(format(Sys.Date(), "%Y")),
-                                      description = paste0("Aging signature derived from Tabula Sapiens human single-cell RNA-seq data for the ", current_tissue_name, " tissue. Differential expression calculated with MAST, adjusting for sex and donor_id. Filters: min cells=",min_cells_per_tissue,", min gene expr=",min_expressed_gene_threshold*100,"%, adj.p<=",adj_p_cutoff,", |logFC|>=",score_cutoff,".")
+                                      sample_type = found_sample_type, adj_p_cutoff = adj_p_cutoff, score_cutoff = log2fc_abs_cutoff, 
+                                      # Explicit cutoffs in metadata table:
+                                      logfc_cutoff = log2fc_abs_cutoff, # Use the defined Log2FC cutoff
+                                      adj_p_cutoff = adj_p_cutoff,      # Use the defined adjusted p-value cutoff
+                                      score_cutoff = NULL,              # Set to NULL as we are ranking by z-score, not using a hard z-score cutoff
+                                      keywords = c("Aging", current_tissue_name, "Tabula Sapiens", "single-cell", "MAST"),
+                                      author = "BU_Bioinformatics_ChallengeProject2025", PMID = NULL, year = as.numeric(format(Sys.Date(), "%Y")),
+                                      description = paste0("Aging signature derived from Tabula Sapiens human single-cell RNA-seq data for the ", current_tissue_name, " tissue. Differential expression calculated with MAST, adjusting for sex and donor_id. Filters: min cells=",min_cells_per_tissue,
+                                                           ", min gene expr=",min_expressed_gene_threshold*100,"%, adj.p<=",adj_p_cutoff,", |Log2FC|>=",log2fc_abs_cutoff, ", max genes=",max_genes_in_signature,".")
                                     )
                                     
                                     # Filter for significant genes based on defined cutoffs
-                                    sig_genes <- results_table_omic %>%
-                                      dplyr::filter(adj_p <= adj_p_cutoff & abs(z_score_stat) >= score_cutoff) %>% # Filter using abs(z_score_stat) and the score_cutoff
-                                      dplyr::select(probe_id, feature_name, score, group_label) # Keep original 'score' (marginal logFC) and group_label for the OmicSignature object
+                                    sig_genes <- results_for_omic_difexp %>%
+                                      dplyr::filter(adj_p <= adj_p_cutoff & abs(log2fc_abs_cutoff) >= score_cutoff) %>% # Filter using abs(log2FC_cutoff) 
                                     
+                                    # Rank by absolute z-score and take the top N genes
+                                    sig_genes_ranked <- sig_genes_filtered %>%
+                                      dplyr::arrange(desc(abs(score))) %>% # 'score' is already z_score_val here. Rank by absolute score.
+                                      dplyr::slice_head(n = max_genes_in_signature) # Take top N genes
+                                    
+                                    # Prepare the 'signature' slot for the OmicSignature object
+                                    # It requires probe_id, feature_name, score, group_label
+                                    sig_genes_for_omic_signature_slot <- sig_genes_ranked %>%
+                                      dplyr::select(probe_id, feature_name, score, group_label)
+                                    
+                                    if (nrow(sig_genes_ranked) == 0) {
+                                      stop("After ranking and limiting to max genes, no genes remain for the signature.")
+                                    }
+                                      
                                     if (nrow(sig_genes) == 0) {
-                                      stop(paste0("No significant genes found with current cutoffs (adj_p <= ", adj_p_cutoff, ", |z-score| >= ", score_cutoff, "). No OmicSignature object created.")) # Updated message
+                                      stop(paste0("No significant genes found with current cutoffs (adj_p <= ", adj_p_cutoff, ", |Log2FC| >= ", log2fc_abs_cutoff, "). No OmicSignature object created.")) # Updated message
                                     } else {
                                       # Create OmicSignature object for the tissue and save it
                                       omic_sig_tissue <- OmicSignature$new(
                                         metadata = metadata_tissue_sig,
-                                        signature = sig_genes,
-                                        difexp = results_table_omic 
+                                        signature = sig_genes_for_omic_signature_slot,
+                                        difexp = results_for_omic_difexp  
                                       )
                                       output_file_path <- file.path(omic_signature_output_path, paste0("aging_signature_", safe_tissue_name, "_oSig.rds"))
                                       saveRDS(omic_sig_tissue, file = output_file_path)
