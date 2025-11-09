@@ -18,7 +18,7 @@ library(Matrix)           # For efficient sparse matrix operations
 
 # --- Define Paths and Analysis Variables ---
 data_input_path <- file.path("/restricted/projectnb/agedisease/projects/challenge2025/data/Tabula_sapiens")
-omic_signature_output_path <- file.path("/restricted/projectnb/agedisease/projects/challenge2025/results/Tabula_sapiens/MAST/consenus_regression_test")
+omic_signature_output_path <- file.path("/restricted/projectnb/agedisease/projects/challenge2025/results/Tabula_sapiens/MAST/consenus_regression")
 
 # Create output directory if it doesn't exist
 dir.create(omic_signature_output_path, recursive = TRUE, showWarnings = FALSE)
@@ -417,7 +417,7 @@ all_tissue_results <- foreach(file_path = tissue_files,
                                     
                                     # Filter for significant genes based on defined cutoffs
                                     sig_genes <- results_for_omic_difexp %>%
-                                      dplyr::filter(adj_p <= adj_p_cutoff & abs(logFC_val) >= log2fc_abs_cutoff) %>% # Filter using abs(log2FC) 
+                                      dplyr::filter(adj_p <= adj_p_cutoff & abs(logFC_val) >= log2fc_abs_cutoff) # Filter using abs(log2FC) 
                                     
                                     # Rank by absolute z-score and take the top N genes
                                     sig_genes_ranked <- sig_genes %>%
