@@ -225,7 +225,7 @@ all_tissue_results <- foreach(file_path = tissue_files,
                                     num_distinct_ages <- length(unique(tissue_seurat@meta.data$age))
                                     num_distinct_assays <- length(unique(tissue_seurat@meta.data$assay))
                                     
-                                    if (num_subjects < 2 || num_distinct_ages < 3) {
+                                    if (num_subjects < 2 || num_distinct_ages < 2) {
                                       stop(paste0("Insufficient variation for regression (Subjects: ", num_subjects, ", Sex groups: ", num_sex_groups, ", Distinct ages: ", num_distinct_ages, ")."))
                                     }
                                     
@@ -298,13 +298,13 @@ all_tissue_results <- foreach(file_path = tissue_files,
                                     # Define regression model based on tissue type (sex is not always a relevant covariate)
                                     # could maybe also add self_reported_ethnicity as a parameter
                                     if (num_distinct_assays < 2) {
-                                      if (safe_tissue_name %in% c('ovary', 'prostate_gland', 'testis')) {
+                                      if (safe_tissue_name %in% c('ovary', 'prostate_gland', 'testis', 'uterus')) {
                                         zlm_obj <- zlm(~ age_scaled + (1|donor_id) + n_genes_expressed_scaled, sca = sca_mast, method = 'glmer', ebayes = FALSE, parallel = TRUE, exprs_value = 'logcounts', fitArgsD = list(nAGQ = 0)) # nAGQ=0 uses a faster but less accurate approximation
                                       } else {
                                         zlm_obj <- zlm(~ age_scaled + sex + (1|donor_id) + n_genes_expressed_scaled, sca = sca_mast, method = 'glmer', ebayes = FALSE, parallel = TRUE, exprs_value = 'logcounts', fitArgsD = list(nAGQ = 0)) # nAGQ=0 uses a faster but less accurate approximation
                                       }
                                     } else { # Only use assay if we have different assay types in tissue dataset
-                                      if (safe_tissue_name %in% c('ovary', 'prostate_gland', 'testis')) {
+                                      if (safe_tissue_name %in% c('ovary', 'prostate_gland', 'testis', 'uterus')) {
                                         zlm_obj <- zlm(~ age_scaled + (1|donor_id) + assay + n_genes_expressed_scaled, sca = sca_mast, method = 'glmer', ebayes = FALSE, parallel = TRUE, exprs_value = 'logcounts', fitArgsD = list(nAGQ = 0)) # nAGQ=0 uses a faster but less accurate approximation
                                       } else {
                                         zlm_obj <- zlm(~ age_scaled + sex + (1|donor_id) + assay + n_genes_expressed_scaled, sca = sca_mast, method = 'glmer', ebayes = FALSE, parallel = TRUE, exprs_value = 'logcounts', fitArgsD = list(nAGQ = 0))# nAGQ=0 uses a faster but less accurate approximation
@@ -417,10 +417,10 @@ all_tissue_results <- foreach(file_path = tissue_files,
                                     
                                     # Filter for significant genes based on defined cutoffs
                                     sig_genes <- results_for_omic_difexp %>%
-                                      dplyr::filter(adj_p <= adj_p_cutoff & abs(log2fc_abs_cutoff) >= score_cutoff) %>% # Filter using abs(log2FC_cutoff) 
+                                      dplyr::filter(adj_p <= adj_p_cutoff & abs(logFC_val) >= log2fc_abs_cutoff) %>% # Filter using abs(log2FC) 
                                     
                                     # Rank by absolute z-score and take the top N genes
-                                    sig_genes_ranked <- sig_genes_filtered %>%
+                                    sig_genes_ranked <- sig_genes %>%
                                       dplyr::arrange(desc(abs(score))) %>% # 'score' is already z_score_val here. Rank by absolute score.
                                       dplyr::slice_head(n = max_genes_in_signature) # Take top N genes
                                     
