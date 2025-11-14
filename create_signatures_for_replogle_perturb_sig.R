@@ -23,7 +23,7 @@ data_input_path <- file.path("/restricted/projectnb/agedisease/projects/challeng
 k562_data_file <- file.path(data_input_path, "k562_ps_sig_all.rds")
 rpe1_data_file <- file.path(data_input_path, "rpe1_ps_sig_all.rds")
 
-output_base_path <- file.path(data_input_path)
+output_base_path <- file.path("/restricted/projectnb/agedisease/projects/challenge2025/results/perturbational_omic_sigs/replogle_2022")
 
 k562_collection_output_file <- file.path(output_base_path, "Replogle_K562_Perturb_OmicSignatureCollection.rds")
 rpe1_collection_output_file <- file.path(output_base_path, "Replogle_RPE1_Perturb_OmicSignatureCollection.rds")
@@ -65,6 +65,7 @@ if (file.exists(gene_mapping_cache_file)) {
   gene_symbol_to_ensembl <- gene_symbol_to_ensembl[names(gene_symbol_to_ensembl) %in% all_gene_symbols]
   # Identify any new symbols not in cache
   symbols_to_map <- setdiff(all_gene_symbols, names(gene_symbol_to_ensembl))
+  message(paste0("  Loaded ", length(gene_symbol_to_ensembl), " genes mapped from cache..."))
 } else {
   symbols_to_map <- all_gene_symbols
 }
@@ -100,21 +101,48 @@ if (length(symbols_to_map) > 0) {
   if (length(symbols_remaining_for_biomart) > 0) {
     message(paste0("  Attempting to map ", length(symbols_remaining_for_biomart), " remaining symbols using biomaRt (EnsemblIDs v114)..."))
     
-    # Connect to Ensembl BioMart
-    ensembl <- useEnsembl(biomart = "genes", dataset = "hsapiens_gene_ensembl", version = 114)
+    ensembl_ids_from_biomart <- NULL
     
-    gene_id_map_df_biomart <- getBM(
-      attributes = c("hgnc_symbol", "ensembl_gene_id"),
-      filters = "hgnc_symbol",
-      values = symbols_remaining_for_biomart,
-      mart = ensembl
+    # Try different strategies for biomaRt connection
+    biomart_attempts <- list(
+      list(biomart = "genes", dataset = "hsapiens_gene_ensembl", version = 114, host = "https://www.ensembl.org", message = "  Attempt 1: Default Ensembl mirror, v114."),
+      list(biomart = "genes", dataset = "hsapiens_gene_ensembl", host = "https://useast.ensembl.org", version = 114, message = "  Attempt 2: US East mirror, v114."),
+      list(biomart = "genes", dataset = "hsapiens_gene_ensembl", host = "https://asia.ensembl.org", version = 114, message = "  Attempt 3: Asia mirror, v114.")
     )
     
-    ensembl_ids_from_biomart <- setNames(gene_id_map_df_biomart$ensembl_gene_id, gene_id_map_df_biomart$hgnc_symbol)
+    for (attempt in biomart_attempts) {
+      message(attempt$message)
+      current_ensembl_mart <- NULL
+      tryCatch({
+        # Attempt to connect to the BioMart
+        current_ensembl_mart <- do.call(useEnsembl, attempt[names(attempt) != "message"])
+        
+        # If connection is successful, retrieve mapping
+        gene_id_map_df_biomart <- getBM(
+          attributes = c("hgnc_symbol", "ensembl_gene_id"),
+          filters = "hgnc_symbol",
+          values = symbols_remaining_for_biomart,
+          mart = current_ensembl_mart
+        )
+        ensembl_ids_from_biomart <- setNames(gene_id_map_df_biomart$ensembl_gene_id, gene_id_map_df_biomart$hgnc_symbol)
+        
+        message(paste0("  Successfully mapped ", length(ensembl_ids_from_biomart), " symbols using biomaRt in this attempt."))
+        break # Exit loop if successful
+        
+      }, error = function(e) {
+        message(paste0("  biomaRt connection/query failed for this attempt: ", e$message))
+        ensembl_ids_from_biomart <<- NULL # Reset for next attempt
+      })
+      if (!is.null(ensembl_ids_from_biomart)) break # Exit outer loop if mapping was successful
+    }
     
-    # Update the master mapping
-    gene_symbol_to_ensembl <- c(gene_symbol_to_ensembl, ensembl_ids_from_biomart)
-    message(paste0("  Mapped ", length(ensembl_ids_from_biomart), " symbols using biomaRt."))
+    
+    if (!is.null(ensembl_ids_from_biomart)) {
+      # Update the master mapping with results from biomaRt
+      gene_symbol_to_ensembl <- c(gene_symbol_to_ensembl, ensembl_ids_from_biomart)
+    } else {
+      message("  All biomaRt attempts failed. Some symbols remain unmapped to Ensembl IDs.")
+    }
   }
   
   # Save the updated complete mapping for future runs
@@ -142,24 +170,22 @@ create_perturb_omic_signature <- function(
 ) {
   message(paste0("  Processing signature for ", perturbation_gene_symbol, " in ", cell_line, "..."))
   
-  # Add 'gene_symbol' column from rownames and convert to tibble for easier manipulation
-  current_results_df <- perturbation_df %>%
+  # Add 'gene_symbol' column from rownames and ensure it's a plain data.frame early
+  current_results_df <- as.data.frame(perturbation_df) %>%
     rownames_to_column("gene_symbol") %>%
-    as_tibble()
+    as_tibble() # Keeping as_tibble here for dplyr operations, but convert back later
   
   # Apply gene ID mapping
   current_results_df <- current_results_df %>%
     dplyr::mutate(
       ensembl_id = gene_symbol_to_ensembl_map[gene_symbol],
-      # probe_id: unique identifier, use Ensembl ID if available, otherwise gene_symbol
       probe_id = ifelse(is.na(ensembl_id) | ensembl_id == "", gene_symbol, ensembl_id),
-      # feature_name: human-readable feature name, Ensembl ID if available, otherwise gene_symbol
       feature_name = ifelse(is.na(ensembl_id) | ensembl_id == "", gene_symbol, ensembl_id)
     )
   
   # Remove rows that might have originated from unmapped or empty gene symbols if any.
   current_results_df <- current_results_df %>%
-    filter(!is.na(gene_symbol) & gene_symbol != "" & !is.na(probe_id) & probe_id != "")
+    dplyr::filter(!is.na(gene_symbol) & gene_symbol != "" & !is.na(probe_id) & probe_id != "")
   
   # If no genes remain after mapping, skip this signature
   if (nrow(current_results_df) == 0) {
@@ -168,31 +194,52 @@ create_perturb_omic_signature <- function(
   }
   
   # --- Prepare 'difexp' dataframe for OmicSignature object ---
-  # Use 'avg_log2FC' as the primary 'score' for OmicSignature, as it represents magnitude and direction.
-  difexp_data <- current_results_df %>%
+  # Create the dataframe, perform all calculations and explicit type coercions,
+  # and ensure non-finite values are handled, all within a pipeline that results in a plain data.frame.
+  difexp_data_clean <- current_results_df %>%
     dplyr::mutate(
-      score = avg_log2FC * p_val_adj, # This will be the main score in OmicSignature
-      logfc = avg_log2FC,
-      p_value = p_val,
-      adj_p = p_val_adj,
+      # Ensure initial avg_log2FC and p_val_adj are explicitly numeric and handle non-finite
+      temp_avg_log2FC = as.numeric(avg_log2FC),
+      temp_p_val_adj = as.numeric(p_val_adj),
+      temp_p_val = as.numeric(p_val),
+      
+      # Handle non-finite values for logFC, adj_p, and p_value as specified:
+      logFC = ifelse(!is.finite(temp_avg_log2FC), 0, temp_avg_log2FC),
+      adj_p = ifelse(!is.finite(temp_p_val_adj), 1, temp_p_val_adj),
+      p_value = ifelse(!is.finite(temp_p_val), 1, temp_p_val)
+    ) %>%
+    dplyr::mutate(
+      # Calculate raw score using cleaned logFC and adj_p
+      raw_score_calc = logFC * (-log(adj_p)),
+      # Final 'score': replace any non-finite raw_score_calc with 0
+      score = ifelse(!is.finite(raw_score_calc), 0, raw_score_calc),
+      
+      # Group label based on the cleaned logFC
       group_label = as.factor(
-        ifelse(avg_log2FC > 0, "Increased_by_Perturbation", "Decreased_by_Perturbation")
+        ifelse(logFC > 0, "Increased_by_Perturbation", "Decreased_by_Perturbation")
       )
     ) %>%
-    # Select only the columns required for the OmicSignature difexp slot
-    dplyr::select(probe_id, feature_name, score, p_value, adj_p, logfc, group_label, gene_symbol)
+    # Select final columns and convert to a plain data.frame
+    dplyr::select(probe_id, feature_name, score, p_value, adj_p, logFC, group_label, gene_symbol) %>%
+    as.data.frame(stringsAsFactors = FALSE) # CRITICAL: Convert to plain data.frame here
+  
+  # Optional: Final check for non-finite values in 'score' after all operations
+  if (any(!is.finite(difexp_data_clean$score))) {
+    message(paste0("    RE-WARNING: Non-finite values in 'score' after full cleaning pipeline for ", perturbation_gene_symbol, " (", cell_line, "). This is highly unexpected. Setting remaining to 0."))
+    difexp_data_clean$score[!is.finite(difexp_data_clean$score)] <- 0
+  }
   
   # --- Prepare 'signature' dataframe for OmicSignature object ---
   # 1. Filter genes based on defined cutoffs
-  significant_genes <- difexp_data %>%
-    dplyr::filter(adj_p <= adj_p_cutoff & abs(logfc) >= log2fc_abs_cutoff)
+  significant_genes <- difexp_data_clean %>% # Use difexp_data_clean for filtering too
+    dplyr::filter(adj_p <= adj_p_cutoff & abs(logFC) >= log2fc_abs_cutoff)
   
   if (nrow(significant_genes) == 0) {
-    message(paste0("    Skipped: No significant genes found for ", perturbation_gene_symbol, " (", cell_line, ") with current cutoffs (adj.p <= ", adj_p_cutoff, ", |log2FC| >= ", log2fc_abs_cutoff, ")."))
+    message(paste0("    Skipped: No significant genes found for ", perturbation_gene_symbol, " (", cell_line, ") with current cutoffs (adj.p <= ", adj_p_cutoff, ", |logFC| >= ", log2fc_abs_cutoff, ")."))
     return(NULL)
   }
   
-  # 3. Rank by absolute score and take the top N genes
+  # 2. Rank by absolute score and take the top N genes
   significant_genes_ranked <- significant_genes %>%
     dplyr::arrange(desc(abs(score))) %>%
     dplyr::slice_head(n = max_genes_in_signature)
@@ -205,8 +252,8 @@ create_perturb_omic_signature <- function(
   # Select and format columns for the 'signature' slot
   signature_data <- significant_genes_ranked %>%
     dplyr::select(probe_id, feature_name, score, group_label) %>%
-    # Ensure probe_id uniqueness, picking the first entry if duplicates exist
-    distinct(probe_id, .keep_all = TRUE)
+    distinct(probe_id, .keep_all = TRUE) %>%
+    as.data.frame(stringsAsFactors = FALSE) # Also convert signature_data to plain data.frame
   
   if (nrow(signature_data) == 0) {
     message(paste0("    Skipped: No unique probe IDs remain for signature for ", perturbation_gene_symbol, " (", cell_line, ")."))
@@ -214,7 +261,6 @@ create_perturb_omic_signature <- function(
   }
   
   # --- Create Metadata for the OmicSignature object ---
-  # Determine sample_type for metadata description
   phenotype_desc <- switch(cell_line,
                            "K562" = "chronic myeloid leukemia (CML) K562 cells",
                            "RPE1" = "retinal pigment epithelial RPE1 cells",
@@ -236,11 +282,11 @@ create_perturb_omic_signature <- function(
       perturbation_gene_symbol, " in ", phenotype_desc, ". ",
       "Data from Replogle et al. 2022 perturbational scRNA-seq regression analysis. ",
       "Signature genes filtered by adjusted p-value <= ", adj_p_cutoff, " and absolute log2FC >= ", log2fc_abs_cutoff, ". ",
-      "The top ", max_genes_in_signature, " genes were selected by ranking based on abs(avg_log2FC * adj_p)."
+      "The top ", max_genes_in_signature, " genes were selected by ranking based on abs(logFC * -log(adj_p))."
     ),
     adj_p_cutoff = adj_p_cutoff,
     logfc_cutoff = log2fc_abs_cutoff,
-    score_cutoff = NULL, # No specific score cutoff, as ranking is by custom score, not 'score' directly
+    score_cutoff = NULL,
     keywords = c("Perturb-seq", "CRISPRi", "knockdown", perturbation_gene_symbol, cell_line, "scRNA-seq", "gene expression")
   )
   
@@ -249,7 +295,7 @@ create_perturb_omic_signature <- function(
     OmicSignature$new(
       metadata = metadata_object,
       signature = signature_data,
-      difexp = difexp_data
+      difexp = difexp_data_clean # Pass the aggressively cleaned data frame
     )
   }, error = function(e) {
     message(paste0("    ERROR creating OmicSignature for ", perturbation_gene_symbol, " (", cell_line, "): ", e$message))
@@ -315,8 +361,8 @@ collection_base_keywords <- c("Perturb-seq", "CRISPRi", "knockdown", "scRNA-seq"
 # K562 OmicSignatureCollection
 if (length(k562_omicsigs_list) > 0) {
   message("\n--- Creating K562 OmicSignatureCollection ---")
-  k562_collection_metadata <- OmicSignature::createMetadata(
-    collection_name = "Replogle K562 Perturb-seq Signatures",
+  k562_collection_metadata <- list(
+    collection_name = "Replogle_K562_PerturbSeq_Signatures",
     description = paste0("Signatures derived from K562 cells. ", collection_base_description),
     organism = "Homo sapiens",
     direction_type = "bi-directional",
@@ -341,8 +387,8 @@ if (length(k562_omicsigs_list) > 0) {
 # RPE1 OmicSignatureCollection
 if (length(rpe1_omicsigs_list) > 0) {
   message("\n--- Creating RPE1 OmicSignatureCollection ---")
-  rpe1_collection_metadata <- OmicSignature::createMetadata(
-    collection_name = "Replogle RPE1 Perturb-seq Signatures",
+  rpe1_collection_metadata <- list(
+    collection_name = "Replogle_RPE1_PerturbSeq_Signatures",
     description = paste0("Signatures derived from RPE1 cells. ", collection_base_description),
     organism = "Homo sapiens",
     direction_type = "bi-directional",
@@ -368,8 +414,8 @@ if (length(rpe1_omicsigs_list) > 0) {
 all_omicsigs_combined <- c(k562_omicsigs_list, rpe1_omicsigs_list)
 if (length(all_omicsigs_combined) > 0) {
   message("\n--- Creating Combined OmicSignatureCollection ---")
-  combined_collection_metadata <- OmicSignature::createMetadata(
-    collection_name = "Replogle Perturb-seq Signatures (K562 & RPE1)",
+  combined_collection_metadata <- list(
+    collection_name = "Replogle_PerturbSeq_Signatures_(K562_and_RPE1)",
     description = paste0("Combined collection of signatures from K562 and RPE1 cells. ",
                          "Each signature name specifies its cell line origin. ", collection_base_description),
     organism = "Homo sapiens",
