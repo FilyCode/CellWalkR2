@@ -1,0 +1,317 @@
+---
+title: "Untitled"
+author: "phitro"
+date: "2025-11-14"
+output: html_document
+---
+
+
+## Plotting heatmap of Replogle perturb seq signatures
+
+```{r plotting_replogle_signature}
+# R Script: Heatmap Generation from OmicSignatureCollection
+
+# --- 1. Setup and Load Libraries ---
+library(tidyverse)     # For data manipulation (dplyr, tidyr)
+library(OmicSignature) # To work with OmicSignature objects and collections
+library(pheatmap)      # For generating advanced heatmaps
+
+# --- 2. Define Paths ---
+combined_collection_input_file <- file.path(
+  "/restricted/projectnb/agedisease/projects/challenge2025/results/perturbational_omic_sigs/replogle_2022",
+  "Replogle_Perturb_Combined_OmicSignatureCollection.rds"
+)
+output_heatmap_file <- "combined_omic_signatures_heatmap_smaller_dimensions.pdf"
+
+# --- 3. Load Combined OmicSignatureCollection ---
+message("--- Loading Combined OmicSignatureCollection ---")
+if (!file.exists(combined_collection_input_file)) {
+  stop(paste("Error: The collection file was not found at:", combined_collection_input_file))
+}
+combined_omic_collection <- readRDS(combined_collection_input_file)
+message(paste0("Loaded collection with ", length(combined_omic_collection$OmicSigList), " signatures."))
+
+# --- 4. Extract Signature Scores and Prepare Data for Heatmap ---
+message("--- Extracting scores and preparing data matrix ---")
+
+# Initialize an empty list to store data for all signatures
+all_signature_data_long <- list()
+
+# Loop through each OmicSignature in the collection
+for (sig_key in names(combined_omic_collection$OmicSigList)) {
+  omic_sig <- combined_omic_collection$OmicSigList[[sig_key]]
+  
+  # Get the full signature name (e.g., "GeneX Knockdown Signature - K562")
+  full_signature_name <- omic_sig$metadata$signature_name
+  
+  # Extract the cell line (K562 or RPE1) from the signature name
+  cell_line <- str_extract(full_signature_name, "(K562|RPE1)$")
+  
+  # Ensure we could extract a cell line and the signature data exists
+  if (is.na(cell_line) || is.null(omic_sig$signature) || nrow(omic_sig$signature) == 0) {
+    warning(paste("Skipping signature due to missing cell line or empty data:", full_signature_name))
+    next
+  }
+  
+  # Get the 'signature' data frame which contains top genes and their scores
+  sig_df <- omic_sig$signature
+  
+  # Create a small data frame (tibble) for the current signature
+  # We select 'probe_id' as the gene identifier and 'score'
+  current_sig_tibble <- tibble(
+    signature_name = full_signature_name,
+    cell_line = cell_line,
+    gene_id = sig_df$probe_id,
+    score = sig_df$score
+  )
+  
+  all_signature_data_long[[full_signature_name]] <- current_sig_tibble
+}
+
+# Combine all individual signature data frames into one long format table
+combined_long_df <- bind_rows(all_signature_data_long)
+
+# Convert the long format data to a wide matrix suitable for a heatmap:
+#   - Rows will be the signature names
+#   - Columns will be the gene IDs
+#   - Values will be the scores
+#   - Genes not present in a specific signature will have their score filled with 0
+heatmap_matrix_data <- combined_long_df %>%
+  # Handle potential duplicate gene_id within a signature (take first score if any)
+  distinct(signature_name, gene_id, .keep_all = TRUE) %>%
+  pivot_wider(
+    id_cols = c(signature_name, cell_line), # Keep signature_name and cell_line for structure
+    names_from = gene_id,                   # Genes become column headers
+    values_from = score,                    # Scores fill the matrix cells
+    values_fill = 0                         # Fill NA values (gene not in signature) with 0
+  )
+
+# Separate the cell line information for row annotations in the heatmap
+annotation_df <- heatmap_matrix_data %>%
+  dplyr::select(signature_name, cell_line) %>%
+  column_to_rownames("signature_name") %>%
+  as.data.frame() # pheatmap expects a data.frame for annotations
+
+# Prepare the actual matrix for the heatmap (remove cell_line column)
+matrix_for_heatmap <- heatmap_matrix_data %>%
+  dplyr::select(-cell_line) %>% # Remove the cell_line column
+  column_to_rownames("signature_name") %>%
+  as.matrix()
+
+# Check if the matrix is empty after processing
+if (nrow(matrix_for_heatmap) == 0 || ncol(matrix_for_heatmap) == 0) {
+  stop("Error: No data available to create a heatmap. Please check your OmicSignatureCollection.")
+}
+
+message(paste0("Heatmap matrix dimensions: ", nrow(matrix_for_heatmap), " signatures x ", ncol(matrix_for_heatmap), " genes."))
+
+# --- 5. Generate Heatmap with pheatmap ---
+message(paste0("--- Generating heatmap and saving to '", output_heatmap_file, "' ---"))
+
+# Define custom colors for the cell line annotation (optional, but good for clarity)
+# You can customize these colors further if needed
+annotation_colors = list(
+  cell_line = c(K562 = "#E41A1C", RPE1 = "#377EB8") # Red for K562, Blue for RPE1
+)
+
+# Generate the heatmap
+# - `mat`: The matrix of scores
+# - `cluster_rows`, `cluster_cols`: Enable clustering for signatures and genes
+# - `annotation_row`: Adds a sidebar to the rows, labeling each signature's cell line
+# - `annotation_colors`: Applies the custom colors to the annotation sidebar
+# - `show_rownames`: Display the full signature names
+# - `show_colnames`: Usually too many genes to show names clearly, set to FALSE
+# - `main`: Title for the heatmap
+# - `filename`: The file path to save the heatmap as a PDF
+# - `width`, `height`: Dimensions for the output PDF
+pheatmap(
+  mat = matrix_for_heatmap,
+  clustering_distance_rows = "euclidean", # Common distance metric for rows
+  clustering_distance_cols = "euclidean", # Common distance metric for columns
+  clustering_method = "ward.D2",           # Common clustering method
+  show_rownames = TRUE,                   # Show signature names (rows)
+  show_colnames = FALSE,                  # Hide gene names (columns) as there are usually too many
+  annotation_row = annotation_df,         # Add cell line annotation to rows
+  annotation_colors = annotation_colors,  # Apply custom colors to cell line annotation
+  main = paste0("Signature Scores Heatmap (", nrow(matrix_for_heatmap), " signatures x ", ncol(matrix_for_heatmap), " genes)"),
+  fontsize_row = 7,                       # Adjust font size for signature names
+  fontsize_col = 5,                       # Adjust font size for gene names if shown
+  filename = output_heatmap_file,         # Save the heatmap to a PDF file
+  width = 10,                             # Width of the PDF in inches
+  height = 20                             # Height of the PDF in inches
+)
+
+message("Heatmap generated and saved successfully!")
+message("\nScript finished.")
+
+```
+
+```{r FGSEA script: GTEX vs perturb seq replogle}
+
+library(tidyverse) 
+library(fgsea)     
+library(OmicSignature) 
+
+perturbation_collection_file <- "/restricted/projectnb/agedisease/projects/challenge2025/results/perturbational_omic_sigs/replogle_2022/Replogle_Perturb_Combined_OmicSignatureCollection.rds"
+
+gtex_collection_file <- "/restricted/projectnb/agedisease/projects/challenge2025/data/GTEX/GTEX_aging_omic_col_stat_v114.rds"
+
+output_dir <- "/restricted/projectnb/agedisease/projects/challenge2025/results/perturbational_omic_sigs/replogle_2022/"
+
+# Load OmicSignature Collections
+perturb_collection <- readRDS(perturbation_collection_file)
+message(paste0("Loaded ", length(perturb_collection$OmicSigList), " perturbation signatures."))
+
+gtex <- readRDS(gtex_collection_file)
+message(paste0("Loaded ", length(gtex$OmicSigList), " GTEX aging signatures."))
+
+# Prepare Perturbation Signatures as Gene Sets for fgsea
+
+# Extract probe_ids (genes) from each perturbation signature.
+# These will be the "pathways" (gene sets) for fgsea.
+perturb_list <- lapply(perturb_collection$OmicSigList, function(x) {
+  # Ensure signature data exists and has probe_id
+  if (!is.null(x$signature) && "probe_id" %in% names(x$signature)) {
+    # Might want to filter genes here based on score if the signatures contain many genes
+    return(x$signature$probe_id)
+  } else {
+    warning(paste("Signature '", x$metadata$signature_name, "' has no 'signature' or 'probe_id'. Skipping."))
+    return(character(0)) # Return empty vector for signatures without valid data
+  }
+})
+
+# Remove any empty gene sets that might have resulted from the warning above
+perturbation_gene_sets <- perturb_list[sapply(perturb_list, length) > 0]
+
+# Check if any gene sets were prepared
+if (length(perturbation_gene_sets) == 0) {
+  stop("No valid perturbation gene sets could be prepared. Check your input data structure.")
+}
+
+message(paste0("Prepared ", length(perturbation_gene_sets), " perturbation gene sets for fgsea."))
+
+
+# Perform fgsea Analysis for each Aging Signature
+aging_sigs <- names(gtex$OmicSigList)
+
+message("Starting fgsea analysis across ", length(aging_sigs), " aging signatures...")
+res_list <- lapply(aging_sigs, function(aging_nm) {
+  age_sig_df <- gtex$OmicSigList[[aging_nm]]$signature
+
+  # Ensure signature data exists and has probe_id and score
+  if (is.null(age_sig_df) || !("probe_id" %in% names(age_sig_df)) || !("score" %in% names(age_sig_df))) {
+    warning(paste("Aging signature '", aging_nm, "' is missing 'signature', 'probe_id', or 'score'. Skipping."))
+    return(NULL) # Return NULL for signatures with missing or incomplete data
+  }
+
+  # Create a named, ranked vector of scores for fgsea `stats` argument.
+  # fgsea expects gene names as names and scores as values, sorted decreasingly.
+  # Genes with higher scores are considered more "upregulated" or significant.
+  aging_ranks <- sort(setNames(age_sig_df$score, age_sig_df$probe_id), decreasing = TRUE)
+
+  # Perform fgsea
+  fg <- fgsea(pathways = perturbation_gene_sets, # Your perturbation gene sets
+              stats    = aging_ranks,          # The ranked aging signature genes
+              minSize  = 1,                    # Minimum size of gene set to be considered (adjust as needed)
+              maxSize  = 500                   # Maximum size of gene set to be considered (adjust as needed)
+  )
+  fg$aging_set <- aging_nm # Add the aging signature name to the results table
+  return(fg)
+})
+
+# Remove any NULL results from the list (for skipped aging signatures)
+res_list <- res_list[!sapply(res_list, is.null)]
+
+# Check if any fgsea results were generated
+if (length(res_list) == 0) {
+  stop("No fgsea results generated. Check for issues in aging signature loading or processing.")
+}
+
+# Combine all fgsea results into a single data frame
+res_list_df <- do.call(rbind, res_list)
+
+message("fgsea analysis complete. Total results: ", nrow(res_list_df), " rows.")
+
+
+
+# Filter and Visualize Significant Results
+
+# Filter for significant results (padj < 0.05) and select top N by absolute NES
+
+if (nrow(res_list_df) == 0) {
+  message("No fgsea results to display.")
+} else {
+  # First, filter for all significant results
+  all_significant_results <- res_list_df %>%
+    filter(padj < 0.05)
+
+  if (nrow(all_significant_results) == 0) {
+    message("No significant interactions (padj < 0.05) found to plot.")
+  } else {
+    message(paste0("Found ", nrow(all_significant_results), " significant interactions (padj < 0.05)."))
+
+    # --- Plot for Top Upregulated Signatures (Positive NES) ---
+    top_upregulated_results <- all_significant_results %>%
+      filter(NES > 0) %>% # Select positive NES
+      arrange(desc(NES)) %>% # Order by highest NES
+      slice(1:min(n(), 20)) # Take top 20, or fewer if less than 20 exist
+
+    if (nrow(top_upregulated_results) > 0) {
+      message("Generating plot for top 20 upregulated results...")
+      plot_upregulated <- ggplot(top_upregulated_results, aes(x = reorder(pathway, NES), y = aging_set)) +
+        geom_point(aes(size  = size, color = NES)) +
+        scale_size_continuous(name = "Gene Set Size") +
+        # Use a single color gradient for positive NES values
+        scale_color_gradient(low = "yellow", high = "red", name = "NES") +
+        coord_flip() +
+        theme_bw() +
+        theme(axis.text.x = element_text(angle = 45, hjust = 1),
+              plot.title = element_text(face = "bold", hjust = 0.5)) +
+        labs(x = "Perturbation Signature (Gene Set)",
+             y = "Aging Signature (Ranked List)",
+             title = "Top 20 Upregulated Perturbation Signatures in Aging Signatures (Positive NES)")
+
+      print(plot_upregulated)
+      ggsave(file.path(output_dir, "top_20_upregulated_perturbation_aging_enrichment.pdf"), plot_upregulated, width = 12, height = 8)
+      message("Top 20 upregulated plot generated and saved.")
+
+      message("\nTop 20 Upregulated Results (pathway, aging_set, NES, pval, padj, size):")
+      print(top_upregulated_results %>% dplyr::select(pathway, aging_set, NES, pval, padj, size))
+    } else {
+      message("No significant upregulated interactions (NES > 0, padj < 0.05) found to plot.")
+    }
+
+    # --- Plot for Top Downregulated Signatures (Negative NES) ---
+    top_downregulated_results <- all_significant_results %>%
+      filter(NES < 0) %>% # Select negative NES
+      arrange(NES) %>% # Order by lowest (most negative) NES
+      slice(1:min(n(), 20)) # Take top 20, or fewer if less than 20 exist
+
+    if (nrow(top_downregulated_results) > 0) {
+      message("Generating plot for top 20 downregulated results...")
+      plot_downregulated <- ggplot(top_downregulated_results, aes(x = reorder(pathway, NES), y = aging_set)) +
+        geom_point(aes(size  = size, color = NES)) +
+        scale_size_continuous(name = "Gene Set Size") +
+        # Use a single color gradient for negative NES values
+        scale_color_gradient(low = "darkblue", high = "lightblue", name = "NES") +
+        coord_flip() +
+        theme_bw() +
+        theme(axis.text.x = element_text(angle = 45, hjust = 1),
+              plot.title = element_text(face = "bold", hjust = 0.5)) +
+        labs(x = "Perturbation Signature (Gene Set)",
+             y = "Aging Signature (Ranked List)",
+             title = "Top 20 Downregulated Perturbation Signatures in Aging Signatures (Negative NES)")
+
+      print(plot_downregulated)
+      ggsave(file.path(output_dir, "top_20_downregulated_perturbation_aging_enrichment.pdf"), plot_downregulated, width = 12, height = 8)
+      message("Top 20 downregulated plot generated and saved.")
+
+      message("\nTop 20 Downregulated Results (pathway, aging_set, NES, pval, padj, size):")
+      print(top_downregulated_results %>% dplyr::select(pathway, aging_set, NES, pval, padj, size))
+    } else {
+      message("No significant downregulated interactions (NES < 0, padj < 0.05) found to plot.")
+    }
+  }
+}
+
+```
