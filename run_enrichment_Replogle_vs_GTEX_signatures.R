@@ -510,8 +510,14 @@ plot_fgsea_results <- function(fgsea_df, analysis_title_prefix, output_dir, top_
       # Combine the main title with the grid of plots
       combined_plot_with_title <- plot_grid(final_title, combined_plot, ncol = 1, rel_heights = c(0.05, 1))
       
+      # Save as png
       plot_filename <- file.path(output_dir, paste0(gsub(" ", "_", analysis_title_prefix), "_top_", top_n, "_gsea_4_panel_enrichment.png"))
       ggsave(plot_filename, combined_plot_with_title, width = 16, height = 12) # Increased width/height for 4 plots
+      
+      # Save as SVG (vector file)
+      plot_filename <- file.path(output_dir, paste0(gsub(" ", "_", analysis_title_prefix), "_top_", top_n, "_gsea_4_panel_enrichment.svg"))
+      ggsave(plot_filename, combined_plot_with_title, width = 16, height = 12) # Increased width/height for 4 plots
+      
       message("  4-panel GSEA plot generated and saved to: ", plot_filename)
     } else {
       message("No plots generated due to lack of significant results in any category for ", analysis_title_prefix, ".")
@@ -589,16 +595,16 @@ plot_clustered_heatmap <- function(fgsea_df, analysis_title_prefix, geneset_sour
   # Generate heatmap using ComplexHeatmap
   hm <- Heatmap(
     mat,
-    name = "ES", # Legend name # CHANGE NES to ES
+    name = "ES", # Legend name
     col = col_fun,
     na_col = "grey90", # Color for NA values
     cluster_rows = TRUE,
     cluster_columns = TRUE,
-    show_row_names = TRUE, # CHANGE FROM FALSE to TRUE
-    row_names_gp = gpar(fontsize = 6), # ADD THIS LINE
+    show_row_names = FALSE,
+    row_names_gp = gpar(fontsize = 6),
     column_names_gp = gpar(fontsize = 8),
     column_names_rot = 90,
-    show_column_dend = FALSE # ADD THIS LINE to match her code (she uses F for this)
+    show_column_dend = FALSE
   )
   
   # Save as PNG
