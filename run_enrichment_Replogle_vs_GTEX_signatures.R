@@ -5,6 +5,7 @@ library(ggplot2)
 library(pheatmap)
 library(ComplexHeatmap)
 library(circlize)
+library(cowplot)
 
 # --- Configuration ---
 # File paths
@@ -22,28 +23,54 @@ if (!dir.exists(output_dir)) {
 logFC_filter_val <- 0.25
 adj_pval_filter_val <- 0.05
 geneset_top_n <- 500
-top_n_genesets_to_plot <- 20
+top_n_genesets_to_plot <- 100
 
 # fgsea parameters
-fgsea_min_size <- 1
-fgsea_max_size <- 500
+fgsea_min_size <- 15 
+fgsea_max_size <- Inf
 
 message("--- Starting GSEA Combined Analysis ---")
 message(paste0("Output directory: ", output_dir))
 message(paste0("Gene set filtering: |logFC| > ", logFC_filter_val, ", adj.pval < ", adj_pval_filter_val))
-message(paste0("fgsea parameters: minSize = ", fgsea_min_size, ", maxSize = ", fgsea_max_size))
+message(paste0("fgsea parameters: minSize = ", fgsea_min_size, ", maxSize = ", fgsea_max_size)) # UPDATE MESSAGE
 message(paste0("Top N results for plotting: ", top_n_genesets_to_plot))
 
 # --- Helper Functions ---
 
+#' Simplifies gene names, taking the shortest alphabetical entry from a ' /// ' delimited string.
+#'
+#' @param x A string representing one or more gene names, possibly ' /// ' delimited.
+#' @return A simplified, uppercase gene name.
+simplify_entry <- function(x) {
+  if (is.null(x) || is.na(x) || x == "" || x == "<NA>") { # Added "<NA>" check
+    return(NA_character_)
+  }
+  # Split on ' /// '
+  parts <- strsplit(x, " /// ")[[1]]
+  # Filter out empty strings if any
+  parts <- parts[parts != ""]
+  if (length(parts) == 0) {
+    return(NA_character_)
+  }
+  # Get lengths
+  len <- nchar(parts)
+  shortest <- parts[len == min(len)]
+  # If tie, sort alphabetically
+  chosen <- sort(shortest)[1]
+  toupper(chosen)
+}
+
+
 #' Extracts ranked gene lists from an OmicSignatureCollection.
 #' Ranks genes by 'score' without p-value/logFC filtering.
 #' Prioritizes 'difexp' table, falls back to 'signature' if 'difexp' is missing.
+#' Maps probe_id to gene_name using a provided gene map.
 #'
 #' @param omic_collection An OmicSignatureCollection object.
 #' @param collection_name A string identifying the source collection (for warnings/messages).
-#' @return A named list of numeric vectors, where names are probe_id and values are scores.
-extract_ranked_lists <- function(omic_collection, collection_name) {
+#' @param gene_map A named character vector for mapping probe_id to gene_name. # ADD gene_map PARAMETER
+#' @return A named list of numeric vectors, where names are gene_name and values are scores.
+extract_ranked_lists <- function(omic_collection, collection_name, gene_map) { # MODIFY FUNCTION SIGNATURE
   ranked_lists <- list()
   if (is.null(omic_collection) || is.null(omic_collection$OmicSigList)) {
     stop(paste("OmicSignatureCollection is NULL or empty for", collection_name))
@@ -64,10 +91,13 @@ extract_ranked_lists <- function(omic_collection, collection_name) {
       next
     }
     
+    # Map probe_id to gene_name and simplify 
+    df_for_ranks$gene_name <- sapply(gene_map[df_for_ranks$probe_id], simplify_entry, USE.NAMES = FALSE)
+    
     current_ranks <- df_for_ranks %>%
-      dplyr::select(probe_id, score) %>%
-      drop_na(score) %>% # Remove NAs in score
-      distinct(probe_id, .keep_all = TRUE) %>% # Keep one entry per probe_id if duplicates exist
+      dplyr::select(gene_name, score) %>% 
+      drop_na(score, gene_name) %>% # Remove NAs in score and gene_name 
+      distinct(gene_name, .keep_all = TRUE) %>% # Keep one entry per gene_name if duplicates exist 
       arrange(desc(score)) %>%
       tibble::deframe() # Convert to named numeric vector
     
@@ -85,17 +115,20 @@ extract_ranked_lists <- function(omic_collection, collection_name) {
   return(ranked_lists)
 }
 
+
 #' Extracts gene sets (upregulated and downregulated) from an OmicSignatureCollection.
 #' Filters genes based on logFC and adjusted p-value thresholds.
 #' Prioritizes 'signature' table, falls back to 'difexp' if 'signature' is missing.
+#' Maps probe_id to gene_name using a provided gene map.
 #'
 #' @param omic_collection An OmicSignatureCollection object.
 #' @param logFC_thresh Numeric, absolute logFC threshold for filtering.
 #' @param pval_thresh Numeric, adjusted p-value threshold for filtering.
 #' @param geneset_top_n Numeric or NULL. If a number, takes top N genes by absolute logFC after other filters.
 #' @param collection_name A string identifying the source collection (for warnings/messages).
+#' @param gene_map A named character vector for mapping probe_id to gene_name. # ADD gene_map PARAMETER
 #' @return A list containing two named lists: 'up_gene_sets' and 'dn_gene_sets'.
-extract_gene_sets_up_dn <- function(omic_collection, logFC_thresh, pval_thresh, geneset_top_n, collection_name) {
+extract_gene_sets_up_dn <- function(omic_collection, logFC_thresh, pval_thresh, geneset_top_n, collection_name, gene_map) { # MODIFY FUNCTION SIGNATURE
   up_gene_sets <- list()
   dn_gene_sets <- list()
   
@@ -162,7 +195,7 @@ extract_gene_sets_up_dn <- function(omic_collection, logFC_thresh, pval_thresh, 
     }
     
     # If no suitable dataframe was found after checking both, skip this signature
-    if (is.null(df_to_process)) {
+    if (is.is.null(df_to_process)) {
       warning(paste("Skipping", collection_name, sig_name, 
                     ": Neither 'difexp' nor 'signature' contains the minimum required columns (probe_id, score, and any of", paste(possible_pval_cols, collapse="/"), ")."))
       next
@@ -175,18 +208,6 @@ extract_gene_sets_up_dn <- function(omic_collection, logFC_thresh, pval_thresh, 
                     "from", used_source_name, ". Will use 'score' for determining UP/DN gene set direction.",
                     "logFC_thresh will not be applied for this signature."))
     }
-    
-    # Filter for NAs in critical columns and ensure unique gene IDs
-    # Filter NAs for mandatory columns (score, adj.pval)
-    df_filtered <- df_to_process %>% 
-      dplyr::filter(!is.na(!!sym(required_score_col)), !is.na(adj.pval)) %>% 
-      dplyr::distinct(!!sym(required_id_col), .keep_all = TRUE) 
-    
-    # If logFC is present, filter its NAs too
-    if (has_logFC) {
-      df_filtered <- df_filtered %>% dplyr::filter(!is.na(!!sym(possible_logfc_cols[1])))
-    }
-    
     
     # Determine if logFC is available and if group_label is a valid fallback for directionality
     has_logFC <- any(possible_logfc_cols %in% names(df_to_process)) && 
@@ -248,16 +269,25 @@ extract_gene_sets_up_dn <- function(omic_collection, logFC_thresh, pval_thresh, 
         dplyr::slice_head(n = geneset_top_n) # Take top N genes
     } 
     
+    # Map probe_id to gene_name and simplify BEFORE extracting to up_genes/dn_genes # ADD THESE LINES
+    significant_genes$gene_name <- sapply(gene_map[significant_genes$probe_id], simplify_entry, USE.NAMES = FALSE)
+    significant_genes <- significant_genes %>% dplyr::filter(!is.na(gene_name)) %>% dplyr::distinct(gene_name, .keep_all = TRUE)
+    
+    if (nrow(significant_genes) == 0) {
+      message(paste("No significant genes with valid gene names found for", collection_name, sig_name, "after mapping. Skipping gene set creation."))
+      next
+    }
+    
     # Filter for upregulated genes and downregulated genes (dynamic directionality)
     up_genes <- character(0)
     dn_genes <- character(0)
     
     if (has_logFC) { # Use logFC for direction
-      up_genes <- significant_genes %>% dplyr::filter(!!sym(possible_logfc_cols[1]) > 0) %>% dplyr::pull(!!sym(required_id_col)) %>% unique()
-      dn_genes <- significant_genes %>% dplyr::filter(!!sym(possible_logfc_cols[1]) < 0) %>% dplyr::pull(!!sym(required_id_col)) %>% unique()
+      up_genes <- significant_genes %>% dplyr::filter(!!sym(possible_logfc_cols[1]) > 0) %>% dplyr::pull(gene_name) %>% unique() 
+      dn_genes <- significant_genes %>% dplyr::filter(!!sym(possible_logfc_cols[1]) < 0) %>% dplyr::pull(gene_name) %>% unique()
     } else if (use_group_label_for_direction) { # Use group_label for direction
-      up_genes <- significant_genes %>% dplyr::filter(!!sym(group_label_col_name) == "Older") %>% dplyr::pull(!!sym(required_id_col)) %>% unique()
-      dn_genes <- significant_genes %>% dplyr::filter(!!sym(group_label_col_name) == "Younger") %>% dplyr::pull(!!sym(required_id_col)) %>% unique()
+      up_genes <- significant_genes %>% dplyr::filter(!!sym(group_label_col_name) == "Older") %>% dplyr::pull(gene_name) %>% unique()
+      dn_genes <- significant_genes %>% dplyr::filter(!!sym(group_label_col_name) == "Younger") %>% dplyr::pull(gene_name) %>% unique()
     }
     
     # Add to gene sets list
@@ -336,12 +366,13 @@ perform_fgsea_and_combine <- function(ranked_lists, gene_sets_up, gene_sets_dn, 
   return(combined_results_df)
 }
 
-#' Generates and saves ggplot visualizations for fgsea results.
+#' Generates and saves a 2x2 grid of ggplot dot plots for fgsea results.
+#' The grid shows combinations of UP/DOWN gene sets with Positive/Negative NES.
 #'
 #' @param fgsea_df A data frame of combined fgsea results.
 #' @param analysis_title_prefix A string for plot titles, e.g., "Age-Centered Analysis".
 #' @param output_dir Path to save the plots.
-#' @param top_n Numeric, number of top results to plot.
+#' @param top_n Numeric, number of top results to plot for each panel.
 plot_fgsea_results <- function(fgsea_df, analysis_title_prefix, output_dir, top_n = 20) {
   
   if (is.null(fgsea_df) || nrow(fgsea_df) == 0) {
@@ -349,7 +380,12 @@ plot_fgsea_results <- function(fgsea_df, analysis_title_prefix, output_dir, top_
     return(invisible(NULL))
   }
   
-  message(paste0("Generating plots for: ", analysis_title_prefix))
+  message(paste0("Generating 4-panel dot plots for: ", analysis_title_prefix))
+  
+  # Ensure output directory exists (already done in main, but good for standalone)
+  if (!dir.exists(output_dir)) {
+    dir.create(output_dir, recursive = TRUE)
+  }
   
   # First, filter for all significant results
   all_significant_results <- fgsea_df %>%
@@ -361,66 +397,123 @@ plot_fgsea_results <- function(fgsea_df, analysis_title_prefix, output_dir, top_
   } else {
     message(paste0("Found ", nrow(all_significant_results), " significant interactions (padj < 0.05) for ", analysis_title_prefix, "."))
     
-    # --- Plot for Top Upregulated Signatures (Positive NES) ---
-    top_upregulated_results <- all_significant_results %>%
-      filter(NES > 0) %>% # Select positive NES
-      arrange(dplyr::desc(NES)) %>% # Order by highest NES
-      slice(1:min(dplyr::n(), top_n)) # Take top N, or fewer if less than N exist
-    
-    if (nrow(top_upregulated_results) > 0) {
-      message(paste0("  Generating plot for top ", top_n, " upregulated results (Positive NES)..."))
-      plot_upregulated <- ggplot(top_upregulated_results, aes(x = reorder(pathway, NES), y = ranked_list_name)) +
-        geom_point(aes(size  = size, color = NES)) +
-        scale_size_continuous(name = "Gene Set Size") +
-        scale_color_gradient(low = "yellow", high = "red", name = "NES") +
-        coord_flip() +
-        theme_bw() +
-        theme(axis.text.x = element_text(angle = 45, hjust = 1),
-              plot.title = element_text(face = "bold", hjust = 0.5),
-              axis.title.y = element_text(face = "bold")) +
-        labs(x = "Gene Set (Pathway)",
-             y = paste0(analysis_title_prefix, " Ranked List"),
-             title = paste0("Top ", top_n, " Upregulated Gene Sets in ", analysis_title_prefix, " (Positive NES)"))
-      
-      plot_filename <- file.path(output_dir, paste0(gsub(" ", "_", analysis_title_prefix), "_top_", top_n, "_upregulated_enrichment.pdf"))
-      ggsave(plot_filename, plot_upregulated, width = 12, height = 8)
-      message("  Plot generated and saved to: ", plot_filename)
-      
-      message(paste0("\nTop ", top_n, " Upregulated Results (pathway, ranked_list_name, NES, pval, padj, size):"))
-      print(top_upregulated_results %>% dplyr::select(pathway, ranked_list_name, NES, pval, padj, size))
-    } else {
-      message(paste("  No significant upregulated interactions (NES > 0, padj < 0.05) found for", analysis_title_prefix, "to plot."))
+    # Check for required columns
+    if (!("geneset_direction" %in% colnames(all_significant_results) &&
+          "NES" %in% colnames(all_significant_results) &&
+          "ranked_list_name" %in% colnames(all_significant_results) &&
+          "pathway" %in% colnames(all_significant_results))) {
+      stop("Error: fgsea_df must contain 'geneset_direction', 'NES', 'ranked_list_name', and 'pathway' columns for 4-panel plot.")
     }
     
-    # --- Plot for Top Downregulated Signatures (Negative NES) ---
-    top_downregulated_results <- all_significant_results %>%
-      filter(NES < 0) %>% # Select negative NES
-      arrange(NES) %>% # Order by lowest (most negative) NES
-      slice(1:min(dplyr::n(), top_n)) # Take top N, or fewer if less than N exist
+    # Determine what type of gene sets are being used (e.g., "Perturbation Gene Set", "Aging Gene Set")
+    gene_set_label <- unique(all_significant_results$geneset_source_name)[1]
+    if (is.null(gene_set_label) || is.na(gene_set_label)) {
+      gene_set_label <- "Gene Set" # Fallback
+    } else {
+      gene_set_label <- paste0(gene_set_label, " Gene Set")
+    }
     
-    if (nrow(top_downregulated_results) > 0) {
-      message(paste0("  Generating plot for top ", top_n, " downregulated results (Negative NES)..."))
-      plot_downregulated <- ggplot(top_downregulated_results, aes(x = reorder(pathway, NES), y = ranked_list_name)) +
-        geom_point(aes(size  = size, color = NES)) +
+    # Helper function to create a single GSEA plot panel
+    create_gsea_plot_panel <- function(data, panel_title, nes_pos = TRUE) {
+      if (nrow(data) == 0) {
+        return(ggplot() + geom_text(aes(x=0.5, y=0.5, label=paste0("No significant data for\n", panel_title)), size=4, color="grey50") + theme_void())
+      }
+      
+      # Define color gradient based on NES direction
+      if (nes_pos) {
+        color_scale <- scale_color_gradient(low = "yellow", high = "red", name = "NES")
+      } else { # Negative NES
+        color_scale <- scale_color_gradient(low = "darkblue", high = "lightblue", name = "NES")
+      }
+      
+      p <- ggplot(data, aes(x = reorder(pathway, NES), y = ranked_list_name)) +
+        geom_point(aes(size = size, color = NES)) +
         scale_size_continuous(name = "Gene Set Size") +
-        scale_color_gradient(low = "darkblue", high = "lightblue", name = "NES") +
+        color_scale +
         coord_flip() +
         theme_bw() +
         theme(axis.text.x = element_text(angle = 45, hjust = 1),
-              plot.title = element_text(face = "bold", hjust = 0.5),
-              axis.title.y = element_text(face = "bold")) +
-        labs(x = "Gene Set (Pathway)",
-             y = paste0(analysis_title_prefix, " Ranked List"),
-             title = paste0("Top ", top_n, " Downregulated Gene Sets in ", analysis_title_prefix, " (Negative NES)"))
+              plot.title = element_text(face = "bold", hjust = 0.5, size = 10), # Adjust title size for grid
+              axis.title = element_text(size = 8),
+              axis.text = element_text(size = 7),
+              legend.text = element_text(size = 7),
+              legend.title = element_text(size = 8),
+              legend.position = "bottom", # Place legend at bottom for more plot space
+              plot.margin = margin(5, 5, 5, 5, "pt")) + # Add a small margin around each plot
+        labs(x = gene_set_label, # Dynamic x-axis label (e.g., "Perturbation Gene Set")
+             y = paste0(unique(data$ranked_source_name), " Ranked List"), # Dynamic y-axis label (e.g., "Aging Ranked List")
+             title = panel_title)
+      return(p)
+    }
+    
+    plot_list <- list() # This list will hold the 4 ggplot objects
+    
+    # --- 1. Gene Sets UP, Positive NES enrichment ---
+    data_up_pos <- all_significant_results %>%
+      dplyr::filter(geneset_direction == 'UP', NES > 0) %>%
+      dplyr::arrange(dplyr::desc(NES)) %>%
+      dplyr::slice(1:min(dplyr::n(), top_n))
+    
+    plot_list$up_pos <- create_gsea_plot_panel(data_up_pos, 
+                                               paste0("Top ", top_n, " UP ", gene_set_label, ", Positive NES"), 
+                                               nes_pos = TRUE)
+    message(paste0("Prepared plot for Top ", top_n, " UP ", gene_set_label, ", Positive NES (", nrow(data_up_pos), " results)."))
+    
+    # --- 2. Gene Sets UP, Negative NES enrichment ---
+    data_up_neg <- all_significant_results %>%
+      dplyr::filter(geneset_direction == 'UP', NES < 0) %>%
+      dplyr::arrange(NES) %>% # Arrange by NES ascending for most negative first
+      dplyr::slice(1:min(dplyr::n(), top_n))
+    
+    plot_list$up_neg <- create_gsea_plot_panel(data_up_neg, 
+                                               paste0("Top ", top_n, " UP ", gene_set_label, ", Negative NES"), 
+                                               nes_pos = FALSE)
+    message(paste0("Prepared plot for Top ", top_n, " UP ", gene_set_label, ", Negative NES (", nrow(data_up_neg), " results)."))
+    
+    # --- 3. Gene Sets DOWN, Positive NES enrichment ---
+    data_down_pos <- all_significant_results %>%
+      dplyr::filter(geneset_direction == 'DN', NES > 0) %>%
+      dplyr::arrange(dplyr::desc(NES)) %>% # Arrange by NES descending for most positive first
+      dplyr::slice(1:min(dplyr::n(), top_n))
+    
+    plot_list$down_pos <- create_gsea_plot_panel(data_down_pos, 
+                                                 paste0("Top ", top_n, " DOWN ", gene_set_label, ", Positive NES"), 
+                                                 nes_pos = TRUE)
+    message(paste0("Prepared plot for Top ", top_n, " DOWN ", gene_set_label, ", Positive NES (", nrow(data_down_pos), " results)."))
+    
+    # --- 4. Gene Sets DOWN, Negative NES enrichment ---
+    data_down_neg <- all_significant_results %>%
+      dplyr::filter(geneset_direction == 'DN', NES < 0) %>%
+      dplyr::arrange(NES) %>% # Arrange by NES ascending for most negative first
+      dplyr::slice(1:min(dplyr::n(), top_n))
+    
+    plot_list$down_neg <- create_gsea_plot_panel(data_down_neg, 
+                                                 paste0("Top ", top_n, " DOWN ", gene_set_label, ", Negative NES"), 
+                                                 nes_pos = FALSE)
+    message(paste0("Prepared plot for Top ", top_n, " DOWN ", gene_set_label, ", Negative NES (", nrow(data_down_neg), " results)."))
+    
+    # --- Combine and save the plots into a 2x2 grid ---
+    if (length(plot_list) > 0) {
+      combined_plot <- plot_grid(plot_list$up_pos, plot_list$up_neg, 
+                                 plot_list$down_pos, plot_list$down_neg, 
+                                 ncol = 2, nrow = 2, align = "hv", 
+                                 labels = c("A", "B", "C", "D"), label_size = 10)
       
-      plot_filename <- file.path(output_dir, paste0(gsub(" ", "_", analysis_title_prefix), "_top_", top_n, "_downregulated_enrichment.pdf"))
-      ggsave(plot_filename, plot_downregulated, width = 12, height = 8)
-      message("  Plot generated and saved to: ", plot_filename)
+      # Add an overall main title for the entire grid
+      final_title_text <- paste0("GSEA ", analysis_title_prefix, " (Top ", top_n, " Pathways)")
+      final_title <- ggdraw() + 
+        draw_label(final_title_text, 
+                   fontface = 'bold', size = 16, x = 0.02, hjust = 0) + # Adjust x and hjust for left alignment
+        theme(plot.margin = margin(0, 0, 0, 7, "pt"))
       
-      message(paste0("\nTop ", top_n, " Downregulated Results (pathway, ranked_list_name, NES, pval, padj, size):"))
-      print(top_downregulated_results %>% dplyr::select(pathway, ranked_list_name, NES, pval, padj, size))
+      # Combine the main title with the grid of plots
+      combined_plot_with_title <- plot_grid(final_title, combined_plot, ncol = 1, rel_heights = c(0.05, 1))
+      
+      plot_filename <- file.path(output_dir, paste0(gsub(" ", "_", analysis_title_prefix), "_top_", top_n, "_gsea_4_panel_enrichment.png"))
+      ggsave(plot_filename, combined_plot_with_title, width = 16, height = 12) # Increased width/height for 4 plots
+      message("  4-panel GSEA plot generated and saved to: ", plot_filename)
     } else {
-      message(paste("  No significant downregulated interactions (NES < 0, padj < 0.05) found for", analysis_title_prefix, "to plot."))
+      message("No plots generated due to lack of significant results in any category for ", analysis_title_prefix, ".")
     }
   }
 }
@@ -460,23 +553,34 @@ plot_clustered_heatmap <- function(fgsea_df, analysis_title_prefix, geneset_sour
     return(invisible(NULL))
   }
   
-  # Reshape data for heatmap: pathways as rows, ranked lists as columns, NES as values
+  # Reshape data for heatmap: pathways as rows, ranked lists as columns, ES as values # CHANGE NES to ES
   heatmap_data <- significant_results %>%
-    dplyr::select(pathway, ranked_list_name, NES) %>%
-    tidyr::pivot_wider(names_from = ranked_list_name, values_from = NES, values_fill = 0) # Fill non-significant/missing with 0
+    dplyr::select(pathway, ranked_list_name, ES) %>% # CHANGE NES to ES
+    tidyr::pivot_wider(names_from = ranked_list_name, values_from = ES, values_fill = 0) # Fill non-significant/missing with 0
+  
+  # Filter heatmap_data rows where ES > 0 for at least 5 columns (her code's "row_zero_counts >= 5" where ES > 0) # ADD THESE LINES
+  mat_for_filtering <- as.matrix(heatmap_data %>% dplyr::select(-pathway))
+  rownames(mat_for_filtering) <- heatmap_data$pathway
+  row_positive_es_counts <- rowSums(mat_for_filtering > 0, na.rm = TRUE)
+  heatmap_data <- heatmap_data[row_positive_es_counts >= 5, ]
+  
+  if (nrow(heatmap_data) == 0) {
+    message(paste("  No pathways left after filtering for at least 5 positive ES enrichments for heatmap in", analysis_title_prefix, "with", geneset_source_name, geneset_direction, "gene sets. Skipping heatmap."))
+    return(invisible(NULL))
+  }
   
   # Convert to matrix, setting row names
   mat <- as.matrix(heatmap_data %>% dplyr::select(-pathway))
   rownames(mat) <- heatmap_data$pathway
   
-  # Determine a symmetric color range based on max absolute NES
-  max_abs_nes <- max(abs(mat), na.rm = TRUE)
+  # Determine a symmetric color range based on max absolute ES # CHANGE NES to ES
+  max_abs_es <- max(abs(mat), na.rm = TRUE) # CHANGE NES to ES
   # Define the color function using circlize::colorRamp2 for a diverging palette
-  col_fun <- colorRamp2(c(-max_abs_nes, -max_abs_nes/2, 0, max_abs_nes/2, max_abs_nes), 
-                        c("darkblue", "lightblue", "white", "pink2", "darkred")) # Matches previous pheatmap color scheme
+  col_fun <- colorRamp2(c(-max_abs_es, -max_abs_es/2, 0, max_abs_es/2, max_abs_es), 
+                        c("darkblue", "lightblue", "white", "pink2", "darkred")) # Matches her code's color scheme
   
   # Construct the plot title and filename
-  hm_title <- paste0("Clustered Heatmap: ", analysis_title_prefix, "\n(", geneset_source_name, " ", geneset_direction, " Gene Sets vs. Ranked Lists)")
+  hm_title <- paste0("Clustered Heatmap: ", analysis_title_prefix, "\n(", geneset_source_name, " ", geneset_direction, " Gene Sets vs. Ranked Lists, ES)") # Added ES to title
   file_name_base <- paste0(gsub(" ", "_", analysis_title_prefix), "_", geneset_source_name, "_", geneset_direction, "_heatmap")
   heatmap_output_path <- file.path(output_dir, paste0(file_name_base, ".png"))
   heatmap_output_path_svg <- file.path(output_dir, paste0(file_name_base, ".svg"))
@@ -484,14 +588,16 @@ plot_clustered_heatmap <- function(fgsea_df, analysis_title_prefix, geneset_sour
   # Generate heatmap using ComplexHeatmap
   hm <- Heatmap(
     mat,
-    name = "NES", # Legend name
+    name = "ES", # Legend name # CHANGE NES to ES
     col = col_fun,
     na_col = "grey90", # Color for NA values
     cluster_rows = TRUE,
     cluster_columns = TRUE,
-    show_row_names = FALSE, # Remove row names
+    show_row_names = TRUE, # CHANGE FROM FALSE to TRUE
+    row_names_gp = gpar(fontsize = 6), # ADD THIS LINE
     column_names_gp = gpar(fontsize = 8),
-    column_names_rot = 90
+    column_names_rot = 90,
+    show_column_dend = FALSE # ADD THIS LINE to match her code (she uses F for this)
   )
   
   # Save as PNG
@@ -518,6 +624,8 @@ message(paste0("Loaded ", length(perturb_collection$OmicSigList), " perturbation
 gtex_collection <- readRDS(gtex_collection_file)
 message(paste0("Loaded ", length(gtex_collection$OmicSigList), " GTEX aging signatures."))
 
+gene_map <- readRDS(gene_map_file)
+message(paste0("Loaded gene map from: ", gene_map_file))
 
 # 2. Age-Centered Analysis
 message("\n--- Running Age-Centered Analysis ---")
@@ -591,3 +699,4 @@ if (!is.null(fgsea_res_perturb_centered)) {
 }
 
 message("\n--- GSEA Combined Analysis Complete ---")
+
