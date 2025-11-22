@@ -633,10 +633,10 @@ message("\n--- Running Age-Centered Analysis ---")
 message("Goal: Compare perturbation gene sets against aging ranked lists.")
 
 # Prepare ranked lists from GTEX aging data
-ranked_lists_age <- extract_ranked_lists(gtex_collection, "Aging")
+ranked_lists_age <- extract_ranked_lists(gtex_collection, "Aging", gene_map)
 
 # Prepare UP/DN gene sets from perturbation data
-perturb_gene_sets_up_dn <- extract_gene_sets_up_dn(perturb_collection, logFC_filter_val, adj_pval_filter_val, geneset_top_n, "Perturbation")
+perturb_gene_sets_up_dn <- extract_gene_sets_up_dn(perturb_collection, logFC_filter_val, adj_pval_filter_val, geneset_top_n, "Perturbation", gene_map)
 
 # Perform fgsea and combine results
 fgsea_res_age_centered <- perform_fgsea_and_combine(
@@ -669,10 +669,10 @@ message("\n--- Running Perturbation-Centered Analysis ---")
 message("Goal: Compare aging gene sets against perturbation ranked lists.")
 
 # Prepare ranked lists from perturbation data
-ranked_lists_perturb <- extract_ranked_lists(perturb_collection, "Perturbation")
+ranked_lists_perturb <- extract_ranked_lists(perturb_collection, "Perturbation", gene_map)
 
 # Prepare UP/DN gene sets from GTEX aging data
-age_gene_sets_up_dn <- extract_gene_sets_up_dn(gtex_collection, logFC_filter_val, adj_pval_filter_val, geneset_top_n, "Aging")
+age_gene_sets_up_dn <- extract_gene_sets_up_dn(gtex_collection, logFC_filter_val, adj_pval_filter_val, geneset_top_n, "Aging", gene_map)
 
 # Perform fgsea and combine results
 fgsea_res_perturb_centered <- perform_fgsea_and_combine(
