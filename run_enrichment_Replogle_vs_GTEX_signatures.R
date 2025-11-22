@@ -13,6 +13,7 @@ work_dir <- "/restricted/projectnb/agedisease/projects/challenge2025/"
 perturbation_collection_file <- paste0(work_dir, "results/perturbational_omic_sigs/replogle_2022/Replogle_Perturb_Combined_OmicSignatureCollection.rds")
 gtex_collection_file <- paste0(work_dir, "data/GTEX/GTEX_aging_omic_col_stat_v114.rds")
 output_dir <- paste0(work_dir, "results/fgsea_combined_analysis/Replogle_GTEX")
+gene_map_file <- paste0(work_dir, "data/Homo_sapiens_GRCh38_114_genemap.rds")
 
 # Ensure output directory exists
 if (!dir.exists(output_dir)) {
