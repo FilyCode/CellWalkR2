@@ -479,6 +479,7 @@ plot_clustered_heatmap <- function(fgsea_df, analysis_title_prefix, geneset_sour
   hm_title <- paste0("Clustered Heatmap: ", analysis_title_prefix, "\n(", geneset_source_name, " ", geneset_direction, " Gene Sets vs. Ranked Lists)")
   file_name_base <- paste0(gsub(" ", "_", analysis_title_prefix), "_", geneset_source_name, "_", geneset_direction, "_heatmap")
   heatmap_output_path <- file.path(output_dir, paste0(file_name_base, ".png"))
+  heatmap_output_path_svg <- file.path(output_dir, paste0(file_name_base, ".svg"))
   
   # Generate heatmap using ComplexHeatmap
   hm <- Heatmap(
@@ -493,13 +494,17 @@ plot_clustered_heatmap <- function(fgsea_df, analysis_title_prefix, geneset_sour
     column_names_rot = 90
   )
   
-  # Save heatmap to PNG using png() and draw()
-  message("  Saving heatmap to: ", heatmap_output_path)
+  # Save as PNG
   png(heatmap_output_path, width = 2200, height = 1800, res = 300)
   draw(hm, column_title = hm_title)
   dev.off()
   
-  message("  Clustered heatmap generated and saved to: ", heatmap_filename)
+  # Save as SVG (vector file)
+  svg(heatmap_output_path_svg, width = 7.33, height = 6) # width and height in inches
+  draw(hm, column_title = hm_title)
+  dev.off()
+  
+  message("  Clustered heatmap generated and saved to: ", heatmap_output_path)
 }
 
 
