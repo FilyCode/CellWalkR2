@@ -196,7 +196,7 @@ extract_gene_sets_up_dn <- function(omic_collection, logFC_thresh, pval_thresh, 
     }
     
     # If no suitable dataframe was found after checking both, skip this signature
-    if (is.is.null(df_to_process)) {
+    if (is.null(df_to_process)) {
       warning(paste("Skipping", collection_name, sig_name, 
                     ": Neither 'difexp' nor 'signature' contains the minimum required columns (probe_id, score, and any of", paste(possible_pval_cols, collapse="/"), ")."))
       next
