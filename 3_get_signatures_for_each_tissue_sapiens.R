@@ -225,7 +225,7 @@ all_tissue_results <- foreach(file_path = tissue_files,
                                     num_distinct_ages <- length(unique(tissue_seurat@meta.data$age))
                                     num_distinct_assays <- length(unique(tissue_seurat@meta.data$assay))
                                     
-                                    if (num_subjects < 2 || num_distinct_ages < 2) {
+                                    if (num_subjects < 2 || num_distinct_ages < 3) {
                                       stop(paste0("Insufficient variation for regression (Subjects: ", num_subjects, ", Sex groups: ", num_sex_groups, ", Distinct ages: ", num_distinct_ages, ")."))
                                     }
                                     
