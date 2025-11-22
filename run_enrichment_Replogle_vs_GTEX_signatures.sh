@@ -22,10 +22,10 @@
 #$ -M phitro@bu.edu
 
 # Request cores.
-#$ -pe omp 1
+#$ -pe omp 12
 
 # Request total memory for the job.
-#$ -l mem_total=8G
+#$ -l mem_total=120G
 
 # --------------------------------------------------------------------------------
 # Setup R Environment
