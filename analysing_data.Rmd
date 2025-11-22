@@ -19,10 +19,62 @@ results_dir <- "/restricted/projectnb/agedisease/projects/challenge2025/results/
 
 TabSapiens_AgingSignature_Collection_MAST_sim <- readRDS(paste0(results_dir,"/MAST/simple_regression/Tabula_Sapiens_Aging_OmicSignatureCollection.rds"))
 TabSapiens_AgingSignature_Collection_MAST_adv <- readRDS(paste0(results_dir,"/MAST/advanced_regression/Tabula_Sapiens_Aging_OmicSignatureCollection.rds"))
-TabSapiens_AgingSignature_Collection_DESeq2 <- readRDS(paste0(results_dir,"/DESeq2/General_collection/TabulaSapiens_aging_omic_col.rds"))
+TabSapiens_AgingSignature_Collection_DESeq2 <- readRDS(paste0(results_dir,"/DESeq2/TabulaSapiens_aging_omic_col.rds"))
+TabSapiens_AgingSignature_Collection_MAST_cons <- readRDS(paste0(results_dir,"/MAST/consenus_regression/Tabula_Sapiens_Aging_OmicSignatureCollection.rds"))
+TabSapiens_AgingSignature_Collection_MAST_cons_slow <- readRDS(paste0(results_dir,"/MAST/consenus_regression_slow_incomplete/Tabula_Sapiens_Aging_OmicSignatureCollection.rds"))
 
 ```
 
+```{r Create OmicSignature Collection from indivual Objects}
+omic_signature_output_path <- file.path("/restricted/projectnb/agedisease/projects/challenge2025/results/Tabula_sapiens/MAST/consenus_regression_slow_incomplete")
+
+message(paste0("Looking for individual OmicSignature .rds files in: ", omic_signature_output_path))
+
+# Find all individual OmicSignature .rds files in that directory.
+individual_sig_files <- list.files(omic_signature_output_path, 
+                                   pattern = "aging_signature_.*_oSig\\.rds$", 
+                                   full.names = TRUE)
+
+# Load each of these .rds files and put them into a list.
+all_tissue_omicsigs_for_collection <- list()
+for (file_path in individual_sig_files) {
+  # Get the tissue name from the file name.
+  tissue_name <- gsub("aging_signature_|_oSig\\.rds$", "", basename(file_path))
+  omic_sig_object <- readRDS(file_path)
+  
+  # Make sure what we loaded is actually an OmicSignature object
+  if (inherits(omic_sig_object, "OmicSignature")) {
+    all_tissue_omicsigs_for_collection[[tissue_name]] <- omic_sig_object
+  } else {
+    warning(paste0("The file '", basename(file_path), "' doesn't seem to be an OmicSignature object. It will be skipped."))
+  }
+}
+
+# Define some information (metadata) for the whole collection.
+omicsig_collection_metadata <- list(
+  collection_name = "Tabula Sapiens Human Aging Signatures - All Tissues", 
+  description = paste0("A collection of aging signatures from Tabula Sapiens human single-cell RNA-seq data, grouped by tissue. ",
+                       "These were made using MAST analysis and then put together into this collection."),
+  organism = "Homo sapiens",
+  direction_type = "bi-directional",
+  phenotype = "Aging",
+  assay_type = "transcriptomics",
+  platform = "transcriptomics by single-cell RNA-seq",
+  author = "BU_Bioinformatics_ChallengeProject2025",
+  year = as.numeric(format(Sys.Date(), "%Y")),
+  keywords = c("Aging", "Tabula Sapiens", "single-cell", "MAST", "human", "sapiens")
+)
+
+# Create the OmicSignatureCollection object using the metadata and list of loaded signatures.
+aging_signature_collection <- OmicSignatureCollection$new(
+  metadata = omicsig_collection_metadata,
+  OmicSigList = all_tissue_omicsigs_for_collection 
+)
+
+output_collection_file <- file.path(omic_signature_output_path, "Tabula_Sapiens_Aging_OmicSignatureCollection.rds")
+saveRDS(aging_signature_collection, file = output_collection_file)
+
+```
 
 
 ```{r Get significant nr of genes for all tissues in all datasets and plot data}
@@ -37,9 +89,16 @@ get_sig_gene_counts <- function(omic_sig_obj) {
   # Count numbers of significatn genes from full dataframe
   adj_p_cutoff <- 0.05
   score_cutoff <- 0.25
+  z_score_cutoff <- 2
   difexp <- omic_sig_obj$difexp
   print(colnames(difexp))
-  difexp_filtered <- difexp %>% dplyr::filter(adj_p <= adj_p_cutoff & abs(score) >= score_cutoff)
+  if ('z_score_stat' %in% colnames(difexp)) {
+    difexp_filtered <- difexp %>% dplyr::filter(adj_p <= adj_p_cutoff & abs(z_score_stat) >= z_score_cutoff)
+  } else {
+    difexp_filtered <- difexp %>% dplyr::filter(adj_p <= adj_p_cutoff & abs(score) >= score_cutoff)
+  }
+  # difexp_filtered <- difexp %>% dplyr::filter(adj_p <= adj_p_cutoff & abs(score) >= score_cutoff)
+
   num_sig_genes <- nrow(difexp_filtered)
   
   return(data.frame(
@@ -67,13 +126,17 @@ process_omic_collection <- function(collection_obj, method_name) {
   return(aggregated_df)
 }
 
-# --- Process each of your loaded collections ---
+# --- Process each of the loaded collections ---
 mast_sim_data <- process_omic_collection(TabSapiens_AgingSignature_Collection_MAST_sim, "MAST_Simple")
 mast_adv_data <- process_omic_collection(TabSapiens_AgingSignature_Collection_MAST_adv, "MAST_Advanced")
 deseq2_data <- process_omic_collection(TabSapiens_AgingSignature_Collection_DESeq2, "DESeq2")
+mast_cons_data <- process_omic_collection(TabSapiens_AgingSignature_Collection_MAST_cons, "MAST_Consensus")
+mast_cons_slow_data <- process_omic_collection(TabSapiens_AgingSignature_Collection_MAST_cons_slow, "MAST_Consensus_slow")
+
 
 # --- Combine all data frames into one ---
-all_methods_data <- rbind(mast_sim_data, mast_adv_data, deseq2_data)
+all_methods_data <- rbind(mast_sim_data, mast_adv_data, deseq2_data, mast_cons_data, mast_cons_slow_data)
+
 
 # --- Reshape the data for plotting: wide format with each method as a column ---
 plot_ready_data <- all_methods_data %>%
@@ -82,10 +145,6 @@ plot_ready_data <- all_methods_data %>%
     values_from = num_sig_genes,
     id_cols = tissue # Make sure to keep tissue as the identifier
   )
-
-# Replace NA values (if a tissue had no results for a specific method) with 0
-# This ensures all columns are numeric for plotting.
-plot_ready_data[is.na(plot_ready_data)] <- 0
 
 print("Data for plotting prepared (head):")
 head(plot_ready_data)
@@ -96,6 +155,8 @@ head(plot_ready_data)
 plot_ready_data$MAST_Simple <- as.numeric(plot_ready_data$MAST_Simple)
 plot_ready_data$MAST_Advanced <- as.numeric(plot_ready_data$MAST_Advanced)
 plot_ready_data$DESeq2 <- as.numeric(plot_ready_data$DESeq2)
+plot_ready_data$MAST_consensus <- as.numeric(plot_ready_data$MAST_Consensus)
+plot_ready_data$MAST_consensus_slow <- as.numeric(plot_ready_data$MAST_Consensus_slow)
 
 
 # --- Scatter Plot 1: MAST Simple vs. MAST Advanced ---
@@ -122,7 +183,7 @@ plot2 <- ggplot(plot_ready_data, aes(x = MAST_Simple, y = DESeq2)) +
   geom_point(alpha = 0.7, size = 3, color = "darkred") + # Add points
   geom_smooth(method = "lm", se = FALSE, color = "purple", linetype = "dashed") + # Add a linear regression line
   # Label points with tissue names, adjusting position for better visibility
-  geom_text(aes(label = tissue), vjust = -1.2, hjust = 0.5, size = 2.5, check_overlap = TRUE, color = "grey30") + 
+  geom_text(aes(label = tissue), vjust = -1.2, hjust = 0.5, size = 2.5, check_overlap = TRUE, color = "grey30") +
   labs(
     title = "Significant Genes: MAST Simple vs. DESeq2",
     x = "Number of Significant Genes (MAST Simple)",
@@ -132,8 +193,48 @@ plot2 <- ggplot(plot_ready_data, aes(x = MAST_Simple, y = DESeq2)) +
   theme_minimal() +
   theme(plot.title = element_text(hjust = 0.5), plot.subtitle = element_text(hjust = 0.5)) + # Center titles
   # Optional: Make sure axes start at 0 if appropriate for gene counts
-  expand_limits(x = 0, y = 0) 
+  expand_limits(x = 0, y = 0)
 
 print(plot2)
+
+
+# --- Scatter Plot 3: MAST Simple vs. MAST Consensus ---
+plot3 <- ggplot(plot_ready_data, aes(x = MAST_Simple, y = MAST_Consensus)) +
+  geom_point(alpha = 0.7, size = 3, color = "darkred") + # Add points
+  geom_smooth(method = "lm", se = FALSE, color = "purple", linetype = "dashed") + # Add a linear regression line
+  # Label points with tissue names, adjusting position for better visibility
+  geom_text(aes(label = tissue), vjust = -1.2, hjust = 0.5, size = 2.5, check_overlap = TRUE, color = "grey30") + 
+  labs(
+    title = "Significant Genes: MAST Simple vs. MAST Consensus",
+    x = "Number of Significant Genes (MAST Simple)",
+    y = "Number of Significant Genes (MAST Consensus)",
+    subtitle = "Each point represents a tissue"
+  ) +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5), plot.subtitle = element_text(hjust = 0.5)) + # Center titles
+  # Optional: Make sure axes start at 0 if appropriate for gene counts
+  expand_limits(x = 0, y = 0) 
+
+print(plot3)
+
+
+# --- Scatter Plot 3: MAST Simple vs. MAST Consensus ---
+plot4 <- ggplot(plot_ready_data, aes(x = MAST_Consensus, y = MAST_Consensus_slow)) +
+  geom_point(alpha = 0.7, size = 3, color = "darkred") + # Add points
+  geom_smooth(method = "lm", se = FALSE, color = "purple", linetype = "dashed") + # Add a linear regression line
+  # Label points with tissue names, adjusting position for better visibility
+  geom_text(aes(label = tissue), vjust = -1.2, hjust = 0.5, size = 2.5, check_overlap = TRUE, color = "grey30") + 
+  labs(
+    title = "Significant Genes: MAST Consensus vs. MAST Consensus slow",
+    x = "Number of Significant Genes (MAST Consensus)",
+    y = "Number of Significant Genes (MAST Consensus slow)",
+    subtitle = "Each point represents a tissue"
+  ) +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5), plot.subtitle = element_text(hjust = 0.5)) + # Center titles
+  # Optional: Make sure axes start at 0 if appropriate for gene counts
+  expand_limits(x = 0, y = 0) 
+
+print(plot4)
 ```
 
