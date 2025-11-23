@@ -35,6 +35,9 @@ fgsea_max_size <- Inf
 num_cores_per_fgsea_task <- 7  # Each individual fgsea call will use 6 CPUs
 num_concurrent_fgsea_tasks <- 4 # Number of fgsea calls to run at the same time
 
+# Define a BPPARAM object for fgsea's internal parallelization with progressbar = FALSE
+fgsea_internal_bpparam <- BiocParallel::MulticoreParam(workers = num_cores_per_fgsea_task, progressbar = FALSE)
+
 
 message("--- Starting GSEA Combined Analysis ---")
 message(paste0("Output directory: ", output_dir))
@@ -335,9 +338,9 @@ perform_fgsea_and_combine <- function(ranked_lists, gene_sets_up, gene_sets_dn,
   message(paste0("Initiating fgsea analysis for '", ranked_source_name, "' ranked lists vs. '", geneset_source_name, "' gene sets."))
   
   # Set up BiocParallel backend for concurrent execution of the loops over ranked_lists.
-  # Each worker will handle one fgsea task (i.e., one iteration for a ranked list).
-  param <- MulticoreParam(workers = num_concurrent_fgsea_tasks)
-  register(param, default = TRUE) # Register the parameter object globally for BiocParallel functions
+  # Set progressbar = FALSE here for the outer bplapply loop
+  outer_bpparam <- BiocParallel::MulticoreParam(workers = num_concurrent_fgsea_tasks, progressbar = FALSE)
+  register(outer_bpparam, default = TRUE) # Register the parameter object globally for BiocParallel functions
   
   all_fgsea_results_list <- list() # Store results in a list to combine later
   
@@ -347,17 +350,17 @@ perform_fgsea_and_combine <- function(ranked_lists, gene_sets_up, gene_sets_dn,
     
     # Use bplapply to parallelize iterations over ranked_lists
     up_results <- bplapply(names(ranked_lists), function(rl_name) {
-      # The individual fgsea call will use its own nproc
+      # Pass fgsea_internal_bpparam directly to fgsea instead of nproc
       fg_up <- fgsea(pathways = gene_sets_up,
                      stats    = ranked_lists[[rl_name]],
                      minSize  = fgsea_min_size,
                      maxSize  = fgsea_max_size,
-                     nproc    = num_cores_per_fgsea_task) # Each fgsea task uses num_cores_per_fgsea_task
+                     BPPARAM  = fgsea_internal_bpparam) # Use the global fgsea_internal_bpparam
       fg_up$ranked_list_name <- rl_name
       fg_up$geneset_source_name <- geneset_source_name
       fg_up$geneset_direction <- "UP"
       return(fg_up)
-    }, BPPARAM = param) # Pass the BPPARAM to bplapply for concurrent execution
+    }, BPPARAM = outer_bpparam) # Pass the outer_bpparam to bplapply for concurrent execution
     
     # Filter out NULL results (if any failed) and combine
     up_results_df <- do.call(rbind, up_results[!sapply(up_results, is.null)])
@@ -376,17 +379,17 @@ perform_fgsea_and_combine <- function(ranked_lists, gene_sets_up, gene_sets_dn,
     
     # Use bplapply to parallelize iterations over ranked_lists
     dn_results <- bplapply(names(ranked_lists), function(rl_name) {
-      # The individual fgsea call will use its own nproc
+      # Pass fgsea_internal_bpparam directly to fgsea instead of nproc
       fg_dn <- fgsea(pathways = gene_sets_dn,
                      stats    = ranked_lists[[rl_name]],
                      minSize  = fgsea_min_size,
                      maxSize  = fgsea_max_size,
-                     nproc    = num_cores_per_fgsea_task) # Each fgsea task uses num_cores_per_fgsea_task
+                     BPPARAM  = fgsea_internal_bpparam) # Use the global fgsea_internal_bpparam
       fg_dn$ranked_list_name <- rl_name
       fg_dn$geneset_source_name <- geneset_source_name
       fg_dn$geneset_direction <- "DN"
       return(fg_dn)
-    }, BPPARAM = param) # Pass the BPPARAM to bplapply for concurrent execution
+    }, BPPARAM = outer_bpparam) # Pass the outer_bpparam to bplapply for concurrent execution
     
     # Filter out NULL results (if any failed) and combine
     dn_results_df <- do.call(rbind, dn_results[!sapply(dn_results, is.null)])
