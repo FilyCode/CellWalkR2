@@ -32,7 +32,7 @@ fgsea_min_size <- 15
 fgsea_max_size <- Inf
 
 # Parallelization strategy
-num_cores_per_fgsea_task <- 6  # Each individual fgsea call will use 6 CPUs
+num_cores_per_fgsea_task <- 7  # Each individual fgsea call will use 6 CPUs
 num_concurrent_fgsea_tasks <- 4 # Number of fgsea calls to run at the same time
 
 
