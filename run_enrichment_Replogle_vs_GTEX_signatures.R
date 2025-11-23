@@ -6,6 +6,7 @@ library(pheatmap)
 library(ComplexHeatmap)
 library(circlize)
 library(cowplot)
+library(BiocParallel)
 
 # --- Configuration ---
 # File paths
@@ -30,10 +31,18 @@ top_n_genesets_to_plot <- 20
 fgsea_min_size <- 15 
 fgsea_max_size <- Inf
 
+# Parallelization strategy
+num_cores_per_fgsea_task <- 6  # Each individual fgsea call will use 6 CPUs
+num_concurrent_fgsea_tasks <- 4 # Number of fgsea calls to run at the same time
+
+
 message("--- Starting GSEA Combined Analysis ---")
 message(paste0("Output directory: ", output_dir))
 message(paste0("Gene set filtering: |logFC| > ", logFC_filter_val, ", adj.pval < ", adj_pval_filter_val))
-message(paste0("fgsea parameters: minSize = ", fgsea_min_size, ", maxSize = ", fgsea_max_size)) # UPDATE MESSAGE
+message(paste0("fgsea parameters: minSize = ", fgsea_min_size, ", maxSize = ", fgsea_max_size, 
+               ", nproc (per task) = ", num_cores_per_fgsea_task, 
+               ", concurrent tasks = ", num_concurrent_fgsea_tasks, 
+               " (total ", num_cores_per_fgsea_task * num_concurrent_fgsea_tasks, " CPUs potentially used for fgsea)"))
 message(paste0("Top N results for plotting: ", top_n_genesets_to_plot))
 
 # --- Helper Functions ---
@@ -309,6 +318,124 @@ extract_gene_sets_up_dn <- function(omic_collection, logFC_thresh, pval_thresh, 
 }
 
 
+**Prioritizing Parallelization**
+  
+  I'm now focusing on parallelizing the `fgsea` function for more efficient CPU utilization, but without touching the `nperm` setting. That is, I am making sure `fgsea` will continue to use the default value. I'm aiming for optimized parallelism while preserving default function behavior.
+
+
+**Adjusting CPU Allocation**
+  
+  I'm now revising my strategy for parallelizing `fgsea`. Instead of immediately targeting the inner loop, I'm thinking of distributing the 24 available CPUs more intelligently. I'll aim to execute 4 instances of `fgsea` concurrently, each utilizing 6 cores, across the multiple ranked list iterations. Maintaining the default `nperm` value remains crucial.
+
+
+**Refining Parallel Strategy**
+
+I'm now focusing on a more sophisticated parallelization approach. I will now parallelize across the ranked list iterations, specifically dividing the ranked lists into chunks of four. Each chunk will then get passed to `fgsea`, setting `nproc=6` inside each `fgsea` call. This strategy should respect the default `nperm` value and efficiently use all 24 available CPUs, achieving the desired concurrency.
+
+
+**Parallelizing Ranked List Processing**
+  
+  I've decided to parallelize the processing of ranked lists directly. The goal is to run 4 instances of `fgsea` concurrently, each using 6 cores, across the iterations over `ranked_lists`. The strategy is to divide the `ranked_lists` into four chunks and then apply `fgsea` to each chunk in parallel. I'll continue to respect the default `nperm` value for `fgsea` within each task.
+
+
+**Parallelizing with BiocParallel**
+  
+  I'm now focusing on implementing the parallelization using `BiocParallel`.  I've set up the necessary configurations for CPU allocation per task and the number of concurrent tasks, aiming for optimal resource utilization.  I'm modifying the `perform_fgsea_and_combine` function to leverage `bplapply` and ensure the proper `BPPARAM` configuration is applied within the main loops that execute `fgsea` calls. This should achieve the desired concurrency, respecting the specified CPU constraints.
+
+
+**Finalizing Parallel Implementation**
+
+I'm now integrating the `BiocParallel` implementation into `perform_fgsea_and_combine`. This will include defining `BPPARAM`, updating the loops to utilize `bplapply`, and adjusting how the results are combined. Specifically, I'm working to make sure `fgsea` respects the specified CPU usage constraints, and that the combined results maintain the correct metadata. I am confident this solution adheres to the project specifications.
+
+
+**Integrating BiocParallel Implementation**
+
+I've successfully integrated `BiocParallel` into the `perform_fgsea_and_combine` function, enabling parallel execution. I've configured the backend,  `MulticoreParam`,  with 4 workers to match the concurrency requirement. The `fgsea` calls now incorporate `nproc=6`, effectively managing the CPU allocation. The main loops now utilize `bplapply`, processing the ranked lists in parallel and ensuring that the default `nperm` setting is maintained.  I am confident in this revised approach.
+
+
+**Parallelizing fgsea with BiocParallel**
+
+I'm now implementing the BiocParallel strategy in `perform_fgsea_and_combine`, defining the appropriate `BPPARAM` for 4 workers and setting `nproc=6` within each `fgsea` call. This ensures the desired concurrency and CPU usage. I'm focusing on ensuring the correct parallel processing and result aggregation.
+
+
+**Optimizing BiocParallel Integration**
+
+I'm now integrating the `BiocParallel` implementation into `perform_fgsea_and_combine` to achieve the parallelization goal. I've configured the `MulticoreParam` with 4 workers and set `nproc=6` within each `fgsea` call. I am ensuring that the loops correctly use `bplapply` and that the results are combined as expected. I'm working to make sure `fgsea` respects the specified CPU usage constraints, and that the combined results maintain the correct metadata. I am confident this solution adheres to the project specifications.
+
+
+**Finalizing BiocParallel Implementation**
+  
+  I'm now integrating `BiocParallel` into the `perform_fgsea_and_combine` function to achieve the requested concurrency and CPU control. The function has been updated to accept `num_cores_per_fgsea_task` and `num_concurrent_fgsea_tasks` as arguments and the main loops now leverage `bplapply` and `MulticoreParam`. I've ensured the `fgsea` calls use the specified `nproc` value.
+
+
+**Optimizing BiocParallel Integration**
+  
+  I've made the necessary modifications to `perform_fgsea_and_combine`, incorporating BiocParallel for parallel execution. I'm now testing the integration. I'm confident that the concurrency and CPU usage are controlled as requested.
+
+
+
+**Optimizing BiocParallel Integration**
+
+I'm now integrating `BiocParallel` into `perform_fgsea_and_combine` to achieve parallel execution. I'm focusing on configuring `MulticoreParam` with 4 workers and setting `nproc=6` within each `fgsea` call. The loops will correctly use `bplapply`, and the results are combined as expected. I'm working to respect CPU usage and ensure data integrity.
+
+Okay, this is a great strategy for optimizing performance on the cluster while explicitly managing CPU resources! You want to utilize the 24 CPUs by running 4 fgsea tasks concurrently, with each fgsea task using 6 CPUs for its internal parallelization. You also want to revert the nperm setting and let fgsea use its default.
+
+Here are the specific lines that need to be adjusted:
+  
+  R
+
+library(tidyverse)
+library(fgsea)
+library(OmicSignature)
+library(ggplot2)
+library(pheatmap)
+library(ComplexHeatmap)
+library(circlize)
+library(cowplot)
+library(BiocParallel) # ADD THIS LINE to load the BiocParallel package
+
+# --- Configuration ---
+# File paths
+work_dir <- "/restricted/projectnb/agedisease/projects/challenge2025/"
+perturbation_collection_file <- paste0(work_dir, "results/perturbational_omic_sigs/replogle_2022/Replogle_Perturb_Combined_OmicSignatureCollection.rds")
+gtex_collection_file <- paste0(work_dir, "data/GTEX/GTEX_aging_omic_col_stat_v114.rds")
+output_dir <- paste0(work_dir, "results/fgsea_combined_analysis/Replogle_GTEX")
+gene_map_file <- paste0(work_dir, "data/Homo_sapiens_GRCh38_114_genemap.rds")
+
+# Ensure output directory exists
+if (!dir.exists(output_dir)) {
+  dir.create(output_dir, recursive = TRUE)
+}
+
+# Filtering parameters for gene sets
+logFC_filter_val <- 0.25
+adj_pval_filter_val <- 0.05
+geneset_top_n <- 500
+top_n_genesets_to_plot <- 20
+
+# fgsea parameters
+fgsea_min_size <- 15 
+fgsea_max_size <- Inf
+# Removed fgsea_nperm as per your request to use default.
+
+# ADD THESE LINES for parallelization strategy
+num_cores_per_fgsea_task <- 6  # Each individual fgsea call will use 6 CPUs
+num_concurrent_fgsea_tasks <- 4 # Number of fgsea calls to run at the same time
+
+message("--- Starting GSEA Combined Analysis ---")
+message(paste0("Output directory: ", output_dir))
+message(paste0("Gene set filtering: |logFC| > ", logFC_filter_val, ", adj.pval < ", adj_pval_filter_val))
+# UPDATE THIS MESSAGE to reflect new parallelization parameters
+message(paste0("fgsea parameters: minSize = ", fgsea_min_size, ", maxSize = ", fgsea_max_size, 
+               ", nproc (per task) = ", num_cores_per_fgsea_task, 
+               ", concurrent tasks = ", num_concurrent_fgsea_tasks, 
+               " (total ", num_cores_per_fgsea_task * num_concurrent_fgsea_tasks, " CPUs potentially used for fgsea)"))
+message(paste0("Top N results for plotting: ", top_n_genesets_to_plot))
+
+# --- Helper Functions ---
+# ... (simplify_entry, extract_ranked_lists, extract_gene_sets_up_dn functions remain unchanged) ...
+
+
 #' Performs fgsea analysis for a set of ranked lists against up/down gene sets and combines the results.
 #'
 #' @param ranked_lists A named list of ranked gene score vectors.
@@ -316,25 +443,46 @@ extract_gene_sets_up_dn <- function(omic_collection, logFC_thresh, pval_thresh, 
 #' @param gene_sets_dn A named list of downregulated gene sets.
 #' @param ranked_source_name A string, e.g., "Aging" or "Perturbation".
 #' @param geneset_source_name A string, e.g., "Aging" or "Perturbation".
+#' @param num_cores_per_fgsea_task Numeric, number of CPU cores for *each* fgsea call. # NEW PARAM
+#' @param num_concurrent_fgsea_tasks Numeric, number of fgsea calls to run concurrently. # NEW PARAM
 #' @return A combined data frame of fgsea results.
-perform_fgsea_and_combine <- function(ranked_lists, gene_sets_up, gene_sets_dn, ranked_source_name, geneset_source_name) {
-  all_fgsea_results <- list()
+perform_fgsea_and_combine <- function(ranked_lists, gene_sets_up, gene_sets_dn, 
+                                      ranked_source_name, geneset_source_name,
+                                      num_cores_per_fgsea_task, num_concurrent_fgsea_tasks) { # MODIFY FUNCTION SIGNATURE
   
   message(paste0("Initiating fgsea analysis for '", ranked_source_name, "' ranked lists vs. '", geneset_source_name, "' gene sets."))
   
+  # Set up BiocParallel backend for concurrent execution of the loops over ranked_lists.
+  # Each worker will handle one fgsea task (i.e., one iteration for a ranked list).
+  param <- MulticoreParam(workers = num_concurrent_fgsea_tasks)
+  register(param, default = TRUE) # Register the parameter object globally for BiocParallel functions
+  
+  all_fgsea_results_list <- list() # Store results in a list to combine later
+  
   # Run for UP gene sets
   if (length(gene_sets_up) > 0) {
-    message(paste0("  Processing with UP gene sets from '", geneset_source_name, "'..."))
-    for (rl_name in names(ranked_lists)) {
-      message(paste0("    Analyzing ranked list: ", rl_name, "..."))
+    message(paste0("  Processing with UP gene sets from '", geneset_source_name, "' (", length(gene_sets_up), " pathways) concurrently across ", length(ranked_lists), " ranked lists..."))
+    
+    # Use bplapply to parallelize iterations over ranked_lists
+    up_results <- bplapply(names(ranked_lists), function(rl_name) {
+      # The individual fgsea call will use its own nproc
       fg_up <- fgsea(pathways = gene_sets_up,
                      stats    = ranked_lists[[rl_name]],
                      minSize  = fgsea_min_size,
-                     maxSize  = fgsea_max_size)
+                     maxSize  = fgsea_max_size,
+                     nproc    = num_cores_per_fgsea_task) # Each fgsea task uses num_cores_per_fgsea_task
       fg_up$ranked_list_name <- rl_name
       fg_up$geneset_source_name <- geneset_source_name
       fg_up$geneset_direction <- "UP"
-      all_fgsea_results[[paste0(rl_name, "_UP_gene_sets")]] <- fg_up
+      return(fg_up)
+    }, BPPARAM = param) # Pass the BPPARAM to bplapply for concurrent execution
+    
+    # Filter out NULL results (if any failed) and combine
+    up_results_df <- do.call(rbind, up_results[!sapply(up_results, is.null)])
+    if (!is.null(up_results_df) && nrow(up_results_df) > 0) {
+      all_fgsea_results_list[["up"]] <- up_results_df
+    } else {
+      message(paste("No UP fgsea results generated for ", ranked_source_name, " vs ", geneset_source_name, "."))
     }
   } else {
     message(paste("No UP gene sets available from '", geneset_source_name, "' for fgsea."))
@@ -342,23 +490,34 @@ perform_fgsea_and_combine <- function(ranked_lists, gene_sets_up, gene_sets_dn, 
   
   # Run for DN gene sets
   if (length(gene_sets_dn) > 0) {
-    message(paste0("  Processing with DN gene sets from '", geneset_source_name, "'..."))
-    for (rl_name in names(ranked_lists)) {
-      message(paste0("    Analyzing ranked list: ", rl_name, "..."))
+    message(paste0("  Processing with DN gene sets from '", geneset_source_name, "' (", length(gene_sets_dn), " pathways) concurrently across ", length(ranked_lists), " ranked lists..."))
+    
+    # Use bplapply to parallelize iterations over ranked_lists
+    dn_results <- bplapply(names(ranked_lists), function(rl_name) {
+      # The individual fgsea call will use its own nproc
       fg_dn <- fgsea(pathways = gene_sets_dn,
                      stats    = ranked_lists[[rl_name]],
                      minSize  = fgsea_min_size,
-                     maxSize  = fgsea_max_size)
+                     maxSize  = fgsea_max_size,
+                     nproc    = num_cores_per_fgsea_task) # Each fgsea task uses num_cores_per_fgsea_task
       fg_dn$ranked_list_name <- rl_name
       fg_dn$geneset_source_name <- geneset_source_name
       fg_dn$geneset_direction <- "DN"
-      all_fgsea_results[[paste0(rl_name, "_DN_gene_sets")]] <- fg_dn
+      return(fg_dn)
+    }, BPPARAM = param) # Pass the BPPARAM to bplapply for concurrent execution
+    
+    # Filter out NULL results (if any failed) and combine
+    dn_results_df <- do.call(rbind, dn_results[!sapply(dn_results, is.null)])
+    if (!is.null(dn_results_df) && nrow(dn_results_df) > 0) {
+      all_fgsea_results_list[["dn"]] <- dn_results_df
+    } else {
+      message(paste("No DN fgsea results generated for ", ranked_source_name, " vs ", geneset_source_name, "."))
     }
   } else {
     message(paste("No DN gene sets available from '", geneset_source_name, "' for fgsea."))
   }
   
-  combined_results_df <- do.call(rbind, all_fgsea_results)
+  combined_results_df <- do.call(rbind, all_fgsea_results_list) # Combine UP and DN results here
   if (is.null(combined_results_df) || nrow(combined_results_df) == 0) {
     warning(paste("No fgsea results generated for ", ranked_source_name, " vs ", geneset_source_name, " analysis type."))
     return(NULL)
@@ -649,11 +808,14 @@ fgsea_res_age_centered <- perform_fgsea_and_combine(
   gene_sets_up = perturb_gene_sets_up_dn$up_gene_sets,
   gene_sets_dn = perturb_gene_sets_up_dn$dn_gene_sets,
   ranked_source_name = "Aging",
-  geneset_source_name = "Perturbation"
+  geneset_source_name = "Perturbation",
+  num_cores_per_fgsea_task = num_cores_per_fgsea_task,
+  num_concurrent_fgsea_tasks = num_concurrent_fgsea_tasks
 )
 
 # Visualize results
 plot_fgsea_results(fgsea_res_age_centered, "Age-Centered Analysis", output_dir, top_n_genesets_to_plot)
+plot_fgsea_results(fgsea_res_age_centered, "Age-Centered Analysis", output_dir, 100) # Plot with bigger number of top genes
 
 fgsea_res_age_centered_up_gs <- fgsea_res_age_centered %>% filter(geneset_direction == "UP")
 plot_clustered_heatmap(fgsea_res_age_centered_up_gs, "Age-Centered Analysis", "Perturbation", "UP", output_dir)
@@ -685,11 +847,14 @@ fgsea_res_perturb_centered <- perform_fgsea_and_combine(
   gene_sets_up = age_gene_sets_up_dn$up_gene_sets,
   gene_sets_dn = age_gene_sets_up_dn$dn_gene_sets,
   ranked_source_name = "Perturbation",
-  geneset_source_name = "Aging"
+  geneset_source_name = "Aging",
+  num_cores_per_fgsea_task = num_cores_per_fgsea_task,
+  num_concurrent_fgsea_tasks = num_concurrent_fgsea_tasks
 )
 
 # Visualize results
 plot_fgsea_results(fgsea_res_perturb_centered, "Perturbation-Centered Analysis", output_dir, top_n_genesets_to_plot)
+plot_fgsea_results(fgsea_res_perturb_centered, "Perturbation-Centered Analysis", output_dir, 100)
 
 fgsea_res_perturb_centered_up_gs <- fgsea_res_perturb_centered %>% filter(geneset_direction == "UP")
 plot_clustered_heatmap(fgsea_res_perturb_centered_up_gs, "Perturbation-Centered Analysis", "Aging", "UP", output_dir)
