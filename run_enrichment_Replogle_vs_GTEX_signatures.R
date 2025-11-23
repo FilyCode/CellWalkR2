@@ -24,7 +24,7 @@ if (!dir.exists(output_dir)) {
 logFC_filter_val <- 0.25
 adj_pval_filter_val <- 0.05
 geneset_top_n <- 500
-top_n_genesets_to_plot <- 100
+top_n_genesets_to_plot <- 20
 
 # fgsea parameters
 fgsea_min_size <- 15 
@@ -603,8 +603,7 @@ plot_clustered_heatmap <- function(fgsea_df, analysis_title_prefix, geneset_sour
     show_row_names = FALSE,
     row_names_gp = gpar(fontsize = 6),
     column_names_gp = gpar(fontsize = 8),
-    column_names_rot = 90,
-    show_column_dend = FALSE
+    column_names_rot = 90
   )
   
   # Save as PNG
