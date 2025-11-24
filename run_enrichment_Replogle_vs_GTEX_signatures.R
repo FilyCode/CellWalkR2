@@ -32,20 +32,15 @@ fgsea_min_size <- 15
 fgsea_max_size <- Inf
 
 # Parallelization strategy
-num_cores_per_fgsea_task <- 7  # Each individual fgsea call will use 6 CPUs
-num_concurrent_fgsea_tasks <- 4 # Number of fgsea calls to run at the same time
-
-# Define a BPPARAM object for fgsea's internal parallelization with progressbar = FALSE
-fgsea_internal_bpparam <- BiocParallel::MulticoreParam(workers = num_cores_per_fgsea_task, progressbar = FALSE)
+total_num_processes <- 7 # Each fgsea runs with 4 CPUs so with 7 workers we need 28 CPUs
 
 
 message("--- Starting GSEA Combined Analysis ---")
 message(paste0("Output directory: ", output_dir))
 message(paste0("Gene set filtering: |logFC| > ", logFC_filter_val, ", adj.pval < ", adj_pval_filter_val))
 message(paste0("fgsea parameters: minSize = ", fgsea_min_size, ", maxSize = ", fgsea_max_size, 
-               ", nproc (per task) = ", num_cores_per_fgsea_task, 
-               ", concurrent tasks = ", num_concurrent_fgsea_tasks, 
-               " (total ", num_cores_per_fgsea_task * num_concurrent_fgsea_tasks, " CPUs potentially used for fgsea)"))
+               ", total_num_processes = ", total_num_processes, 
+               " (each fgsea task will run on 1 core, with up to ", total_num_processes, " tasks concurrently)"))
 message(paste0("Top N results for plotting: ", top_n_genesets_to_plot))
 
 # --- Helper Functions ---
@@ -333,76 +328,70 @@ extract_gene_sets_up_dn <- function(omic_collection, logFC_thresh, pval_thresh, 
 #' @return A combined data frame of fgsea results.
 perform_fgsea_and_combine <- function(ranked_lists, gene_sets_up, gene_sets_dn, 
                                       ranked_source_name, geneset_source_name,
-                                      num_cores_per_fgsea_task, num_concurrent_fgsea_tasks) {
+                                      total_num_processes) {
   
   message(paste0("Initiating fgsea analysis for '", ranked_source_name, "' ranked lists vs. '", geneset_source_name, "' gene sets."))
   
-  # Set up BiocParallel backend for concurrent execution of the loops over ranked_lists.
-  # Set progressbar = FALSE here for the outer bplapply loop
-  outer_bpparam <- BiocParallel::MulticoreParam(workers = num_concurrent_fgsea_tasks, progressbar = FALSE)
-  register(outer_bpparam, default = TRUE) # Register the parameter object globally for BiocParallel functions
+  # Create a list of all individual fgsea tasks to be executed
+  fgsea_tasks <- list()
   
-  all_fgsea_results_list <- list() # Store results in a list to combine later
-  
-  # Run for UP gene sets
+  # Add tasks for UP gene sets
   if (length(gene_sets_up) > 0) {
-    message(paste0("  Processing with UP gene sets from '", geneset_source_name, "' (", length(gene_sets_up), " pathways) concurrently across ", length(ranked_lists), " ranked lists..."))
-    
-    # Use bplapply to parallelize iterations over ranked_lists
-    up_results <- bplapply(names(ranked_lists), function(rl_name) {
-      # Pass fgsea_internal_bpparam directly to fgsea instead of nproc
-      fg_up <- fgsea(pathways = gene_sets_up,
-                     stats    = ranked_lists[[rl_name]],
-                     minSize  = fgsea_min_size,
-                     maxSize  = fgsea_max_size,
-                     BPPARAM  = fgsea_internal_bpparam) # Use the global fgsea_internal_bpparam
-      fg_up$ranked_list_name <- rl_name
-      fg_up$geneset_source_name <- geneset_source_name
-      fg_up$geneset_direction <- "UP"
-      return(fg_up)
-    }, BPPARAM = outer_bpparam) # Pass the outer_bpparam to bplapply for concurrent execution
-    
-    # Filter out NULL results (if any failed) and combine
-    up_results_df <- do.call(rbind, up_results[!sapply(up_results, is.null)])
-    if (!is.null(up_results_df) && nrow(up_results_df) > 0) {
-      all_fgsea_results_list[["up"]] <- up_results_df
-    } else {
-      message(paste("No UP fgsea results generated for ", ranked_source_name, " vs ", geneset_source_name, "."))
+    for (rl_name in names(ranked_lists)) {
+      fgsea_tasks[[length(fgsea_tasks) + 1]] <- list(
+        pathways = gene_sets_up,
+        stats = ranked_lists[[rl_name]],
+        ranked_list_name = rl_name,
+        geneset_source_name = geneset_source_name,
+        geneset_direction = "UP"
+      )
     }
-  } else {
-    message(paste("No UP gene sets available from '", geneset_source_name, "' for fgsea."))
   }
   
-  # Run for DN gene sets
+  # Add tasks for DN gene sets
   if (length(gene_sets_dn) > 0) {
-    message(paste0("  Processing with DN gene sets from '", geneset_source_name, "' (", length(gene_sets_dn), " pathways) concurrently across ", length(ranked_lists), " ranked lists..."))
-    
-    # Use bplapply to parallelize iterations over ranked_lists
-    dn_results <- bplapply(names(ranked_lists), function(rl_name) {
-      # Pass fgsea_internal_bpparam directly to fgsea instead of nproc
-      fg_dn <- fgsea(pathways = gene_sets_dn,
-                     stats    = ranked_lists[[rl_name]],
-                     minSize  = fgsea_min_size,
-                     maxSize  = fgsea_max_size,
-                     BPPARAM  = fgsea_internal_bpparam) # Use the global fgsea_internal_bpparam
-      fg_dn$ranked_list_name <- rl_name
-      fg_dn$geneset_source_name <- geneset_source_name
-      fg_dn$geneset_direction <- "DN"
-      return(fg_dn)
-    }, BPPARAM = outer_bpparam) # Pass the outer_bpparam to bplapply for concurrent execution
-    
-    # Filter out NULL results (if any failed) and combine
-    dn_results_df <- do.call(rbind, dn_results[!sapply(dn_results, is.null)])
-    if (!is.null(dn_results_df) && nrow(dn_results_df) > 0) {
-      all_fgsea_results_list[["dn"]] <- dn_results_df
-    } else {
-      message(paste("No DN fgsea results generated for ", ranked_source_name, " vs ", geneset_source_name, "."))
+    for (rl_name in names(ranked_lists)) {
+      fgsea_tasks[[length(fgsea_tasks) + 1]] <- list(
+        pathways = gene_sets_dn,
+        stats = ranked_lists[[rl_name]],
+        ranked_list_name = rl_name,
+        geneset_source_name = geneset_source_name,
+        geneset_direction = "DN"
+      )
     }
-  } else {
-    message(paste("No DN gene sets available from '", geneset_source_name, "' for fgsea."))
   }
   
-  combined_results_df <- do.call(rbind, all_fgsea_results_list) # Combine UP and DN results here
+  if (length(fgsea_tasks) == 0) {
+    warning(paste("No fgsea tasks could be prepared for ", ranked_source_name, " vs ", geneset_source_name, " analysis type."))
+    return(NULL)
+  }
+  
+  message(paste0("  Prepared ", length(fgsea_tasks), " individual fgsea tasks. Running with ", total_num_processes, " concurrent workers."))
+  
+  # Set up BiocParallel backend for running ALL fgsea tasks concurrently.
+  # Each worker will perform one complete fgsea call.
+  # We set progressbar=FALSE globally to prevent verbose output.
+  bpparam_global <- BiocParallel::MulticoreParam(workers = total_num_processes)
+  register(bpparam_global, default = TRUE) # Register for use by bplapply
+  
+  # Execute all fgsea tasks in parallel
+  all_fgsea_results <- bplapply(fgsea_tasks, function(task) {
+    res <- fgsea(pathways = task$pathways,
+                 stats    = task$stats,
+                 minSize  = fgsea_min_size,
+                 maxSize  = fgsea_max_size,
+                 nproc    = 4)
+    
+    # Add metadata to the results
+    res$ranked_list_name <- task$ranked_list_name
+    res$geneset_source_name <- task$geneset_source_name
+    res$geneset_direction <- task$geneset_direction
+    return(res)
+  }, BPPARAM = bpparam_global) # Use the global bpparam for this bplapply
+  
+  # Filter out NULL results (if any failed) and combine
+  combined_results_df <- do.call(rbind, all_fgsea_results[!sapply(all_fgsea_results, is.null)])
+  
   if (is.null(combined_results_df) || nrow(combined_results_df) == 0) {
     warning(paste("No fgsea results generated for ", ranked_source_name, " vs ", geneset_source_name, " analysis type."))
     return(NULL)
@@ -410,6 +399,7 @@ perform_fgsea_and_combine <- function(ranked_lists, gene_sets_up, gene_sets_dn,
   message(paste0("fgsea analysis complete for '", ranked_source_name, "' vs. '", geneset_source_name, "'. Total results: ", nrow(combined_results_df), " rows."))
   return(combined_results_df)
 }
+
 
 #' Generates and saves a 2x2 grid of ggplot dot plots for fgsea results.
 #' The grid shows combinations of UP/DOWN gene sets with Positive/Negative NES.
@@ -694,8 +684,7 @@ fgsea_res_age_centered <- perform_fgsea_and_combine(
   gene_sets_dn = perturb_gene_sets_up_dn$dn_gene_sets,
   ranked_source_name = "Aging",
   geneset_source_name = "Perturbation",
-  num_cores_per_fgsea_task = num_cores_per_fgsea_task,
-  num_concurrent_fgsea_tasks = num_concurrent_fgsea_tasks
+  total_num_processes = total_num_processes
 )
 
 # Visualize results
@@ -733,8 +722,7 @@ fgsea_res_perturb_centered <- perform_fgsea_and_combine(
   gene_sets_dn = age_gene_sets_up_dn$dn_gene_sets,
   ranked_source_name = "Perturbation",
   geneset_source_name = "Aging",
-  num_cores_per_fgsea_task = num_cores_per_fgsea_task,
-  num_concurrent_fgsea_tasks = num_concurrent_fgsea_tasks
+  total_num_processes = total_num_processes
 )
 
 # Visualize results
