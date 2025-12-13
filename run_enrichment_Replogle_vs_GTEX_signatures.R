@@ -7,6 +7,8 @@ library(ComplexHeatmap)
 library(circlize)
 library(cowplot)
 library(BiocParallel)
+library(purrr)
+library(data.table)
 
 # --- Configuration ---
 # File paths
@@ -25,7 +27,8 @@ if (!dir.exists(output_dir)) {
 logFC_filter_val <- 0.25
 adj_pval_filter_val <- 0.05
 geneset_top_n <- 500
-top_n_genesets_to_plot <- 20
+top_n_genesets_to_plot <- 20 # For existing 4-panel plots
+top_n_combined_plots <- 20 # For new combined ES dot plots
 
 # fgsea parameters
 fgsea_min_size <- 15 
@@ -41,7 +44,8 @@ message(paste0("Gene set filtering: |logFC| > ", logFC_filter_val, ", adj.pval <
 message(paste0("fgsea parameters: minSize = ", fgsea_min_size, ", maxSize = ", fgsea_max_size, 
                ", total_num_cores = ", total_num_cores, 
                " (each fgsea task will run on 1 core, with up to ", total_num_cores, " tasks concurrently)"))
-message(paste0("Top N results for plotting: ", top_n_genesets_to_plot))
+message(paste0("Top N results for plotting (traditional): ", top_n_genesets_to_plot))
+message(paste0("Top N results for plotting (combined ES): ", top_n_combined_plots))
 
 # --- Helper Functions ---
 
@@ -72,13 +76,13 @@ simplify_entry <- function(x) {
 #' Extracts ranked gene lists from an OmicSignatureCollection.
 #' Ranks genes by 'score' without p-value/logFC filtering.
 #' Prioritizes 'difexp' table, falls back to 'signature' if 'difexp' is missing.
-#' Maps probe_id to gene_name using a provided gene map.
+#' Maps probe_id to gene_name using a provided *simplified* gene map.
 #'
 #' @param omic_collection An OmicSignatureCollection object.
 #' @param collection_name A string identifying the source collection (for warnings/messages).
-#' @param gene_map A named character vector for mapping probe_id to gene_name. # ADD gene_map PARAMETER
+#' @param simplified_gene_map A named character vector for mapping probe_id to gene_name (already simplified).
 #' @return A named list of numeric vectors, where names are gene_name and values are scores.
-extract_ranked_lists <- function(omic_collection, collection_name, gene_map) { # MODIFY FUNCTION SIGNATURE
+extract_ranked_lists <- function(omic_collection, collection_name, simplified_gene_map) { 
   ranked_lists <- list()
   if (is.null(omic_collection) || is.null(omic_collection$OmicSigList)) {
     stop(paste("OmicSignatureCollection is NULL or empty for", collection_name))
@@ -99,9 +103,9 @@ extract_ranked_lists <- function(omic_collection, collection_name, gene_map) { #
       next
     }
     
-    # Map probe_id to gene_name and simplify 
-    df_for_ranks$gene_name <- sapply(gene_map[df_for_ranks$probe_id], simplify_entry, USE.NAMES = FALSE)
-    
+    # Use the pre-simplified gene_map for direct lookup
+    df_for_ranks$gene_name <- simplified_gene_map[df_for_ranks$probe_id]
+
     current_ranks <- df_for_ranks %>%
       dplyr::select(gene_name, score) %>% 
       drop_na(score, gene_name) %>% # Remove NAs in score and gene_name 
@@ -124,19 +128,20 @@ extract_ranked_lists <- function(omic_collection, collection_name, gene_map) { #
 }
 
 
+
 #' Extracts gene sets (upregulated and downregulated) from an OmicSignatureCollection.
 #' Filters genes based on logFC and adjusted p-value thresholds.
 #' Prioritizes 'signature' table, falls back to 'difexp' if 'signature' is missing.
-#' Maps probe_id to gene_name using a provided gene map.
+#' Maps probe_id to gene_name using a provided *simplified* gene map.
 #'
 #' @param omic_collection An OmicSignatureCollection object.
 #' @param logFC_thresh Numeric, absolute logFC threshold for filtering.
 #' @param pval_thresh Numeric, adjusted p-value threshold for filtering.
 #' @param geneset_top_n Numeric or NULL. If a number, takes top N genes by absolute logFC after other filters.
 #' @param collection_name A string identifying the source collection (for warnings/messages).
-#' @param gene_map A named character vector for mapping probe_id to gene_name. # ADD gene_map PARAMETER
+#' @param simplified_gene_map A named character vector for mapping probe_id to gene_name (already simplified).
 #' @return A list containing two named lists: 'up_gene_sets' and 'dn_gene_sets'.
-extract_gene_sets_up_dn <- function(omic_collection, logFC_thresh, pval_thresh, geneset_top_n, collection_name, gene_map) { # MODIFY FUNCTION SIGNATURE
+extract_gene_sets_up_dn <- function(omic_collection, logFC_thresh, pval_thresh, geneset_top_n, collection_name, simplified_gene_map) { 
   up_gene_sets <- list()
   dn_gene_sets <- list()
   
@@ -155,12 +160,6 @@ extract_gene_sets_up_dn <- function(omic_collection, logFC_thresh, pval_thresh, 
   
   for (sig_name in names(omic_collection$OmicSigList)) {
     sig_obj <- omic_collection$OmicSigList[[sig_name]]
-    
-    # For debugging, uncomment to see column names for each signature
-    # message(paste0("  Processing signature: ", sig_name))
-    # if (!is.null(sig_obj$signature)) { print(paste("    signature cols:", paste(names(sig_obj$signature), collapse=", "))) }
-    # if (!is.null(sig_obj$difexp)) { print(paste("    difexp cols:", paste(names(sig_obj$difexp), collapse=", "))) }
-    
     
     df_to_process <- NULL
     used_source_name <- "none" 
@@ -277,8 +276,8 @@ extract_gene_sets_up_dn <- function(omic_collection, logFC_thresh, pval_thresh, 
         dplyr::slice_head(n = geneset_top_n) # Take top N genes
     } 
     
-    # Map probe_id to gene_name and simplify BEFORE extracting to up_genes/dn_genes # ADD THESE LINES
-    significant_genes$gene_name <- sapply(gene_map[significant_genes$probe_id], simplify_entry, USE.NAMES = FALSE)
+    # Use the pre-simplified gene_map for direct lookup
+    significant_genes$gene_name <- simplified_gene_map[significant_genes$probe_id]
     significant_genes <- significant_genes %>% dplyr::filter(!is.na(gene_name)) %>% dplyr::distinct(gene_name, .keep_all = TRUE)
     
     if (nrow(significant_genes) == 0) {
@@ -390,7 +389,7 @@ perform_fgsea_and_combine <- function(ranked_lists, gene_sets_up, gene_sets_dn,
   }, BPPARAM = bpparam_global) # Use the global bpparam for this bplapply
   
   # Filter out NULL results (if any failed) and combine
-  combined_results_df <- do.call(rbind, all_fgsea_results[!sapply(all_fgsea_results, is.null)])
+  combined_results_df <- dplyr::bind_rows(all_fgsea_results[!sapply(all_fgsea_results, is.null)])
   
   if (is.null(combined_results_df) || nrow(combined_results_df) == 0) {
     warning(paste("No fgsea results generated for ", ranked_source_name, " vs ", geneset_source_name, " analysis type."))
@@ -654,6 +653,389 @@ plot_clustered_heatmap <- function(fgsea_df, analysis_title_prefix, geneset_sour
 }
 
 
+#' Calculates a combined ES score (ES_UP - ES_DN) and a combined p-value
+#' (using Fisher's method) for fgsea results.
+#'
+#' @param fgsea_df A data frame of combined fgsea results (containing 'pathway', 'ranked_list_name', 'geneset_direction', 'ES', 'padj').
+#' @param analysis_name A string for logging/message purposes.
+#' @return A data frame with combined scores, p-values, and original metadata.
+calculate_combined_scores <- function(fgsea_df, analysis_name) {
+  if (is.null(fgsea_df) || nrow(fgsea_df) == 0) {
+    message(paste("No fgsea results to calculate combined scores for", analysis_name))
+    return(NULL)
+  }
+  
+  message(paste0("Calculating combined ES and p-values for '", analysis_name, "'..."))
+  
+  required_cols <- c("pathway", "ranked_list_name", "geneset_direction", "ES", "padj", "geneset_source_name", "ranked_source_name")
+  if (!all(required_cols %in% colnames(fgsea_df))) {
+    stop(paste("Missing required columns for combined score calculation:", setdiff(required_cols, colnames(fgsea_df))))
+  }
+  
+  combined_df <- fgsea_df %>%
+    dplyr::select(pathway, ranked_list_name, geneset_direction, ES, padj, geneset_source_name, ranked_source_name) %>%
+    tidyr::pivot_wider(
+      names_from = geneset_direction,
+      values_from = c(ES, padj),
+      names_glue = "{.value}_{.name}"
+    ) %>%
+    dplyr::mutate(
+      ES_UP = ifelse(is.na(ES_UP), 0, ES_UP), # Treat missing ES as 0 for combination
+      ES_DN = ifelse(is.na(ES_DN), 0, ES_DN),
+      
+      combined_ES = ES_UP - ES_DN,
+      
+      combined_padj = purrr::pmap_dbl(list(padj_UP, padj_DN), function(p_up, p_dn) {
+        p_values_to_combine <- c()
+        if (!is.na(p_up)) p_values_to_combine <- c(p_values_to_combine, p_up)
+        if (!is.na(p_dn)) p_values_to_combine <- c(p_values_to_combine, p_dn)
+        
+        if (length(p_values_to_combine) == 0) {
+          return(NA_real_)
+        } else if (length(p_values_to_combine) == 1) {
+          return(p_values_to_combine[1]) # If only one, use that p-value
+        } else {
+          # Fisher's method: Ensure p-values are not exactly 0 to avoid -Inf from log, clamp at a small value
+          p_values_to_combine <- pmax(p_values_to_combine, .Machine$double.xmin)
+          
+          chisq <- -2 * sum(log(p_values_to_combine))
+          df_fisher <- 2 * length(p_values_to_combine)
+          return(pchisq(chisq, df = df_fisher, lower.tail = FALSE))
+        }
+      })
+    ) %>%
+    dplyr::select(
+      pathway, ranked_list_name, geneset_source_name, ranked_source_name,
+      ES_UP, padj_UP, ES_DN, padj_DN, combined_ES, combined_padj
+    )
+  
+  # Add the 'size' from the original df (assuming size is the same for UP/DN of the same pathway)
+  size_info <- fgsea_df %>%
+    dplyr::select(pathway, geneset_direction, size) %>%
+    tidyr::pivot_wider(names_from = geneset_direction, values_from = size, names_prefix = "size_") %>%
+    dplyr::mutate(size = ifelse(!is.na(size_UP), size_UP, size_DN)) %>% # Take UP size if present, else DN
+    dplyr::select(pathway, size) %>%
+    dplyr::distinct()
+  
+  combined_df <- combined_df %>%
+    dplyr::left_join(size_info, by = "pathway") %>%
+    dplyr::mutate(size = ifelse(is.na(size), 0, size)) # Fill NA sizes with 0 if pathway not found
+  
+  # Only keep rows where p-value could be combined or was single.
+  combined_df <- combined_df %>% drop_na(combined_padj) 
+  
+  message(paste0("Combined scores calculated for '", analysis_name, "'. Total combined results: ", nrow(combined_df), " rows."))
+  return(combined_df)
+}
+
+#' Generates and saves a dot plot for combined fgsea results (ES_UP - ES_DN).
+#'
+#' @param combined_fgsea_df A data frame of combined fgsea results from calculate_combined_scores.
+#' @param analysis_title_prefix A string for plot titles, e.g., "Age-Centered Analysis".
+#' @param output_dir Path to save the plots.
+#' @param top_n Numeric, number of top results to plot.
+plot_combined_fgsea_dotplot <- function(combined_fgsea_df, analysis_title_prefix, output_dir, top_n = 20) {
+  
+  if (is.null(combined_fgsea_df) || nrow(combined_fgsea_df) == 0) {
+    message(paste("No combined fgsea results for", analysis_title_prefix, "to display or plot."))
+    return(invisible(NULL))
+  }
+  
+  message(paste0("Generating combined dot plot for: ", analysis_title_prefix))
+  
+  all_significant_combined_results <- combined_fgsea_df %>%
+    dplyr::filter(combined_padj < 0.05)
+  
+  if (nrow(all_significant_combined_results) == 0) {
+    message(paste("No significant combined interactions (combined_padj < 0.05) found for", analysis_title_prefix, "to plot."))
+    return(invisible(NULL))
+  } else {
+    message(paste0("Found ", nrow(all_significant_combined_results), " significant combined interactions (combined_padj < 0.05) for ", analysis_title_prefix, "."))
+  }
+  
+  gene_set_label <- unique(all_significant_combined_results$geneset_source_name)[1]
+  if (is.null(gene_set_label) || is.na(gene_set_label)) {
+    gene_set_label <- "Gene Set" 
+  } else {
+    gene_set_label <- paste0(gene_set_label, " Gene Set")
+  }
+  
+  ranked_list_label <- unique(all_significant_combined_results$ranked_source_name)[1]
+  if (is.is.null(ranked_list_label) || is.na(ranked_list_label)) {
+    ranked_list_label <- "Ranked List" 
+  } else {
+    ranked_list_label <- paste0(ranked_list_label, " Ranked List")
+  }
+  
+  # --- Plot 1: Top Positive combined_ES (Gero-advancer) ---
+  data_pos <- all_significant_combined_results %>%
+    dplyr::filter(combined_ES > 0) %>%
+    dplyr::arrange(dplyr::desc(combined_ES)) %>%
+    dplyr::slice(1:min(dplyr::n(), top_n))
+  
+  plot_pos <- if (nrow(data_pos) > 0) {
+    ggplot(data_pos, aes(x = reorder(pathway, combined_ES), y = ranked_list_name)) +
+      geom_point(aes(size = size, color = combined_ES)) +
+      scale_size_continuous(name = "Gene Set Size") +
+      scale_color_gradient(low = "yellow", high = "red", name = "Combined ES\n(ES_UP - ES_DN)") + # Gero-advancer colors
+      coord_flip() +
+      theme_bw() +
+      theme(axis.text.x = element_text(angle = 45, hjust = 1),
+            plot.title = element_text(face = "bold", hjust = 0.5, size = 10),
+            axis.title = element_text(size = 8), axis.text = element_text(size = 7),
+            legend.text = element_text(size = 7), legend.title = element_text(size = 8),
+            legend.position = "bottom", plot.margin = margin(5, 5, 5, 5, "pt")) +
+      labs(x = gene_set_label, y = ranked_list_label, title = paste0("Top ", top_n, " Gero-Advancer Pathways (Positive Combined ES)"))
+  } else {
+    ggplot() + geom_text(aes(x=0.5, y=0.5, label="No significant Gero-Advancer pathways"), size=4, color="grey50") + theme_void()
+  }
+  message(paste0("Prepared plot for Top ", top_n, " Gero-Advancer pathways (", nrow(data_pos), " results)."))
+  
+  # --- Plot 2: Top Negative combined_ES (Gero-protector) ---
+  data_neg <- all_significant_combined_results %>%
+    dplyr::filter(combined_ES < 0) %>%
+    dplyr::arrange(combined_ES) %>% # Arrange ascending for most negative first
+    dplyr::slice(1:min(dplyr::n(), top_n))
+  
+  plot_neg <- if (nrow(data_neg) > 0) {
+    ggplot(data_neg, aes(x = reorder(pathway, combined_ES), y = ranked_list_name)) +
+      geom_point(aes(size = size, color = combined_ES)) +
+      scale_size_continuous(name = "Gene Set Size") +
+      scale_color_gradient(low = "darkblue", high = "lightblue", name = "Combined ES\n(ES_UP - ES_DN)") + # Gero-protector colors
+      coord_flip() +
+      theme_bw() +
+      theme(axis.text.x = element_text(angle = 45, hjust = 1),
+            plot.title = element_text(face = "bold", hjust = 0.5, size = 10),
+            axis.title = element_text(size = 8), axis.text = element_text(size = 7),
+            legend.text = element_text(size = 7), legend.title = element_text(size = 8),
+            legend.position = "bottom", plot.margin = margin(5, 5, 5, 5, "pt")) +
+      labs(x = gene_set_label, y = ranked_list_label, title = paste0("Top ", top_n, " Gero-Protector Pathways (Negative Combined ES)"))
+  } else {
+    ggplot() + geom_text(aes(x=0.5, y=0.5, label="No significant Gero-Protector pathways"), size=4, color="grey50") + theme_void()
+  }
+  message(paste0("Prepared plot for Top ", top_n, " Gero-Protector pathways (", nrow(data_neg), " results)."))
+  
+  # Combine and save
+  if (nrow(data_pos) > 0 || nrow(data_neg) > 0) {
+    combined_plot <- plot_grid(plot_pos, plot_neg, ncol = 2, align = "hv", 
+                               labels = c("A", "B"), label_size = 10)
+    
+    final_title_text <- paste0("GSEA Combined ES: ", analysis_title_prefix, " (Top ", top_n, " Pathways)")
+    final_title <- ggdraw() + 
+      draw_label(final_title_text, fontface = 'bold', size = 16, x = 0.02, hjust = 0) +
+      theme(plot.margin = margin(0, 0, 0, 7, "pt"))
+    
+    combined_plot_with_title <- plot_grid(final_title, combined_plot, ncol = 1, rel_heights = c(0.05, 1))
+    
+    plot_filename_png <- file.path(output_dir, paste0(gsub(" ", "_", analysis_title_prefix), "_top_", top_n, "_gsea_combined_ES_dotplot.png"))
+    ggsave(plot_filename_png, combined_plot_with_title, width = 16, height = 10)
+    
+    plot_filename_svg <- file.path(output_dir, paste0(gsub(" ", "_", analysis_title_prefix), "_top_", top_n, "_gsea_combined_ES_dotplot.svg"))
+    ggsave(plot_filename_svg, combined_plot_with_title, width = 16, height = 10)
+    
+    message("  Combined ES dot plot generated and saved to: ", plot_filename_png)
+  } else {
+    message("No combined dot plots generated for ", analysis_title_prefix, " due to lack of significant results.")
+  }
+}
+
+#' Generates and saves a clustered heatmap from combined fgsea results (combined_ES).
+#'
+#' @param combined_fgsea_df A data frame of combined fgsea results (from calculate_combined_scores).
+#' @param analysis_title_prefix A string for plot titles, e.g., "Age-Centered Analysis".
+#' @param output_dir Path to save the plots.
+plot_combined_heatmap <- function(combined_fgsea_df, analysis_title_prefix, output_dir) {
+  
+  if (is.null(combined_fgsea_df) || nrow(combined_fgsea_df) == 0) {
+    message(paste("No combined fgsea results for heatmap in", analysis_title_prefix, "."))
+    return(invisible(NULL))
+  }
+  
+  message(paste0("Generating clustered heatmap for combined ES: ", analysis_title_prefix))
+  
+  # Filter for significant results (combined_padj < 0.05)
+  significant_combined_results <- combined_fgsea_df %>%
+    dplyr::filter(combined_padj < 0.05)
+  
+  if (nrow(significant_combined_results) == 0) {
+    message(paste("  No significant combined interactions (combined_padj < 0.05) found for heatmap in", analysis_title_prefix, "."))
+    return(invisible(NULL))
+  }
+  
+  num_pathways <- length(unique(significant_combined_results$pathway))
+  num_ranked_lists <- length(unique(significant_combined_results$ranked_list_name))
+  
+  if (num_pathways < 2 || num_ranked_lists < 2) {
+    message(paste("  Not enough unique pathways (", num_pathways, ") or ranked lists (", num_ranked_lists, ") for a meaningful combined heatmap in", analysis_title_prefix, ". Skipping heatmap."))
+    return(invisible(NULL))
+  }
+  
+  # Reshape data for heatmap: pathways as rows, ranked lists as columns, combined_ES as values
+  heatmap_data <- significant_combined_results %>%
+    dplyr::select(pathway, ranked_list_name, combined_ES) %>%
+    tidyr::pivot_wider(names_from = ranked_list_name, values_from = combined_ES, values_fill = 0) 
+  
+  # Filter heatmap_data rows where combined_ES != 0 for at least 5 columns (similar to original logic)
+  mat_for_filtering <- as.matrix(heatmap_data %>% dplyr::select(-pathway))
+  rownames(mat_for_filtering) <- heatmap_data$pathway
+  # Here, we filter for pathways that have at least 5 non-zero combined ES values,
+  row_non_zero_es_counts <- rowSums(mat_for_filtering != 0, na.rm = TRUE)
+  heatmap_data <- heatmap_data[row_non_zero_es_counts >= 5, ] # You might adjust this threshold
+  
+  if (nrow(heatmap_data) == 0) {
+    message(paste("  No pathways left after filtering for at least 5 non-zero combined ES enrichments for heatmap in", analysis_title_prefix, ". Skipping heatmap."))
+    return(invisible(NULL))
+  }
+  
+  mat <- as.matrix(heatmap_data %>% dplyr::select(-pathway))
+  rownames(mat) <- heatmap_data$pathway
+  
+  max_abs_es <- max(abs(mat), na.rm = TRUE)
+  col_fun <- colorRamp2(c(-max_abs_es, -max_abs_es/2, 0, max_abs_es/2, max_abs_es), 
+                        c("darkblue", "lightblue", "white", "pink2", "darkred")) # Use diverging palette
+  
+  hm_title <- paste0("Clustered Heatmap: ", analysis_title_prefix, "\n(Combined ES: ES_UP - ES_DN)")
+  file_name_base <- paste0(gsub(" ", "_", analysis_title_prefix), "_combined_ES_heatmap")
+  heatmap_output_path_png <- file.path(output_dir, paste0(file_name_base, ".png"))
+  heatmap_output_path_svg <- file.path(output_dir, paste0(file_name_base, ".svg"))
+  
+  hm <- Heatmap(
+    mat,
+    name = "Combined ES",
+    col = col_fun,
+    na_col = "grey90",
+    cluster_rows = TRUE,
+    cluster_columns = TRUE,
+    show_row_names = FALSE,
+    row_names_gp = gpar(fontsize = 6),
+    column_names_gp = gpar(fontsize = 8),
+    column_names_rot = 90
+  )
+  
+  png(heatmap_output_path_png, width = 2200, height = 1800, res = 300)
+  draw(hm, column_title = hm_title)
+  dev.off()
+  
+  svg(heatmap_output_path_svg, width = 7.33, height = 6)
+  draw(hm, column_title = hm_title)
+  dev.off()
+  
+  message("  Combined ES clustered heatmap generated and saved to: ", heatmap_output_path_png)
+}
+
+#' Generates an exploratory plot of adjusted p-value vs. ES.
+#'
+#' @param fgsea_df A data frame of fgsea results (can be raw or combined, specify ES_col and pval_col).
+#' @param analysis_title_prefix A string for plot titles.
+#' @param output_dir Path to save the plots.
+#' @param es_col The name of the ES column (e.g., "NES", "ES", "combined_ES").
+#' @param pval_col The name of the p-value column (e.g., "padj", "combined_padj").
+#' @param max_plot_points Optional: maximum number of points to plot for performance, samples if more.
+plot_pval_vs_es <- function(fgsea_df, analysis_title_prefix, output_dir, 
+                            es_col = "NES", pval_col = "padj", max_plot_points = 50000) {
+  
+  if (is.null(fgsea_df) || nrow(fgsea_df) == 0) {
+    message(paste("No fgsea results for p-value vs ES plot in", analysis_title_prefix, "."))
+    return(invisible(NULL))
+  }
+  
+  message(paste0("Generating p-value vs ", es_col, " plot for: ", analysis_title_prefix))
+  
+  if (!all(c(es_col, pval_col) %in% colnames(fgsea_df))) {
+    warning(paste("Missing required columns ('", es_col, "', '", pval_col, "') for p-value vs ES plot in", analysis_title_prefix, ". Skipping."))
+    return(invisible(NULL))
+  }
+  
+  plot_data <- fgsea_df %>%
+    dplyr::filter(!is.na(!!sym(es_col)), !is.na(!!sym(pval_col))) %>%
+    dplyr::mutate(log10_pval = -log10(!!sym(pval_col)))
+  
+  if (nrow(plot_data) == 0) {
+    message(paste("No valid data points for p-value vs ES plot in", analysis_title_prefix, "after NA filtering. Skipping."))
+    return(invisible(NULL))
+  }
+  
+  if (nrow(plot_data) > max_plot_points) {
+    message(paste0("  Sampling ", max_plot_points, " points for p-value vs ES plot to improve performance."))
+    plot_data <- plot_data %>% dplyr::sample_n(max_plot_points)
+  }
+  
+  p <- ggplot(plot_data, aes(x = !!sym(es_col), y = log10_pval)) +
+    geom_point(alpha = 0.5, size = 1) +
+    geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "red") +
+    labs(
+      title = paste0(analysis_title_prefix, ": -log10(", pval_col, ") vs ", es_col),
+      x = es_col,
+      y = paste0("-log10(", pval_col, ")")
+    ) +
+    theme_minimal() +
+    theme(plot.title = element_text(face = "bold", hjust = 0.5))
+  
+  plot_filename_png <- file.path(output_dir, paste0(gsub(" ", "_", analysis_title_prefix), "_", pval_col, "_vs_", es_col, ".png"))
+  ggsave(plot_filename_png, p, width = 8, height = 6)
+  
+  plot_filename_svg <- file.path(output_dir, paste0(gsub(" ", "_", analysis_title_prefix), "_", pval_col, "_vs_", es_col, ".svg"))
+  ggsave(plot_filename_svg, p, width = 8, height = 6)
+  
+  message("  P-value vs ES plot generated and saved to: ", plot_filename_png)
+}
+
+#' Generates an exploratory plot of gene set size vs. ES.
+#'
+#' @param fgsea_df A data frame of fgsea results (can be raw or combined, specify ES_col).
+#' @param analysis_title_prefix A string for plot titles.
+#' @param output_dir Path to save the plots.
+#' @param es_col The name of the ES column (e.g., "NES", "ES", "combined_ES").
+#' @param max_plot_points Optional: maximum number of points to plot for performance, samples if more.
+plot_geneset_size_vs_es <- function(fgsea_df, analysis_title_prefix, output_dir, 
+                                    es_col = "NES", max_plot_points = 50000) {
+  
+  if (is.null(fgsea_df) || nrow(fgsea_df) == 0) {
+    message(paste("No fgsea results for gene set size vs ES plot in", analysis_title_prefix, "."))
+    return(invisible(NULL))
+  }
+  
+  message(paste0("Generating gene set size vs ", es_col, " plot for: ", analysis_title_prefix))
+  
+  if (!all(c("size", es_col) %in% colnames(fgsea_df))) {
+    warning(paste("Missing required columns ('size', '", es_col, "') for gene set size vs ES plot in", analysis_title_prefix, ". Skipping."))
+    return(invisible(NULL))
+  }
+  
+  plot_data <- fgsea_df %>%
+    dplyr::filter(!is.na(size), !is.na(!!sym(es_col)))
+  
+  if (nrow(plot_data) == 0) {
+    message(paste("No valid data points for gene set size vs ES plot in", analysis_title_prefix, "after NA filtering. Skipping."))
+    return(invisible(NULL))
+  }
+  
+  if (nrow(plot_data) > max_plot_points) {
+    message(paste0("  Sampling ", max_plot_points, " points for gene set size vs ES plot to improve performance."))
+    plot_data <- plot_data %>% dplyr::sample_n(max_plot_points)
+  }
+  
+  p <- ggplot(plot_data, aes(x = size, y = !!sym(es_col))) +
+    geom_point(alpha = 0.5, size = 1) +
+    geom_smooth(method = "loess", color = "blue", se = TRUE) + # Add a smooth line
+    labs(
+      title = paste0(analysis_title_prefix, ": Gene Set Size vs ", es_col),
+      x = "Gene Set Size",
+      y = es_col
+    ) +
+    theme_minimal() +
+    theme(plot.title = element_text(face = "bold", hjust = 0.5))
+  
+  plot_filename_png <- file.path(output_dir, paste0(gsub(" ", "_", analysis_title_prefix), "_size_vs_", es_col, ".png"))
+  ggsave(plot_filename_png, p, width = 8, height = 6)
+  
+  plot_filename_svg <- file.path(output_dir, paste0(gsub(" ", "_", analysis_title_prefix), "_size_vs_", es_col, ".svg"))
+  ggsave(plot_filename_svg, p, width = 8, height = 6)
+  
+  message("  Gene set size vs ES plot generated and saved to: ", plot_filename_png)
+}
+
+
 
 # --- Main Script Execution ---
 
@@ -667,15 +1049,28 @@ message(paste0("Loaded ", length(gtex_collection$OmicSigList), " GTEX aging sign
 gene_map <- readRDS(gene_map_file)
 message(paste0("Loaded gene map from: ", gene_map_file))
 
+# Pre-process gene_map once
+message("Pre-processing gene_map for faster lookups (applying simplify_entry once)...")
+simplified_gene_map_values <- sapply(gene_map, simplify_entry, USE.NAMES = FALSE)
+# Ensure original names (probe_ids) are kept for lookup
+names(simplified_gene_map_values) <- names(gene_map) 
+gene_map_simplified <- simplified_gene_map_values
+message("Gene map pre-processing complete.")
+
 # 2. Age-Centered Analysis
 message("\n--- Running Age-Centered Analysis ---")
 message("Goal: Compare perturbation gene sets against aging ranked lists.")
 
 # Prepare ranked lists from GTEX aging data
-ranked_lists_age <- extract_ranked_lists(gtex_collection, "Aging", gene_map)
+ranked_lists_age <- extract_ranked_lists(gtex_collection, "Aging", gene_map_simplified) 
 
 # Prepare UP/DN gene sets from perturbation data
-perturb_gene_sets_up_dn <- extract_gene_sets_up_dn(perturb_collection, logFC_filter_val, adj_pval_filter_val, geneset_top_n, "Perturbation", gene_map)
+perturb_gene_sets_up_dn <- extract_gene_sets_up_dn(perturb_collection, logFC_filter_val, adj_pval_filter_val, geneset_top_n, "Perturbation", gene_map_simplified) 
+
+# Add messages for scale diagnostics
+message(paste0("  Age-Centered: Number of Aging ranked lists: ", length(ranked_lists_age)))
+message(paste0("  Age-Centered: Number of Perturbation UP gene sets: ", length(perturb_gene_sets_up_dn$up_gene_sets)))
+message(paste0("  Age-Centered: Number of Perturbation DN gene sets: ", length(perturb_gene_sets_up_dn$dn_gene_sets)))
 
 # Perform fgsea and combine results
 fgsea_res_age_centered <- perform_fgsea_and_combine(
@@ -698,11 +1093,32 @@ fgsea_res_age_centered_dn_gs <- fgsea_res_age_centered %>% filter(geneset_direct
 plot_clustered_heatmap(fgsea_res_age_centered_dn_gs, "Age-Centered Analysis", "Perturbation", "DN", output_dir)
 
 
+if (!is.null(fgsea_res_age_centered)) {
+  # Calculate combined scores
+  fgsea_res_age_centered_combined <- calculate_combined_scores(fgsea_res_age_centered, "Age-Centered Analysis")
+  
+  if (!is.null(fgsea_res_age_centered_combined) && nrow(fgsea_res_age_centered_combined) > 0) {
+    message("\n--- Generating NEW Age-Centered Visualizations ---")
+    plot_combined_fgsea_dotplot(fgsea_res_age_centered_combined, "Age-Centered Analysis", output_dir, top_n_combined_plots)
+    plot_combined_heatmap(fgsea_res_age_centered_combined, "Age-Centered Analysis", output_dir)
+    # Exploratory plots for raw fgsea results
+    plot_pval_vs_es(fgsea_res_age_centered, "Age-Centered Analysis (Raw FGSEA)", output_dir, es_col = "NES", pval_col = "padj")
+    plot_geneset_size_vs_es(fgsea_res_age_centered, "Age-Centered Analysis (Raw FGSEA)", output_dir, es_col = "NES")
+    # Exploratory plots for combined scores
+    plot_pval_vs_es(fgsea_res_age_centered_combined, "Age-Centered Analysis (Combined ES)", output_dir, es_col = "combined_ES", pval_col = "combined_padj")
+    plot_geneset_size_vs_es(fgsea_res_age_centered_combined, "Age-Centered Analysis (Combined ES)", output_dir, es_col = "combined_ES")
+  } else {
+    message("Skipping new Age-Centered visualizations due to no combined results.")
+  }
+}
+
+
 # Save the full results table
 if (!is.null(fgsea_res_age_centered)) {
-  write_tsv(fgsea_res_age_centered, file.path(output_dir, "fgsea_results_age_centered.tsv"))
-  message("Full Age-Centered fgsea results saved to: ", file.path(output_dir, "fgsea_results_age_centered.tsv"))
+  data.table::fwrite(fgsea_res_age_centered, file.path(output_dir, "fgsea_results_age_centered.csv"))
+  message("Full Age-Centered fgsea results saved to: ", file.path(output_dir, "fgsea_results_age_centered.csv"))
 }
+
 
 
 # 3. Perturbation-Centered Analysis
@@ -710,10 +1126,15 @@ message("\n--- Running Perturbation-Centered Analysis ---")
 message("Goal: Compare aging gene sets against perturbation ranked lists.")
 
 # Prepare ranked lists from perturbation data
-ranked_lists_perturb <- extract_ranked_lists(perturb_collection, "Perturbation", gene_map)
+ranked_lists_perturb <- extract_ranked_lists(perturb_collection, "Perturbation", gene_map_simplified) 
 
 # Prepare UP/DN gene sets from GTEX aging data
-age_gene_sets_up_dn <- extract_gene_sets_up_dn(gtex_collection, logFC_filter_val, adj_pval_filter_val, geneset_top_n, "Aging", gene_map)
+age_gene_sets_up_dn <- extract_gene_sets_up_dn(gtex_collection, logFC_filter_val, adj_pval_filter_val, geneset_top_n, "Aging", gene_map_simplified) 
+
+# Add messages for scale diagnostics
+message(paste0("  Perturbation-Centered: Number of Perturbation ranked lists: ", length(ranked_lists_perturb)))
+message(paste0("  Perturbation-Centered: Number of Aging UP gene sets: ", length(age_gene_sets_up_dn$up_gene_sets)))
+message(paste0("  Perturbation-Centered: Number of Aging DN gene sets: ", length(age_gene_sets_up_dn$dn_gene_sets)))
 
 # Perform fgsea and combine results
 fgsea_res_perturb_centered <- perform_fgsea_and_combine(
@@ -736,10 +1157,30 @@ fgsea_res_perturb_centered_dn_gs <- fgsea_res_perturb_centered %>% filter(genese
 plot_clustered_heatmap(fgsea_res_perturb_centered_dn_gs, "Perturbation-Centered Analysis", "Aging", "DN", output_dir)
 
 
+if (!is.null(fgsea_res_perturb_centered)) {
+  # Calculate combined scores
+  fgsea_res_perturb_centered_combined <- calculate_combined_scores(fgsea_res_perturb_centered, "Perturbation-Centered Analysis")
+  
+  if (!is.null(fgsea_res_perturb_centered_combined) && nrow(fgsea_res_perturb_centered_combined) > 0) {
+    message("\n--- Generating NEW Perturbation-Centered Visualizations ---")
+    plot_combined_fgsea_dotplot(fgsea_res_perturb_centered_combined, "Perturbation-Centered Analysis", output_dir, top_n_combined_plots)
+    plot_combined_heatmap(fgsea_res_perturb_centered_combined, "Perturbation-Centered Analysis", output_dir)
+    # Exploratory plots for raw fgsea results
+    plot_pval_vs_es(fgsea_res_perturb_centered, "Perturbation-Centered Analysis (Raw FGSEA)", output_dir, es_col = "NES", pval_col = "padj")
+    plot_geneset_size_vs_es(fgsea_res_perturb_centered, "Perturbation-Centered Analysis (Raw FGSEA)", output_dir, es_col = "NES")
+    # Exploratory plots for combined scores
+    plot_pval_vs_es(fgsea_res_perturb_centered_combined, "Perturbation-Centered Analysis (Combined ES)", output_dir, es_col = "combined_ES", pval_col = "combined_padj")
+    plot_geneset_size_vs_es(fgsea_res_perturb_centered_combined, "Perturbation-Centered Analysis (Combined ES)", output_dir, es_col = "combined_ES")
+  } else {
+    message("Skipping new Perturbation-Centered visualizations due to no combined results.")
+  }
+}
+
+
 # Save the full results table
 if (!is.null(fgsea_res_perturb_centered)) {
-  write_tsv(fgsea_res_perturb_centered, file.path(output_dir, "fgsea_results_perturbation_centered.tsv"))
-  message("Full Perturbation-Centered fgsea results saved to: ", file.path(output_dir, "fgsea_results_perturbation_centered.tsv"))
+  data.table::fwrite(fgsea_res_perturb_centered, file.path(output_dir, "fgsea_results_perturbation_centered.csv"))
+  message("Full Perturbation-Centered fgsea results saved to: ", file.path(output_dir, "fgsea_results_perturbation_centered.csv"))
 }
 
 message("\n--- GSEA Combined Analysis Complete ---")
