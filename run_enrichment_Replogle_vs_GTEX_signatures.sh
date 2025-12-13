@@ -7,7 +7,7 @@
 #$ -P agedisease
 
 # Hard time limit (hh:mm:ss). Adjust as needed.
-#$ -l h_rt=24:00:00
+#$ -l h_rt=48:00:00
 
 # Job name
 #$ -N ReploglevsGTEX
