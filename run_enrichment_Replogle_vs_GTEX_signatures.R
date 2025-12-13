@@ -32,15 +32,15 @@ fgsea_min_size <- 15
 fgsea_max_size <- Inf
 
 # Parallelization strategy
-total_num_processes <- 7 # Each fgsea runs with 4 CPUs so with 7 workers we need 28 CPUs
+total_num_cores <- 28
 
 
 message("--- Starting GSEA Combined Analysis ---")
 message(paste0("Output directory: ", output_dir))
 message(paste0("Gene set filtering: |logFC| > ", logFC_filter_val, ", adj.pval < ", adj_pval_filter_val))
 message(paste0("fgsea parameters: minSize = ", fgsea_min_size, ", maxSize = ", fgsea_max_size, 
-               ", total_num_processes = ", total_num_processes, 
-               " (each fgsea task will run on 1 core, with up to ", total_num_processes, " tasks concurrently)"))
+               ", total_num_cores = ", total_num_cores, 
+               " (each fgsea task will run on 1 core, with up to ", total_num_cores, " tasks concurrently)"))
 message(paste0("Top N results for plotting: ", top_n_genesets_to_plot))
 
 # --- Helper Functions ---
@@ -328,7 +328,7 @@ extract_gene_sets_up_dn <- function(omic_collection, logFC_thresh, pval_thresh, 
 #' @return A combined data frame of fgsea results.
 perform_fgsea_and_combine <- function(ranked_lists, gene_sets_up, gene_sets_dn, 
                                       ranked_source_name, geneset_source_name,
-                                      total_num_processes) {
+                                      total_num_cores) {
   
   message(paste0("Initiating fgsea analysis for '", ranked_source_name, "' ranked lists vs. '", geneset_source_name, "' gene sets."))
   
@@ -366,12 +366,12 @@ perform_fgsea_and_combine <- function(ranked_lists, gene_sets_up, gene_sets_dn,
     return(NULL)
   }
   
-  message(paste0("  Prepared ", length(fgsea_tasks), " individual fgsea tasks. Running with ", total_num_processes, " concurrent workers."))
+  message(paste0("  Prepared ", length(fgsea_tasks), " individual fgsea tasks. Running with ", total_num_cores, " concurrent workers."))
   
   # Set up BiocParallel backend for running ALL fgsea tasks concurrently.
   # Each worker will perform one complete fgsea call.
   # We set progressbar=FALSE globally to prevent verbose output.
-  bpparam_global <- BiocParallel::MulticoreParam(workers = total_num_processes)
+  bpparam_global <- BiocParallel::MulticoreParam(workers = total_num_cores)
   register(bpparam_global, default = TRUE) # Register for use by bplapply
   
   # Execute all fgsea tasks in parallel
@@ -380,7 +380,7 @@ perform_fgsea_and_combine <- function(ranked_lists, gene_sets_up, gene_sets_dn,
                  stats    = task$stats,
                  minSize  = fgsea_min_size,
                  maxSize  = fgsea_max_size,
-                 nproc    = 4)
+                 nproc    = 1)
     
     # Add metadata to the results
     res$ranked_list_name <- task$ranked_list_name
@@ -684,7 +684,7 @@ fgsea_res_age_centered <- perform_fgsea_and_combine(
   gene_sets_dn = perturb_gene_sets_up_dn$dn_gene_sets,
   ranked_source_name = "Aging",
   geneset_source_name = "Perturbation",
-  total_num_processes = total_num_processes
+  total_num_cores = total_num_cores
 )
 
 # Visualize results
@@ -722,7 +722,7 @@ fgsea_res_perturb_centered <- perform_fgsea_and_combine(
   gene_sets_dn = age_gene_sets_up_dn$dn_gene_sets,
   ranked_source_name = "Perturbation",
   geneset_source_name = "Aging",
-  total_num_processes = total_num_processes
+  total_num_cores = total_num_cores
 )
 
 # Visualize results

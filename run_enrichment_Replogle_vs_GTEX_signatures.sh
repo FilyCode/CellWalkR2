@@ -22,7 +22,7 @@
 #$ -M phitro@bu.edu
 
 # Request cores.
-#$ -pe omp 12
+#$ -pe omp 28
 
 # Request total memory for the job.
 #$ -l mem_total=120G
