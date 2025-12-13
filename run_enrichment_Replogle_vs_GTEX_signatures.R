@@ -377,8 +377,8 @@ perform_fgsea_and_combine <- function(ranked_lists, gene_sets_up, gene_sets_dn,
   on.exit(BiocParallel::register(old_bpparam_registered, default = TRUE), add = TRUE)
   
   # Register MulticoreParam for bplapply itself to use multiple cores for multiple tasks.
-  # The progressbar=FALSE here controls the bplapply progress, not fgsea's internal progress.
-  BiocParallel::register(BiocParallel::MulticoreParam(workers = total_num_cores, progressbar = FALSE), default = TRUE)
+  # Change progressbar=FALSE to progressbar=TRUE here to enable the overall progress bar.
+  BiocParallel::register(BiocParallel::MulticoreParam(workers = total_num_cores, progressbar = TRUE), default = TRUE)
   
   # Execute all fgsea tasks in parallel
   all_fgsea_results <- BiocParallel::bplapply(fgsea_tasks, function(task) {
@@ -690,23 +690,29 @@ calculate_combined_scores <- function(fgsea_df, analysis_name) {
     stop(paste("Missing required columns for combined score calculation:", setdiff(required_cols, colnames(fgsea_df))))
   }
   
-  # Add values_fill = NA_real_ to pivot_wider to ensure that ES_UP/ES_DN and padj_UP/padj_DN
-  # columns are created and filled with NA if one direction is entirely missing for a given pathway.
   combined_df <- fgsea_df %>%
     dplyr::select(pathway, ranked_list_name, geneset_direction, ES, padj, geneset_source_name, ranked_source_name) %>%
-    # Ensure 'geneset_direction' is a factor with all expected levels ("UP", "DN")
-    # This guarantees that pivot_wider creates columns for both, even if one is absent for certain groups.
     dplyr::mutate(geneset_direction = factor(geneset_direction, levels = c("UP", "DN"))) %>% 
     tidyr::pivot_wider(
+      id_cols = c(pathway, ranked_list_name, geneset_source_name, ranked_source_name), 
       names_from = geneset_direction,
       values_from = c(ES, padj),
       names_glue = "{.value}_{.name}",
       values_fill = NA_real_ 
     ) %>%
+    # Use rename_with to conditionally rename if the double prefix exists
+    dplyr::rename_with(
+      .fn = ~gsub("ES_ES_", "ES_", .x), # Function to replace "ES_ES_" with "ES_"
+      .cols = dplyr::starts_with("ES_ES_") # Apply only to columns starting with "ES_ES_"
+    ) %>%
+    dplyr::rename_with(
+      .fn = ~gsub("padj_padj_", "padj_", .x), # Function to replace "padj_padj_" with "padj_"
+      .cols = dplyr::starts_with("padj_padj_") # Apply only to columns starting with "padj_padj_"
+    ) %>%
+    # Now proceed with your mutate and select as originally intended, using ES_UP, etc.
     dplyr::mutate(
-      # Use if_else for type safety
       ES_UP = if_else(is.na(ES_UP), 0, ES_UP), 
-      ES_DN = if_else(is.na(ES_DN), 0, ES_DN), 
+      ES_DN = if_else(is.na(ES_DN), 0, ES_DN),  
       
       combined_ES = ES_UP - ES_DN,
       
@@ -730,24 +736,29 @@ calculate_combined_scores <- function(fgsea_df, analysis_name) {
     ) %>%
     dplyr::select(
       pathway, ranked_list_name, geneset_source_name, ranked_source_name,
+      # Now these are the correctly named columns
       ES_UP, padj_UP, ES_DN, padj_DN, combined_ES, combined_padj
     )
   
   # Add the 'size' from the original df (assuming size is the same for UP/DN of the same pathway)
   size_info <- fgsea_df %>%
     dplyr::select(pathway, geneset_direction, size) %>%
-    tidyr::pivot_wider(names_from = geneset_direction, values_from = size, names_prefix = "size_") %>%
+    tidyr::pivot_wider(
+      names_from = geneset_direction,
+      values_from = size,
+      names_prefix = "size_",
+      values_fn = max 
+    ) %>%
     # Use if_else for type safety
     dplyr::mutate(size = if_else(!is.na(size_UP), size_UP, size_DN)) %>% # Take UP size if present, else DN
     dplyr::select(pathway, size) %>%
-    dplyr::distinct()
+    dplyr::distinct() # distinct here might be redundant if values_fn resolves all, but doesn't hurt.
   
   combined_df <- combined_df %>%
     dplyr::left_join(size_info, by = "pathway") %>%
     # Use if_else for type safety
     dplyr::mutate(size = if_else(is.na(size), 0, size)) # Fill NA sizes with 0 if pathway not found
   
-  # Only keep rows where p-value could be combined or was single.
   combined_df <- combined_df %>% drop_na(combined_padj) 
   
   message(paste0("Combined scores calculated for '", analysis_name, "'. Total combined results: ", nrow(combined_df), " rows."))
@@ -1118,14 +1129,10 @@ plot_clustered_heatmap(fgsea_res_age_centered_up_gs, "Age-Centered Analysis", "P
 fgsea_res_age_centered_dn_gs <- fgsea_res_age_centered %>% filter(geneset_direction == "DN")
 plot_clustered_heatmap(fgsea_res_age_centered_dn_gs, "Age-Centered Analysis", "Perturbation", "DN", output_dir)
 
-message(paste0("fgsea_res_age_centered: ",!is.null(fgsea_res_age_centered)))
 
 if (!is.null(fgsea_res_age_centered)) {
   # Calculate combined scores
   fgsea_res_age_centered_combined <- calculate_combined_scores(fgsea_res_age_centered, "Age-Centered Analysis")
-  
-  message(paste0("fgsea_res_age_centered_combined: ", !is.null(fgsea_res_age_centered_combined), ", ", nrow(fgsea_res_age_centered_combined)))
-  
   
   if (!is.null(fgsea_res_age_centered_combined) && nrow(fgsea_res_age_centered_combined) > 0) {
     message("\n--- Generating NEW Age-Centered Visualizations ---")
