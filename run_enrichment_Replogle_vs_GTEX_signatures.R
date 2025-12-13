@@ -1,14 +1,16 @@
-library(tidyverse)
-library(fgsea)
-library(OmicSignature)
-library(ggplot2)
-library(pheatmap)
-library(ComplexHeatmap)
-library(circlize)
-library(cowplot)
-library(BiocParallel)
-library(purrr)
-library(data.table)
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(fgsea)
+  library(OmicSignature)
+  library(ggplot2)
+  library(pheatmap)
+  library(ComplexHeatmap)
+  library(circlize)
+  library(cowplot)
+  library(BiocParallel)
+  library(purrr)
+  library(data.table)
+})
 
 # --- Configuration ---
 # File paths
@@ -315,6 +317,7 @@ extract_gene_sets_up_dn <- function(omic_collection, logFC_thresh, pval_thresh, 
 }
 
 
+
 #' Performs fgsea analysis for a set of ranked lists against up/down gene sets and combines the results.
 #'
 #' @param ranked_lists A named list of ranked gene score vectors.
@@ -327,7 +330,7 @@ extract_gene_sets_up_dn <- function(omic_collection, logFC_thresh, pval_thresh, 
 #' @return A combined data frame of fgsea results.
 perform_fgsea_and_combine <- function(ranked_lists, gene_sets_up, gene_sets_dn, 
                                       ranked_source_name, geneset_source_name,
-                                      total_num_cores) {
+                                      total_num_cores, fgsea_min_size, fgsea_max_size) {
   
   message(paste0("Initiating fgsea analysis for '", ranked_source_name, "' ranked lists vs. '", geneset_source_name, "' gene sets."))
   
@@ -342,7 +345,8 @@ perform_fgsea_and_combine <- function(ranked_lists, gene_sets_up, gene_sets_dn,
         stats = ranked_lists[[rl_name]],
         ranked_list_name = rl_name,
         geneset_source_name = geneset_source_name,
-        geneset_direction = "UP"
+        geneset_direction = "UP",
+        ranked_source_name = ranked_source_name
       )
     }
   }
@@ -355,7 +359,8 @@ perform_fgsea_and_combine <- function(ranked_lists, gene_sets_up, gene_sets_dn,
         stats = ranked_lists[[rl_name]],
         ranked_list_name = rl_name,
         geneset_source_name = geneset_source_name,
-        geneset_direction = "DN"
+        geneset_direction = "DN",
+        ranked_source_name = ranked_source_name
       )
     }
   }
@@ -370,7 +375,9 @@ perform_fgsea_and_combine <- function(ranked_lists, gene_sets_up, gene_sets_dn,
   # Set up BiocParallel backend for running ALL fgsea tasks concurrently.
   # Each worker will perform one complete fgsea call.
   # We set progressbar=FALSE globally to prevent verbose output.
-  bpparam_global <- BiocParallel::MulticoreParam(workers = total_num_cores)
+  bpparam_global <- BiocParallel::MulticoreParam(workers = total_num_cores, progressbar=FALSE)
+  bpprogressbar(bpparam_global) <- FALSE
+  bpparam_global <- SnowParam(progressbar = FALSE)
   register(bpparam_global, default = TRUE) # Register for use by bplapply
   
   # Execute all fgsea tasks in parallel
@@ -381,10 +388,19 @@ perform_fgsea_and_combine <- function(ranked_lists, gene_sets_up, gene_sets_dn,
                  maxSize  = fgsea_max_size,
                  nproc    = 1)
     
-    # Add metadata to the results
-    res$ranked_list_name <- task$ranked_list_name
-    res$geneset_source_name <- task$geneset_source_name
-    res$geneset_direction <- task$geneset_direction
+    # Ensure 'res' is a data.table to use set()
+    # This check is defensive; fgsea generally returns data.table
+    if (!inherits(res, "data.table")) {
+      res <- data.table(res)
+    }
+    
+    # Add metadata to the results using data.table::set
+    # This is a more explicit and robust way to add columns to a data.table
+    data.table::set(res, j = "ranked_list_name", value = task$ranked_list_name)
+    data.table::set(res, j = "geneset_source_name", value = task$geneset_source_name)
+    data.table::set(res, j = "geneset_direction", value = task$geneset_direction)
+    data.table::set(res, j = "ranked_source_name", value = task$ranked_source_name) # Ensure this column is explicitly added
+    
     return(res)
   }, BPPARAM = bpparam_global) # Use the global bpparam for this bplapply
   
@@ -761,7 +777,7 @@ plot_combined_fgsea_dotplot <- function(combined_fgsea_df, analysis_title_prefix
   }
   
   ranked_list_label <- unique(all_significant_combined_results$ranked_source_name)[1]
-  if (is.is.null(ranked_list_label) || is.na(ranked_list_label)) {
+  if (is.null(ranked_list_label) || is.na(ranked_list_label)) {
     ranked_list_label <- "Ranked List" 
   } else {
     ranked_list_label <- paste0(ranked_list_label, " Ranked List")
@@ -1079,7 +1095,9 @@ fgsea_res_age_centered <- perform_fgsea_and_combine(
   gene_sets_dn = perturb_gene_sets_up_dn$dn_gene_sets,
   ranked_source_name = "Aging",
   geneset_source_name = "Perturbation",
-  total_num_cores = total_num_cores
+  total_num_cores = total_num_cores,
+  fgsea_min_size = fgsea_min_size,
+  fgsea_max_size = fgsea_max_size
 )
 
 # Visualize results
@@ -1092,10 +1110,14 @@ plot_clustered_heatmap(fgsea_res_age_centered_up_gs, "Age-Centered Analysis", "P
 fgsea_res_age_centered_dn_gs <- fgsea_res_age_centered %>% filter(geneset_direction == "DN")
 plot_clustered_heatmap(fgsea_res_age_centered_dn_gs, "Age-Centered Analysis", "Perturbation", "DN", output_dir)
 
+message(paste0("fgsea_res_age_centered: ",!is.null(fgsea_res_age_centered)))
 
 if (!is.null(fgsea_res_age_centered)) {
   # Calculate combined scores
   fgsea_res_age_centered_combined <- calculate_combined_scores(fgsea_res_age_centered, "Age-Centered Analysis")
+  
+  message(paste0("fgsea_res_age_centered_combined: ", !is.null(fgsea_res_age_centered_combined), ", ", nrow(fgsea_res_age_centered_combined)))
+  
   
   if (!is.null(fgsea_res_age_centered_combined) && nrow(fgsea_res_age_centered_combined) > 0) {
     message("\n--- Generating NEW Age-Centered Visualizations ---")
@@ -1143,7 +1165,9 @@ fgsea_res_perturb_centered <- perform_fgsea_and_combine(
   gene_sets_dn = age_gene_sets_up_dn$dn_gene_sets,
   ranked_source_name = "Perturbation",
   geneset_source_name = "Aging",
-  total_num_cores = total_num_cores
+  total_num_cores = total_num_cores,
+  fgsea_min_size = fgsea_min_size,
+  fgsea_max_size = fgsea_max_size
 )
 
 # Visualize results
