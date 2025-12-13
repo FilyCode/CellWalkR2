@@ -372,21 +372,23 @@ perform_fgsea_and_combine <- function(ranked_lists, gene_sets_up, gene_sets_dn,
   
   message(paste0("  Prepared ", length(fgsea_tasks), " individual fgsea tasks. Running with ", total_num_cores, " concurrent workers."))
   
-  # Set up BiocParallel backend for running ALL fgsea tasks concurrently.
-  # Each worker will perform one complete fgsea call.
-  # We set progressbar=FALSE globally to prevent verbose output.
-  bpparam_global <- BiocParallel::MulticoreParam(workers = total_num_cores, progressbar=FALSE)
-  bpprogressbar(bpparam_global) <- FALSE
-  bpparam_global <- SnowParam(progressbar = FALSE)
-  register(bpparam_global, default = TRUE) # Register for use by bplapply
+  # Store the current default BPPARAM to restore it later to avoid side effects
+  old_bpparam_registered <- BiocParallel::bpparam()
+  on.exit(BiocParallel::register(old_bpparam_registered, default = TRUE), add = TRUE)
+  
+  # Register MulticoreParam for bplapply itself to use multiple cores for multiple tasks.
+  # The progressbar=FALSE here controls the bplapply progress, not fgsea's internal progress.
+  BiocParallel::register(BiocParallel::MulticoreParam(workers = total_num_cores, progressbar = FALSE), default = TRUE)
   
   # Execute all fgsea tasks in parallel
-  all_fgsea_results <- bplapply(fgsea_tasks, function(task) {
+  all_fgsea_results <- BiocParallel::bplapply(fgsea_tasks, function(task) {
+    # Each fgsea call runs serially (nproc = 1) and explicitly disables its own progress bar
     res <- fgsea(pathways = task$pathways,
                  stats    = task$stats,
                  minSize  = fgsea_min_size,
                  maxSize  = fgsea_max_size,
-                 nproc    = 1)
+                 nproc    = 1, 
+                 BPPARAM  = BiocParallel::SerialParam(progressbar = FALSE)) # Explicitly disable fgsea's internal progressbar
     
     # Ensure 'res' is a data.table to use set()
     # This check is defensive; fgsea generally returns data.table
@@ -402,7 +404,7 @@ perform_fgsea_and_combine <- function(ranked_lists, gene_sets_up, gene_sets_dn,
     data.table::set(res, j = "ranked_source_name", value = task$ranked_source_name) # Ensure this column is explicitly added
     
     return(res)
-  }, BPPARAM = bpparam_global) # Use the global bpparam for this bplapply
+  }, BPPARAM = BiocParallel::bpparam()) # Use the global bpparam for this bplapply
   
   # Filter out NULL results (if any failed) and combine
   combined_results_df <- dplyr::bind_rows(all_fgsea_results[!sapply(all_fgsea_results, is.null)])
@@ -688,16 +690,23 @@ calculate_combined_scores <- function(fgsea_df, analysis_name) {
     stop(paste("Missing required columns for combined score calculation:", setdiff(required_cols, colnames(fgsea_df))))
   }
   
+  # Add values_fill = NA_real_ to pivot_wider to ensure that ES_UP/ES_DN and padj_UP/padj_DN
+  # columns are created and filled with NA if one direction is entirely missing for a given pathway.
   combined_df <- fgsea_df %>%
     dplyr::select(pathway, ranked_list_name, geneset_direction, ES, padj, geneset_source_name, ranked_source_name) %>%
+    # Ensure 'geneset_direction' is a factor with all expected levels ("UP", "DN")
+    # This guarantees that pivot_wider creates columns for both, even if one is absent for certain groups.
+    dplyr::mutate(geneset_direction = factor(geneset_direction, levels = c("UP", "DN"))) %>% 
     tidyr::pivot_wider(
       names_from = geneset_direction,
       values_from = c(ES, padj),
-      names_glue = "{.value}_{.name}"
+      names_glue = "{.value}_{.name}",
+      values_fill = NA_real_ 
     ) %>%
     dplyr::mutate(
-      ES_UP = ifelse(is.na(ES_UP), 0, ES_UP), # Treat missing ES as 0 for combination
-      ES_DN = ifelse(is.na(ES_DN), 0, ES_DN),
+      # Use if_else for type safety
+      ES_UP = if_else(is.na(ES_UP), 0, ES_UP), 
+      ES_DN = if_else(is.na(ES_DN), 0, ES_DN), 
       
       combined_ES = ES_UP - ES_DN,
       
@@ -709,9 +718,8 @@ calculate_combined_scores <- function(fgsea_df, analysis_name) {
         if (length(p_values_to_combine) == 0) {
           return(NA_real_)
         } else if (length(p_values_to_combine) == 1) {
-          return(p_values_to_combine[1]) # If only one, use that p-value
+          return(p_values_to_combine[1]) 
         } else {
-          # Fisher's method: Ensure p-values are not exactly 0 to avoid -Inf from log, clamp at a small value
           p_values_to_combine <- pmax(p_values_to_combine, .Machine$double.xmin)
           
           chisq <- -2 * sum(log(p_values_to_combine))
@@ -729,13 +737,15 @@ calculate_combined_scores <- function(fgsea_df, analysis_name) {
   size_info <- fgsea_df %>%
     dplyr::select(pathway, geneset_direction, size) %>%
     tidyr::pivot_wider(names_from = geneset_direction, values_from = size, names_prefix = "size_") %>%
-    dplyr::mutate(size = ifelse(!is.na(size_UP), size_UP, size_DN)) %>% # Take UP size if present, else DN
+    # Use if_else for type safety
+    dplyr::mutate(size = if_else(!is.na(size_UP), size_UP, size_DN)) %>% # Take UP size if present, else DN
     dplyr::select(pathway, size) %>%
     dplyr::distinct()
   
   combined_df <- combined_df %>%
     dplyr::left_join(size_info, by = "pathway") %>%
-    dplyr::mutate(size = ifelse(is.na(size), 0, size)) # Fill NA sizes with 0 if pathway not found
+    # Use if_else for type safety
+    dplyr::mutate(size = if_else(is.na(size), 0, size)) # Fill NA sizes with 0 if pathway not found
   
   # Only keep rows where p-value could be combined or was single.
   combined_df <- combined_df %>% drop_na(combined_padj) 
@@ -1067,10 +1077,8 @@ message(paste0("Loaded gene map from: ", gene_map_file))
 
 # Pre-process gene_map once
 message("Pre-processing gene_map for faster lookups (applying simplify_entry once)...")
-simplified_gene_map_values <- sapply(gene_map, simplify_entry, USE.NAMES = FALSE)
-# Ensure original names (probe_ids) are kept for lookup
-names(simplified_gene_map_values) <- names(gene_map) 
-gene_map_simplified <- simplified_gene_map_values
+gene_map_simplified <- sapply(gene_map, simplify_entry, USE.NAMES = FALSE)
+names(gene_map_simplified) <- names(gene_map) 
 message("Gene map pre-processing complete.")
 
 # 2. Age-Centered Analysis
