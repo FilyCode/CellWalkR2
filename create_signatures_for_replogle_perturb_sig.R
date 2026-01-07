@@ -183,6 +183,11 @@ create_perturb_omic_signature <- function(
       ensembl_id = gene_symbol_to_ensembl_map[gene_symbol],
       probe_id = ifelse(is.na(ensembl_id) | ensembl_id == "", gene_symbol, ensembl_id),
       feature_name = ifelse(is.na(ensembl_id) | ensembl_id == "", gene_symbol, ensembl_id)
+    ) %>% # Ensure character type for probe_id and feature_name
+    dplyr::mutate(
+      probe_id = as.character(probe_id),
+      feature_name = as.character(feature_name),
+      gene_symbol = as.character(gene_symbol)
     )
   
   # Remove rows that might have originated from unmapped or empty gene symbols if any.
