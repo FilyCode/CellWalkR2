@@ -12,11 +12,31 @@ library(tidyverse)    # For data manipulation
 library(OmicSignature) # To work with OmicSignature objects and collections
 library(biomaRt)      # For gene ID mapping
 # For faster gene ID mapping, use a local annotation database.
-# if (!requireNamespace("BiocManager", quietly = TRUE))
-#    install.packages("BiocManager")
-# BiocManager::install("org.Hs.eg.db")
-library(org.Hs.eg.db) # Local Human Gene annotation database
+if (!requireNamespace("BiocManager", quietly=TRUE)) install.packages("BiocManager")
 
+# Create local gene annotation mapping
+# BiocManager::install("org.Hs.eg.db")
+# BiocManager::install("ensembldb")
+library(org.Hs.eg.db) # Local Human Gene annotation database
+library(ensembldb)
+
+gtf <- "/restricted/projectnb/agedisease/projects/challenge2025/data/Homo_sapiens.GRCh38.114.gtf"
+outdb <- "/restricted/projectnb/agedisease/projects/challenge2025/data/EnsDb.Hsapiens.GRCh38.114.sqlite"
+DBfile <- ensembldb::ensDbFromGtf(
+  gtf = gtf,
+  outfile = outdb,
+  path = dirname(outdb),
+  organism = "Homo sapiens",
+  genomeVersion = "GRCh38",
+  version = 114
+)
+
+# Load the local SQLite EnsDb file to annotate the gene symbols
+edb <- EnsDb(outdb)
+metadata = metadata(edb)
+message("Created EnsDb with organism: ", organism(edb),
+        "; genomeVersion: ", metadata[metadata$name == "genome_build","value"],
+        "; ensemblVersion: ", ensemblVersion(edb))
 
 # --- 2. Define Paths and Parameters ---
 data_input_path <- file.path("/restricted/projectnb/agedisease/projects/challenge2025/data/perturbational_sigs/replogle_2022")
@@ -72,86 +92,68 @@ if (file.exists(gene_mapping_cache_file)) {
 
 
 if (length(symbols_to_map) > 0) {
-  # --- Step 1: Map using org.Hs.eg.db (local and fast) ---
+  # Step 1: Map using org.Hs.eg.db (local and fast)
   message(paste0("  Attempting to map ", length(symbols_to_map), " symbols using org.Hs.eg.db..."))
   ensembl_ids_from_db <- AnnotationDbi::mapIds(
     org.Hs.eg.db,
     keys = symbols_to_map,
     column = "ENSEMBL",
     keytype = "SYMBOL",
-    multiVals = "first" # Take the first Ensembl ID if a symbol maps to multiple
+    multiVals = "first"
   )
-  
-  # Remove NAs from the result (symbols not found in org.Hs.eg.db)
   ensembl_ids_from_db <- ensembl_ids_from_db[!is.na(ensembl_ids_from_db)]
-  
-  # Update the master mapping
   if (is.null(gene_symbol_to_ensembl)) {
     gene_symbol_to_ensembl <- ensembl_ids_from_db
   } else {
     gene_symbol_to_ensembl <- c(gene_symbol_to_ensembl, ensembl_ids_from_db)
   }
-  
   mapped_by_db_count <- length(ensembl_ids_from_db)
-  symbols_remaining_for_biomart <- setdiff(symbols_to_map, names(ensembl_ids_from_db))
   
-  message(paste0("  Mapped ", mapped_by_db_count, " symbols using org.Hs.eg.db."))
+  # Resolve aliases/deprecated symbols to boost mapping
+  symbols_remaining <- setdiff(symbols_to_map, names(ensembl_ids_from_db))
+  message(paste0("  Mapped ", mapped_by_db_count, " symbols using org.Hs.eg.db. ",
+                 "Resolving aliases for ", length(symbols_remaining), " remaining..."))
+  alias2symbol <- AnnotationDbi::mapIds(
+    org.Hs.eg.db,
+    keys = symbols_remaining,
+    keytype = "ALIAS",
+    column = "SYMBOL",
+    multiVals = "first"
+  )
+  symbols_resolved <- ifelse(!is.na(alias2symbol), alias2symbol, symbols_remaining)
   
-  # --- Step 2: Fallback to biomaRt for any remaining unmapped symbols ---
-  if (length(symbols_remaining_for_biomart) > 0) {
-    message(paste0("  Attempting to map ", length(symbols_remaining_for_biomart), " remaining symbols using biomaRt (EnsemblIDs v114)..."))
-    
-    ensembl_ids_from_biomart <- NULL
-    
-    # Try different strategies for biomaRt connection
-    biomart_attempts <- list(
-      list(biomart = "genes", dataset = "hsapiens_gene_ensembl", version = 114, host = "https://www.ensembl.org", message = "  Attempt 1: Default Ensembl mirror, v114."),
-      list(biomart = "genes", dataset = "hsapiens_gene_ensembl", host = "https://useast.ensembl.org", version = 114, message = "  Attempt 2: US East mirror, v114."),
-      list(biomart = "genes", dataset = "hsapiens_gene_ensembl", host = "https://asia.ensembl.org", version = 114, message = "  Attempt 3: Asia mirror, v114.")
+  # Map remaining using EnsDb v114 offline
+  if (length(symbols_resolved) > 0) {
+    message(paste0("  Attempting to map ", length(symbols_resolved), " symbols using EnsDb.Hsapiens.v114..."))
+    res <- ensembldb::select(
+      edb,
+      keys = symbols_resolved,
+      keytype = "SYMBOL",
+      columns = c("GENEID", "SYMBOL")
     )
+    # Build named vector SYMBOL -> GENEID
+    ensdb_map <- setNames(res$GENEID, res$SYMBOL)
+    ensdb_map <- ensdb_map[!is.na(ensdb_map) & ensdb_map != ""]
     
-    for (attempt in biomart_attempts) {
-      message(attempt$message)
-      current_ensembl_mart <- NULL
-      tryCatch({
-        # Attempt to connect to the BioMart
-        current_ensembl_mart <- do.call(useEnsembl, attempt[names(attempt) != "message"])
-        
-        # If connection is successful, retrieve mapping
-        gene_id_map_df_biomart <- getBM(
-          attributes = c("hgnc_symbol", "ensembl_gene_id"),
-          filters = "hgnc_symbol",
-          values = symbols_remaining_for_biomart,
-          mart = current_ensembl_mart
-        )
-        ensembl_ids_from_biomart <- setNames(gene_id_map_df_biomart$ensembl_gene_id, gene_id_map_df_biomart$hgnc_symbol)
-        
-        message(paste0("  Successfully mapped ", length(ensembl_ids_from_biomart), " symbols using biomaRt in this attempt."))
-        break # Exit loop if successful
-        
-      }, error = function(e) {
-        message(paste0("  biomaRt connection/query failed for this attempt: ", e$message))
-        ensembl_ids_from_biomart <<- NULL # Reset for next attempt
-      })
-      if (!is.null(ensembl_ids_from_biomart)) break # Exit outer loop if mapping was successful
-    }
+    # Prefer mappings for symbols that were originally requested
+    ensdb_map <- ensdb_map[names(ensdb_map) %in% symbols_remaining]
     
-    
-    if (!is.null(ensembl_ids_from_biomart)) {
-      # Update the master mapping with results from biomaRt
-      gene_symbol_to_ensembl <- c(gene_symbol_to_ensembl, ensembl_ids_from_biomart)
-    } else {
-      message("  All biomaRt attempts failed. Some symbols remain unmapped to Ensembl IDs.")
-    }
+    # Merge and deduplicate (prefer existing org.Hs.eg.db mappings)
+    gene_symbol_to_ensembl <- c(gene_symbol_to_ensembl, ensdb_map)
+    gene_symbol_to_ensembl <- tapply(gene_symbol_to_ensembl, names(gene_symbol_to_ensembl), `[`, 1)
   }
   
-  # Save the updated complete mapping for future runs
+  # Strip version suffix from Ensembl IDs (e.g., ENSG... .xx)
+  strip_ver <- function(x) sub("\\.\\d+$","", x)
+  gene_symbol_to_ensembl <- strip_ver(gene_symbol_to_ensembl)
+  
+  # Save cache
   saveRDS(gene_symbol_to_ensembl, file = gene_mapping_cache_file)
   message(paste0("  Saved updated gene mapping cache to '", gene_mapping_cache_file, "'."))
-  
 } else {
   message("  All gene symbols already mapped and present in cache.")
 }
+
 
 final_mapped_count <- length(unique(names(gene_symbol_to_ensembl)))
 unmapped_overall_count <- length(all_gene_symbols) - final_mapped_count
