@@ -169,31 +169,31 @@ extract_gene_sets_up_dn <- function(omic_collection, logFC_thresh, pval_thresh, 
   possible_group_label_cols <- c("group_label") # Standard group_label column name
   possible_pval_cols <- c("adj.pval", "adj_p", "adj_pval", "adj_p_val", "pval_adj") 
   
+  # Helper function to get a valid dataframe and standardize p-value column
+  # A dataframe is considered valid if it has probe_id, score, and any of the possible p-value columns.
+  get_valid_df <- function(candidate_df, source_str) {
+    if (!is.null(candidate_df)) {
+      current_cols <- names(candidate_df)
+      has_basic_cols <- all(c(required_id_col, required_score_col) %in% current_cols)
+      has_pval_col <- any(possible_pval_cols %in% current_cols)
+      
+      if (has_basic_cols && has_pval_col) {
+        # Standardize p-value column name to 'adj.pval'
+        pval_col_name <- intersect(possible_pval_cols, current_cols)[1]
+        if (pval_col_name != "adj.pval") {
+          candidate_df <- candidate_df %>% dplyr::rename(adj.pval = !!sym(pval_col_name))
+        }
+        return(candidate_df)
+      }
+    }
+    return(NULL)
+  }
+  
   for (sig_name in names(omic_collection$OmicSigList)) {
     sig_obj <- omic_collection$OmicSigList[[sig_name]]
     
     df_to_process <- NULL
     used_source_name <- "none" 
-    
-    # Helper function to get a valid dataframe and standardize p-value column
-    # A dataframe is considered valid if it has probe_id, score, and any of the possible p-value columns.
-    get_valid_df <- function(candidate_df, source_str) {
-      if (!is.null(candidate_df)) {
-        current_cols <- names(candidate_df)
-        has_basic_cols <- all(c(required_id_col, required_score_col) %in% current_cols)
-        has_pval_col <- any(possible_pval_cols %in% current_cols)
-        
-        if (has_basic_cols && has_pval_col) {
-          # Standardize p-value column name to 'adj.pval'
-          pval_col_name <- intersect(possible_pval_cols, current_cols)[1]
-          if (pval_col_name != "adj.pval") {
-            candidate_df <- candidate_df %>% dplyr::rename(adj.pval = !!sym(pval_col_name))
-          }
-          return(candidate_df)
-        }
-      }
-      return(NULL)
-    }
     
     
     # Attempt to get dataframe, preferring 'difexp' over 'signature'
@@ -286,9 +286,34 @@ extract_gene_sets_up_dn <- function(omic_collection, logFC_thresh, pval_thresh, 
         dplyr::slice_head(n = geneset_top_n) # Take top N genes
     } 
     
-    # Use the pre-simplified gene_map for direct lookup
-    significant_genes$gene_name <- simplified_gene_map[significant_genes$probe_id]
-    significant_genes <- significant_genes %>% dplyr::filter(!is.na(gene_name)) %>% dplyr::distinct(gene_name, .keep_all = TRUE)
+    # Use the pre-simplified gene_map for direct lookup if we have ENSG* names and not gene symbols, otherwise just use probe_id
+    # preserve original order
+    significant_genes$orig_row <- seq_len(nrow(significant_genes))
+    
+    # detect ENSG probe_ids
+    is_ensg <- grepl("^ENSG", significant_genes$probe_id)
+    
+    # vectorized lookup for ENSG rows (fast named-vector indexing)
+    gene_name <- rep(NA_character_, nrow(significant_genes))
+    gene_name[is_ensg] <- simplified_gene_map[significant_genes$probe_id[is_ensg]]
+    
+    # fallback: use probe_id when mapping failed or for non-ENSG rows
+    na_idx <- is.na(gene_name)
+    gene_name[na_idx] <- significant_genes$probe_id[na_idx]
+    
+    # assign gene_name
+    significant_genes$gene_name <- gene_name
+    
+    # deduplicate only among successfully mapped ENSG rows (keep first occurrence)
+    mapped_idx <- is_ensg & significant_genes$gene_name != significant_genes$probe_id
+    keep <- rep(TRUE, nrow(significant_genes))
+    dup_pos <- which(mapped_idx)[duplicated(significant_genes$gene_name[mapped_idx])]
+    keep[dup_pos] <- FALSE
+    
+    # filter and restore original order; drop helper column
+    significant_genes <- significant_genes[keep, , drop = FALSE]
+    significant_genes <- significant_genes[order(significant_genes$orig_row), ]
+    significant_genes$orig_row <- NULL
     
     if (nrow(significant_genes) == 0) {
       message(paste("No significant genes with valid gene names found for", collection_name, sig_name, "after mapping. Skipping gene set creation."))
