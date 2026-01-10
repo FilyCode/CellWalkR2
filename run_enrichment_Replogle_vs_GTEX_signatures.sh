@@ -4,7 +4,7 @@
 # SGE Job Directives
 # --------------------------------------------------------------------------------
 # Project name
-#$ -P agedisease
+#$ -P brcameta
 
 # Hard time limit (hh:mm:ss). Adjust as needed.
 #$ -l h_rt=48:00:00
