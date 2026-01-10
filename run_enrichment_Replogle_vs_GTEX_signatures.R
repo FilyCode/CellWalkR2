@@ -729,7 +729,7 @@ calculate_combined_scores <- function(fgsea_df, analysis_name) {
   
   message(paste0("Calculating combined NES/ES and p-values for '", analysis_name, "'...")) 
   
-  required_cols <- c("pathway", "ranked_list_name", "geneset_direction", "NES", "ES", "padj", "geneset_source_name", "ranked_source_name")
+  required_cols <- c("pathway", "ranked_list_name", "geneset_direction", "NES", "ES", "padj", "size", "geneset_source_name", "ranked_source_name")
   if (!all(required_cols %in% colnames(fgsea_df))) {
     stop(paste("Missing required columns for combined score calculation:", setdiff(required_cols, colnames(fgsea_df))))
   }
@@ -740,33 +740,29 @@ calculate_combined_scores <- function(fgsea_df, analysis_name) {
     tidyr::pivot_wider(
       id_cols = c(pathway, ranked_list_name, geneset_source_name, ranked_source_name), 
       names_from = geneset_direction,
-      values_from = c(NES, ES, padj),
+      values_from = c(NES, ES, padj, size),
       names_glue = "{.value}_{.name}",
       values_fill = NA_real_ 
     ) %>%
-    # Use rename_with to conditionally rename if the double prefix exists
-    dplyr::rename_with(
-      .fn = ~gsub("NES_NES_", "NES_", .x), 
-      .cols = dplyr::starts_with("NES_NES_") 
-    ) %>%
-    dplyr::rename_with(
-      .fn = ~gsub("ES_ES_", "ES_", .x), # Function to replace "ES_ES_" with "ES_"
-      .cols = dplyr::starts_with("ES_ES_") # Apply only to columns starting with "ES_ES_"
-    ) %>%
-    dplyr::rename_with(
-      .fn = ~gsub("padj_padj_", "padj_", .x), # Function to replace "padj_padj_" with "padj_"
-      .cols = dplyr::starts_with("padj_padj_") # Apply only to columns starting with "padj_padj_"
-    ) %>%
-    # Now proceed with your mutate and select as originally intended, using ES_UP, etc.
+    # Use rename_with to conditionally rename if the double prefix exists (e.g., NES_NES_UP -> NES_UP)
+    dplyr::rename_with(.fn = ~gsub("NES_NES_", "NES_", .x), .cols = dplyr::starts_with("NES_NES_")) %>%
+    dplyr::rename_with(.fn = ~gsub("ES_ES_", "ES_", .x), .cols = dplyr::starts_with("ES_ES_")) %>%
+    dplyr::rename_with(.fn = ~gsub("padj_padj_", "padj_", .x), .cols = dplyr::starts_with("padj_padj_")) %>%
+    dplyr::rename_with(.fn = ~gsub("size_size_", "size_", .x), .cols = dplyr::starts_with("size_size_")) %>%
     dplyr::mutate(
-      # Fill NAs for UP/DN NES and ES with 0 for calculation
-      NES_UP = if_else(is.na(NES_UP), 0, NES_UP), 
-      NES_DN = if_else(is.na(NES_DN), 0, NES_DN),  
-      ES_UP = if_else(is.na(ES_UP), 0, ES_UP), 
-      ES_DN = if_else(is.na(ES_DN), 0, ES_DN),   
+      # Fill NAs for UP/DN NES, ES, and Size with 0 for calculation to allow subtraction
+      NES_UP = if_else(is.na(NES_UP), 0, NES_UP),
+      NES_DN = if_else(is.na(NES_DN), 0, NES_DN),
+      ES_UP = if_else(is.na(ES_UP), 0, ES_UP),
+      ES_DN = if_else(is.na(ES_DN), 0, ES_DN),
+      size_UP = if_else(is.na(size_UP), 0, size_UP), # Default missing sizes to 0
+      size_DN = if_else(is.na(size_DN), 0, size_DN), # Default missing sizes to 0
       
       combined_NES = NES_UP - NES_DN,
       combined_ES = ES_UP - ES_DN,
+      # Take the size, prioritizing UP if available, otherwise DN. If both 0/NA, size is 0.
+      size = if_else(size_UP > 0, size_UP, size_DN),
+      size = if_else(size == 0 & size_UP == 0 & size_DN == 0, 0, size), # Ensure it's 0 if no valid size
       
       combined_padj = purrr::pmap_dbl(list(padj_UP, padj_DN), function(p_up, p_dn) {
         p_values_to_combine <- c()
@@ -776,48 +772,40 @@ calculate_combined_scores <- function(fgsea_df, analysis_name) {
         if (length(p_values_to_combine) == 0) {
           return(NA_real_)
         } else if (length(p_values_to_combine) == 1) {
-          return(p_values_to_combine[1]) 
+          return(p_values_to_combine[1])
         } else {
+          # Ensure p-values are not exactly zero for log calculation
           p_values_to_combine <- pmax(p_values_to_combine, .Machine$double.xmin)
-          
           chisq <- -2 * sum(log(p_values_to_combine))
           df_fisher <- 2 * length(p_values_to_combine)
-          return(pchisq(chisq, df = df_fisher, lower.tail = FALSE))
+          return(stats::pchisq(chisq, df = df_fisher, lower.tail = FALSE))
         }
       })
     ) %>%
+    # Select final desired columns, including the new 'size'
     dplyr::select(
       pathway, ranked_list_name, geneset_source_name, ranked_source_name,
-      # Now these are the correctly named columns
-      NES_UP, padj_UP, NES_DN, padj_DN, # Include individual NES and padj
-      ES_UP, ES_DN,                       # Include individual ES
-      combined_NES, combined_ES, combined_padj # Include combined NES, ES and padj
+      NES_UP, padj_UP, NES_DN, padj_DN,
+      ES_UP, ES_DN,
+      combined_NES, combined_ES, combined_padj, size # Include combined size
+    ) %>%
+    # Filter out rows where combined_padj could not be calculated (e.g., if both padj_UP and padj_DN were NA)
+    dplyr::filter(!is.na(combined_padj)) %>%
+    # Annotate pathways based on combined p-value (colleague's suggestion)
+    dplyr::mutate(
+      combined_padj_status = case_when(
+        combined_padj == 0 ~ "p=0", # Handle exact zero p-values
+        combined_padj < 0.05 ~ "Significant",
+        TRUE ~ "Not Significant"
+      ),
+      # Factor the status for consistent ordering in plots
+      combined_padj_status = factor(combined_padj_status, levels = c("Significant", "p=0", "Not Significant"))
     )
   
-  # Add the 'size' from the original df (assuming size is the same for UP/DN of the same pathway)
-  size_info <- fgsea_df %>%
-    dplyr::select(pathway, geneset_direction, size) %>%
-    tidyr::pivot_wider(
-      names_from = geneset_direction,
-      values_from = size,
-      names_prefix = "size_",
-      values_fn = max 
-    ) %>%
-    # Use if_else for type safety
-    dplyr::mutate(size = if_else(!is.na(size_UP), size_UP, size_DN)) %>% # Take UP size if present, else DN
-    dplyr::select(pathway, size) %>%
-    dplyr::distinct() # distinct here might be redundant if values_fn resolves all, but doesn't hurt.
-  
-  combined_df <- combined_df %>%
-    dplyr::left_join(size_info, by = "pathway") %>%
-    # Use if_else for type safety
-    dplyr::mutate(size = if_else(is.na(size), 0, size)) # Fill NA sizes with 0 if pathway not found
-  
-  combined_df <- combined_df %>% drop_na(combined_padj) 
-  
-  message(paste0("Combined scores calculated for '", analysis_name, "'. Total combined results: ", nrow(combined_df), " rows."))
+  message(paste0("Combined scores calculated and annotated for '", analysis_name, "'. Total combined results: ", nrow(combined_df), " rows."))
   return(combined_df)
 }
+
 
 #' Generates and saves a dot plot for combined fgsea results (ES_UP - ES_DN).
 #'
@@ -1274,119 +1262,178 @@ plot_geneset_size_vs_es <- function(fgsea_df, analysis_title_prefix, output_dir,
 }
 
 
-#' Generates a scatter plot comparing combined NES from age-centered and perturbation-centered analyses.
-#' Each point represents a unique (Tissue, Perturbation_Gene, Cell_Line) triplet.
+#' Generates scatter plots comparing combined NES and ES between age-centered and perturbation-centered analyses.
+#' Each point represents a unique (Perturbation_Gene, Cell_Line, Tissue) triplet.
+#' The plots include a y=x reference line, and highlight essential perturbation genes.
 #'
 #' @param age_combined_df A data frame of combined fgsea results from age-centered analysis.
 #' @param perturb_combined_df A data frame of combined fgsea results from perturbation-centered analysis.
 #' @param output_dir Path to save the plots.
-#' @param top_n_to_label Numeric, number of top/bottom points to label by default.
 #' @param essential_gene_list Character vector of essential genes for highlighting.
-plot_tissue_perturb_scatterplot <- function(age_combined_df, perturb_combined_df, output_dir, top_n_to_label = 20, essential_gene_list = NULL) {
-  message("Generating tissue-perturbation scatter plot...")
+#' @param top_n_to_label Numeric, number of top/bottom points to label by default.
+plot_cross_analysis_scatterplots <- function(age_combined_df, perturb_combined_df, output_dir, essential_gene_list = NULL, top_n_to_label = 20) {
+  message("Generating cross-analysis scatter plots (Combined NES and Combined ES)...")
   
   if (is.null(age_combined_df) || nrow(age_combined_df) == 0) {
-    message("Age-centered combined results are empty. Skipping tissue-perturbation scatter plot.")
+    message("Age-centered combined results are empty. Skipping cross-analysis scatter plots.")
     return(invisible(NULL))
   }
   if (is.null(perturb_combined_df) || nrow(perturb_combined_df) == 0) {
-    message("Perturbation-centered combined results are empty. Skipping tissue-perturbation scatter plot.")
+    message("Perturbation-centered combined results are empty. Skipping cross-analysis scatter plots.")
     return(invisible(NULL))
   }
   
-  # Helper to extract relevant names and clean them for joining
-  extract_meta_age <- age_combined_df %>%
-    dplyr::filter(combined_padj < 0.05) %>%
-    dplyr::mutate(
-      tissue = gsub("Aging Signature - (.*)", "\\1", ranked_list_name),
-      perturb_gene_cl = gsub("^(.*?)\\s+Knockdown Signature - (.*)", "\\1 in \\2", pathway) # Capture gene and cell line
-    ) %>%
-    dplyr::select(tissue, perturb_gene_cl, age_combined_NES = combined_NES, age_combined_padj = combined_padj) %>% 
-    dplyr::distinct(tissue, perturb_gene_cl, .keep_all = TRUE) 
-  
-  extract_meta_perturb <- perturb_combined_df %>%
-    dplyr::filter(combined_padj < 0.05) %>%
-    dplyr::mutate(
-      tissue = gsub("Aging Signature - (.*)", "\\1", pathway),
-      perturb_gene_cl = gsub("^(.*?)\\s+Knockdown Signature - (.*)", "\\1 in \\2", ranked_list_name) # Capture gene and cell line
-    ) %>%
-    dplyr::select(tissue, perturb_gene_cl, perturb_combined_NES = combined_NES, perturb_combined_padj = combined_padj) %>% 
-    dplyr::distinct(tissue, perturb_gene_cl, .keep_all = TRUE) 
-  
-  if (nrow(extract_meta_age) == 0 || nrow(extract_meta_perturb) == 0) {
-    message("No significant data after parsing for tissue-perturbation scatter plot. Skipping.")
-    return(invisible(NULL))
-  }
-  
-  merged_data <- dplyr::inner_join(
-    extract_meta_age,
-    extract_meta_perturb,
-    by = c("tissue", "perturb_gene_cl")
-  ) %>%
-    dplyr::mutate(
-      label = paste0(perturb_gene_cl, ", Tissue: ", tissue),
-      min_padj = pmin(age_combined_padj, perturb_combined_padj, na.rm = TRUE),
-      perturb_gene_symbol = gsub("^(.*?)\\s+in .*", "\\1", perturb_gene_cl) # Extract gene symbol for essential gene check
+  # Filter for significant results using the new 'combined_padj_status'
+  age_filt <- age_combined_df %>%
+    dplyr::filter(combined_padj_status == 'Significant') %>%
+    dplyr::rename(
+      combined_ES_age = combined_ES,
+      combined_NES_age = combined_NES,
+      combined_padj_age = combined_padj,
+      size_age = size
     )
   
-  if (nrow(merged_data) == 0) {
-    message("No common significant tissue-perturbation pairs found for scatter plot. Skipping.")
+  perturb_filt <- perturb_combined_df %>%
+    dplyr::filter(combined_padj_status == 'Significant') %>%
+    dplyr::rename(
+      combined_ES_perturb = combined_ES,
+      combined_NES_perturb = combined_NES,
+      combined_padj_perturb = combined_padj,
+      size_perturb = size
+    )
+  
+  if (nrow(age_filt) == 0 || nrow(perturb_filt) == 0) {
+    message("No significant data after filtering for cross-analysis scatter plots. Skipping.")
     return(invisible(NULL))
   }
   
-  # Label essential genes in the data
+  # Create symmetric identifiers for joining the two dataframes.
+  # For age_filt: 'pathway' is the Perturbation signature, 'ranked_list_name' is the Aging tissue.
+  # For perturb_filt: 'ranked_list_name' is the Perturbation signature, 'pathway' is the Aging tissue.
+  # The goal is to join on (Perturbation_Signature, Aging_Tissue).
+  
+  age_filt_for_join <- age_filt %>%
+    dplyr::mutate(
+      perturb_signature = pathway, # e.g., "FOXO1 Knockdown Signature - K562"
+      aging_tissue = ranked_list_name, # e.g., "Lung"
+      # Create a consistent identifier string for joining
+      identifier = paste0(perturb_signature, "__", aging_tissue)
+    ) %>%
+    dplyr::select(identifier, combined_ES_age, combined_NES_age, combined_padj_age, size_age)
+  
+  perturb_filt_for_join <- perturb_filt %>%
+    dplyr::mutate(
+      perturb_signature = ranked_list_name, # e.g., "FOXO1 Knockdown Signature - K562"
+      aging_tissue = pathway, # e.g., "Lung"
+      # Create a consistent identifier string for joining
+      identifier = paste0(perturb_signature, "__", aging_tissue)
+    ) %>%
+    dplyr::select(identifier, combined_ES_perturb, combined_NES_perturb, combined_padj_perturb, size_perturb)
+  
+  merged_data <- dplyr::inner_join(
+    age_filt_for_join,
+    perturb_filt_for_join,
+    by = "identifier"
+  )
+  
+  if (nrow(merged_data) == 0) {
+    message("No common significant (perturbation_signature, aging_tissue) pairs found for cross-analysis scatter plots. Skipping.")
+    return(invisible(NULL))
+  }
+  
+  # Add metadata for plotting (perturb_gene_cl, tissue, perturb_gene_symbol, is_essential)
+  merged_data <- merged_data %>%
+    # Extract perturb_gene_cl and tissue back from the identifier
+    tidyr::separate(identifier, into = c("perturb_gene_cl", "tissue"), sep = "__", remove = FALSE) %>%
+    dplyr::mutate(
+      label = paste0(perturb_gene_cl, ", Tissue: ", tissue), # Label for text annotation
+      perturb_gene_symbol = gsub("^(.*?)\\s+Knockdown Signature - .*", "\\1", perturb_gene_cl) # Extract gene symbol for essential gene check
+    )
+  
+  # Label essential genes
   if (!is.null(essential_gene_list) && length(essential_gene_list) > 0) {
     merged_data <- merged_data %>%
       dplyr::mutate(
         is_essential = perturb_gene_symbol %in% essential_gene_list
       )
   } else {
-    merged_data$is_essential <- FALSE # Default if no list
+    merged_data$is_essential <- FALSE # Default to FALSE if no list provided
   }
   
-  # Select top and bottom entries for labeling
-  top_pos <- merged_data %>% 
-    dplyr::arrange(dplyr::desc(age_combined_NES * perturb_combined_NES)) %>% 
-    dplyr::slice(1:min(dplyr::n(), top_n_to_label))
-  top_neg <- merged_data %>% 
-    dplyr::arrange(age_combined_NES * perturb_combined_NES) %>% 
+  # Identify points to label (top/bottom correlated points)
+  # Using product of NES for correlation, similar to your original scatterplot logic
+  top_cor <- merged_data %>%
+    dplyr::arrange(dplyr::desc(combined_NES_age * combined_NES_perturb)) %>%
     dplyr::slice(1:min(dplyr::n(), top_n_to_label))
   
-  labels_to_show <- unique(rbind(top_pos, top_neg)) %>% pull(label)
+  bottom_cor <- merged_data %>%
+    dplyr::arrange(combined_NES_age * combined_NES_perturb) %>%
+    dplyr::slice(1:min(dplyr::n(), top_n_to_label))
   
-  plot_data <- merged_data %>%
-    dplyr::mutate(
-      is_labeled = label %in% labels_to_show
-    )
+  labels_to_show <- unique(rbind(top_cor, bottom_cor)) %>% dplyr::pull(label)
   
-  # Plotting with combined_NES and highlighting essential genes
-  p <- ggplot(plot_data, aes(x = perturb_combined_NES, y = age_combined_NES)) + 
-    geom_point(aes(color = -log10(min_padj), size = -log10(min_padj), shape = is_essential), alpha = 0.7) + # Added shape
+  plot_data_final <- merged_data %>%
+    dplyr::mutate(is_labeled = label %in% labels_to_show)
+  
+  
+  # --- Plot 1: Combined NES Comparison ---
+  plot_nes_comparison <- ggplot(plot_data_final, aes(x = combined_NES_perturb, y = combined_NES_age)) +
+    geom_point(aes(color = combined_NES_perturb, size = size_perturb, shape = is_essential), alpha = 0.7) +
     geom_vline(xintercept = 0, linetype = "dashed", color = "gray") +
     geom_hline(yintercept = 0, linetype = "dashed", color = "gray") +
-    geom_text(data = dplyr::filter(plot_data, is_labeled), aes(label = label), 
+    geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "grey50") + # Add y=x line
+    geom_text(data = dplyr::filter(plot_data_final, is_labeled), aes(label = label),
               size = 2.5, vjust = -0.8, hjust = 0.5, check_overlap = TRUE) +
-    scale_color_viridis_c(name = "-log10(Min Adj. P)") +
-    scale_size_continuous(range = c(1, 5), name = "-log10(Min Adj. P)") +
-    scale_shape_manual(values = c("FALSE" = 16, "TRUE" = 18), name = "Essential Perturbation", labels = c("No", "Yes")) + # Square for essential
+    scale_color_gradient2(low = "darkblue", mid = "white", high = "darkred", midpoint = 0, name = "Perturb. NES") + # Symmetric colors
+    scale_size_continuous(range = c(1, 5), name = "Perturb. Geneset Size") +
+    scale_shape_manual(values = c("FALSE" = 16, "TRUE" = 18), name = "Essential Perturbation", labels = c("No", "Yes")) +
     labs(
-      title = "Comparison of Age-Centered vs. Perturbation-Centered Combined NES", 
-      subtitle = "Each point represents a (Perturbation Gene + Cell Line, Tissue) pair",
-      x = "Perturbation-Centered Combined NES (Perturbation's effect on Aging)", 
-      y = "Age-Centered Combined NES (Aging's effect on Perturbation)" 
+      title = "Comparison of Combined NES: Perturbation-Centered vs. Age-Centered Analysis",
+      subtitle = "Each point: (Perturbation Gene + Cell Line, Tissue) pair; Shape: Essential Gene",
+      x = "Perturbation-Centered Combined NES (Perturbation's effect on Aging)",
+      y = "Age-Centered Combined NES (Aging's effect on Perturbation)"
     ) +
     theme_minimal() +
     theme(plot.title = element_text(face = "bold", hjust = 0.5),
-          plot.subtitle = element_text(hjust = 0.5))
+          plot.subtitle = element_text(hjust = 0.5),
+          legend.position = "bottom")
   
-  plot_filename_png <- file.path(output_dir, "age_vs_perturb_combined_NES_scatterplot.png") 
-  ggsave(plot_filename_png, p, width = 12, height = 10)
+  plot_filename_nes_png <- file.path(output_dir, "cross_analysis_combined_NES_scatterplot.png")
+  ggsave(plot_filename_nes_png, plot_nes_comparison, width = 12, height = 10)
+  plot_filename_nes_svg <- file.path(output_dir, "cross_analysis_combined_NES_scatterplot.svg")
+  ggsave(plot_filename_nes_svg, plot_nes_comparison, width = 12, height = 10)
+  message("  Cross-analysis Combined NES scatter plot generated and saved to: ", plot_filename_nes_png)
   
-  plot_filename_svg <- file.path(output_dir, "age_vs_perturb_combined_NES_scatterplot.svg") 
-  ggsave(plot_filename_svg, p, width = 12, height = 10)
   
-  message("  Tissue-perturbation scatter plot generated and saved to: ", plot_filename_png)
+  # --- Plot 2: Combined ES Comparison ---
+  plot_es_comparison <- ggplot(plot_data_final, aes(x = combined_ES_perturb, y = combined_ES_age)) +
+    geom_point(aes(color = combined_ES_perturb, size = size_perturb, shape = is_essential), alpha = 0.7) +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "gray") +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "gray") +
+    geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "grey50") + # Add y=x line
+    geom_text(data = dplyr::filter(plot_data_final, is_labeled), aes(label = label),
+              size = 2.5, vjust = -0.8, hjust = 0.5, check_overlap = TRUE) +
+    scale_color_gradient2(low = "darkblue", mid = "white", high = "darkred", midpoint = 0, name = "Perturb. ES") + # Symmetric colors
+    scale_size_continuous(range = c(1, 5), name = "Perturb. Geneset Size") +
+    scale_shape_manual(values = c("FALSE" = 16, "TRUE" = 18), name = "Essential Perturbation", labels = c("No", "Yes")) +
+    labs(
+      title = "Comparison of Combined ES: Perturbation-Centered vs. Age-Centered Analysis",
+      subtitle = "Each point: (Perturbation Gene + Cell Line, Tissue) pair; Shape: Essential Gene",
+      x = "Perturbation-Centered Combined ES (Perturbation's effect on Aging)",
+      y = "Age-Centered Combined ES (Aging's effect on Perturbation)"
+    ) +
+    theme_minimal() +
+    theme(plot.title = element_text(face = "bold", hjust = 0.5),
+          plot.subtitle = element_text(hjust = 0.5),
+          legend.position = "bottom")
+  
+  plot_filename_es_png <- file.path(output_dir, "cross_analysis_combined_ES_scatterplot.png")
+  ggsave(plot_filename_es_png, plot_es_comparison, width = 12, height = 10)
+  plot_filename_es_svg <- file.path(output_dir, "cross_analysis_combined_ES_scatterplot.svg")
+  ggsave(plot_filename_es_svg, plot_es_comparison, width = 12, height = 10)
+  message("  Cross-analysis Combined ES scatter plot generated and saved to: ", plot_filename_es_png)
 }
+
 
 
 # --- Main Script Execution ---
@@ -1541,9 +1588,9 @@ if (!is.null(fgsea_res_perturb_centered)) {
 
 # Cross-Analysis Scatter Plot (Pass essential gene list, now plots NES)
 if (!is.null(fgsea_res_age_centered_combined) && !is.null(fgsea_res_perturb_centered_combined)) {
-  plot_tissue_perturb_scatterplot(fgsea_res_age_centered_combined, fgsea_res_perturb_centered_combined, output_dir, essential_gene_list = essential_gene_list)
+  plot_cross_analysis_scatterplots(fgsea_res_age_centered_combined, fgsea_res_perturb_centered_combined, output_dir, essential_gene_list = essential_gene_list)
 } else {
-  message("\nSkipping Tissue-Perturbation scatter plot due to missing combined results from one or both analyses.")
+  message("\nSkipping Cross-Analysis scatter plots due to missing combined results from one or both analyses.")
 }
 
 
