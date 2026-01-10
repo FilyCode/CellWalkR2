@@ -19,6 +19,7 @@ perturbation_collection_file <- paste0(work_dir, "results/perturbational_omic_si
 gtex_collection_file <- paste0(work_dir, "data/GTEX/GTEX_aging_omic_col_stat_v114.rds")
 output_dir <- paste0(work_dir, "results/fgsea_combined_analysis/Replogle_GTEX")
 gene_map_file <- paste0(work_dir, "data/Homo_sapiens_GRCh38_114_genemap.rds")
+essential_genes_file <- paste0(work_dir, "data/Gene_Dependency_Profile_Summary.csv")
 
 # Ensure output directory exists
 if (!dir.exists(output_dir)) {
@@ -30,7 +31,7 @@ logFC_filter_val <- 0.25
 adj_pval_filter_val <- 0.05
 geneset_top_n <- 500
 top_n_genesets_to_plot <- 20 # For existing 4-panel plots
-top_n_combined_plots <- 20 # For new combined ES dot plots
+top_n_combined_plots <- 20 # For new combined NES dot plots
 
 # fgsea parameters
 fgsea_min_size <- 15 
@@ -40,6 +41,14 @@ fgsea_max_size <- Inf
 total_num_cores <- 28
 
 
+# Load essential genes from DepMap
+message("--- Loading Essential Genes from DepMap ---")
+essential_genes_df <- read.csv(essential_genes_file) %>%
+  dplyr::filter(Dataset == "DependencyEnum.Chronos_Combined", Common.Essential == 'True')
+essential_gene_list <- unique(essential_genes_df$Gene)
+message(paste0("Loaded ", length(essential_gene_list), " common essential genes from DepMap for highlighting."))
+
+
 message("--- Starting GSEA Combined Analysis ---")
 message(paste0("Output directory: ", output_dir))
 message(paste0("Gene set filtering: |logFC| > ", logFC_filter_val, ", adj.pval < ", adj_pval_filter_val))
@@ -47,7 +56,7 @@ message(paste0("fgsea parameters: minSize = ", fgsea_min_size, ", maxSize = ", f
                ", total_num_cores = ", total_num_cores, 
                " (each fgsea task will run on 1 core, with up to ", total_num_cores, " tasks concurrently)"))
 message(paste0("Top N results for plotting (traditional): ", top_n_genesets_to_plot))
-message(paste0("Top N results for plotting (combined ES): ", top_n_combined_plots))
+message(paste0("Top N results for plotting (combined NES): ", top_n_combined_plots))
 
 # --- Helper Functions ---
 
@@ -228,9 +237,8 @@ extract_gene_sets_up_dn <- function(omic_collection, logFC_thresh, pval_thresh, 
     if (!has_logFC) { # If logFC is not available or all NA
       if (any(possible_group_label_cols %in% names(df_to_process))) {
         group_label_col_name <- intersect(possible_group_label_cols, names(df_to_process))[1]
-        # Check if group_label has the expected values and is not all NA
-        group_labels_in_df <- unique(df_to_process[[group_label_col_name]])
-        if (all(c("Older", "Younger") %in% group_labels_in_df) && !all(is.na(df_to_process[[group_label_col_name]]))) {
+        # Check for presence of *any* non-NA group label
+        if (!all(is.na(df_to_process[[group_label_col_name]]))) { 
           use_group_label_for_direction <- TRUE
           warning(paste("Warning: 'logFC' column missing or all NA for", collection_name, sig_name, 
                         "from", used_source_name, ". Using '", group_label_col_name, "' for determining UP/DN gene set direction.",
@@ -291,12 +299,21 @@ extract_gene_sets_up_dn <- function(omic_collection, logFC_thresh, pval_thresh, 
     up_genes <- character(0)
     dn_genes <- character(0)
     
-    if (has_logFC) { # Use logFC for direction
+    if (has_logFC) { 
       up_genes <- significant_genes %>% dplyr::filter(!!sym(possible_logfc_cols[1]) > 0) %>% dplyr::pull(gene_name) %>% unique() 
       dn_genes <- significant_genes %>% dplyr::filter(!!sym(possible_logfc_cols[1]) < 0) %>% dplyr::pull(gene_name) %>% unique()
-    } else if (use_group_label_for_direction) { # Use group_label for direction
-      up_genes <- significant_genes %>% dplyr::filter(!!sym(group_label_col_name) == "Older") %>% dplyr::pull(gene_name) %>% unique()
-      dn_genes <- significant_genes %>% dplyr::filter(!!sym(group_label_col_name) == "Younger") %>% dplyr::pull(gene_name) %>% unique()
+    } else if (use_group_label_for_direction) {
+      # Handle different possible group_label values (Aging vs. Perturbation)
+      if (any(grepl("Increased_with_Age|Increased_by_Perturbation", unique(significant_genes[[group_label_col_name]])))) {
+        up_genes <- significant_genes %>% dplyr::filter(grepl("Increased_with_Age|Increased_by_Perturbation", !!sym(group_label_col_name))) %>% dplyr::pull(gene_name) %>% unique()
+        dn_genes <- significant_genes %>% dplyr::filter(grepl("Decreased_with_Age|Decreased_by_Perturbation", !!sym(group_label_col_name))) %>% dplyr::pull(gene_name) %>% unique()
+      } else if (any(c("Older", "Younger") %in% unique(significant_genes[[group_label_col_name]]))) {
+        up_genes <- significant_genes %>% dplyr::filter(!!sym(group_label_col_name) == "Older") %>% dplyr::pull(gene_name) %>% unique()
+        dn_genes <- significant_genes %>% dplyr::filter(!!sym(group_label_col_name) == "Younger") %>% dplyr::pull(gene_name) %>% unique()
+      } else {
+        warning(paste("Skipping", collection_name, sig_name, ": Unrecognized group_label values for directionality. Expected 'Increased/Decreased' or 'Older/Younger'."))
+        next
+      }
     }
     
     # Add to gene sets list
@@ -449,7 +466,7 @@ plot_fgsea_results <- function(fgsea_df, analysis_title_prefix, output_dir, top_
   } else {
     message(paste0("Found ", nrow(all_significant_results), " significant interactions (padj < 0.05) for ", analysis_title_prefix, "."))
     
-    # Check for required columns
+    # Check for required columns - NES is used for plotting here
     if (!("geneset_direction" %in% colnames(all_significant_results) &&
           "NES" %in% colnames(all_significant_results) &&
           "ranked_list_name" %in% colnames(all_significant_results) &&
@@ -613,14 +630,15 @@ plot_clustered_heatmap <- function(fgsea_df, analysis_title_prefix, geneset_sour
   
   # Reshape data for heatmap: pathways as rows, ranked lists as columns, ES as values # CHANGE NES to ES
   heatmap_data <- significant_results %>%
-    dplyr::select(pathway, ranked_list_name, ES) %>% # CHANGE NES to ES
-    tidyr::pivot_wider(names_from = ranked_list_name, values_from = ES, values_fill = 0) # Fill non-significant/missing with 0
+    dplyr::select(pathway, ranked_list_name, NES) %>% 
+    tidyr::pivot_wider(names_from = ranked_list_name, values_from = NES, values_fill = 0) # Fill non-significant/missing with 0
   
-  # Filter heatmap_data rows where ES > 0 for at least 5 columns (her code's "row_zero_counts >= 5" where ES > 0) # ADD THESE LINES
   mat_for_filtering <- as.matrix(heatmap_data %>% dplyr::select(-pathway))
   rownames(mat_for_filtering) <- heatmap_data$pathway
-  row_positive_es_counts <- rowSums(mat_for_filtering > 0, na.rm = TRUE)
-  heatmap_data <- heatmap_data[row_positive_es_counts >= 5, ]
+  
+  # Filter for pathways with at least 5 non-zero NES values to avoid overly sparse heatmaps
+  row_non_zero_nes_counts <- rowSums(mat_for_filtering != 0, na.rm = TRUE) # Count non-zero NES
+  heatmap_data <- heatmap_data[row_non_zero_nes_counts >= 5, ]
   
   if (nrow(heatmap_data) == 0) {
     message(paste("  No pathways left after filtering for at least 5 positive ES enrichments for heatmap in", analysis_title_prefix, "with", geneset_source_name, geneset_direction, "gene sets. Skipping heatmap."))
@@ -631,22 +649,23 @@ plot_clustered_heatmap <- function(fgsea_df, analysis_title_prefix, geneset_sour
   mat <- as.matrix(heatmap_data %>% dplyr::select(-pathway))
   rownames(mat) <- heatmap_data$pathway
   
-  # Determine a symmetric color range based on max absolute ES # CHANGE NES to ES
-  max_abs_es <- max(abs(mat), na.rm = TRUE) # CHANGE NES to ES
+  # Determine a symmetric color range based on max absolute NES
+  max_abs_nes <- max(abs(mat), na.rm = TRUE) # CHANGE NES to ES
   # Define the color function using circlize::colorRamp2 for a diverging palette
-  col_fun <- colorRamp2(c(-max_abs_es, -max_abs_es/2, 0, max_abs_es/2, max_abs_es), 
+  col_fun <- colorRamp2(c(-max_abs_nes, -max_abs_nes/2, 0, max_abs_nes/2, max_abs_nes), 
                         c("darkblue", "lightblue", "white", "pink2", "darkred")) # Matches her code's color scheme
   
   # Construct the plot title and filename
-  hm_title <- paste0("Clustered Heatmap: ", analysis_title_prefix, "\n(", geneset_source_name, " ", geneset_direction, " Gene Sets vs. Ranked Lists, ES)") # Added ES to title
-  file_name_base <- paste0(gsub(" ", "_", analysis_title_prefix), "_", geneset_source_name, "_", geneset_direction, "_heatmap")
+  hm_title <- paste0("Clustered Heatmap: ", analysis_title_prefix, "\n(", geneset_source_name, " ", geneset_direction, " Gene Sets vs. Ranked Lists, NES)",
+                     "\nRows: ", nrow(mat), ", Cols: ", ncol(mat)) # Added row/column counts
+  file_name_base <- paste0(gsub(" ", "_", analysis_title_prefix), "_", geneset_source_name, "_", geneset_direction, "_heatmap_NES") # Added NES to filename
   heatmap_output_path <- file.path(output_dir, paste0(file_name_base, ".png"))
   heatmap_output_path_svg <- file.path(output_dir, paste0(file_name_base, ".svg"))
   
   # Generate heatmap using ComplexHeatmap
   hm <- Heatmap(
     mat,
-    name = "ES", # Legend name
+    name = "NES", # Legend name
     col = col_fun,
     na_col = "grey90", # Color for NA values
     cluster_rows = TRUE,
@@ -671,36 +690,40 @@ plot_clustered_heatmap <- function(fgsea_df, analysis_title_prefix, geneset_sour
 }
 
 
-#' Calculates a combined ES score (ES_UP - ES_DN) and a combined p-value
-#' (using Fisher's method) for fgsea results.
+#' Calculates combined NES and ES scores (NES_UP - NES_DN or ES_UP - ES_DN)
+#' and a combined p-value (using Fisher's method) for fgsea results.
 #'
 #' @param fgsea_df A data frame of combined fgsea results (containing 'pathway', 'ranked_list_name', 'geneset_direction', 'ES', 'padj').
 #' @param analysis_name A string for logging/message purposes.
-#' @return A data frame with combined scores, p-values, and original metadata.
+#' @return A data frame with combined NES, combined ES, combined p-values, and original metadata.
 calculate_combined_scores <- function(fgsea_df, analysis_name) {
   if (is.null(fgsea_df) || nrow(fgsea_df) == 0) {
     message(paste("No fgsea results to calculate combined scores for", analysis_name))
     return(NULL)
   }
   
-  message(paste0("Calculating combined ES and p-values for '", analysis_name, "'..."))
+  message(paste0("Calculating combined NES/ES and p-values for '", analysis_name, "'...")) 
   
-  required_cols <- c("pathway", "ranked_list_name", "geneset_direction", "ES", "padj", "geneset_source_name", "ranked_source_name")
+  required_cols <- c("pathway", "ranked_list_name", "geneset_direction", "NES", "ES", "padj", "geneset_source_name", "ranked_source_name")
   if (!all(required_cols %in% colnames(fgsea_df))) {
     stop(paste("Missing required columns for combined score calculation:", setdiff(required_cols, colnames(fgsea_df))))
   }
   
   combined_df <- fgsea_df %>%
-    dplyr::select(pathway, ranked_list_name, geneset_direction, ES, padj, geneset_source_name, ranked_source_name) %>%
+    dplyr::select(pathway, ranked_list_name, geneset_direction, NES, ES, padj, geneset_source_name, ranked_source_name) %>%
     dplyr::mutate(geneset_direction = factor(geneset_direction, levels = c("UP", "DN"))) %>% 
     tidyr::pivot_wider(
       id_cols = c(pathway, ranked_list_name, geneset_source_name, ranked_source_name), 
       names_from = geneset_direction,
-      values_from = c(ES, padj),
+      values_from = c(NES, ES, padj),
       names_glue = "{.value}_{.name}",
       values_fill = NA_real_ 
     ) %>%
     # Use rename_with to conditionally rename if the double prefix exists
+    dplyr::rename_with(
+      .fn = ~gsub("NES_NES_", "NES_", .x), 
+      .cols = dplyr::starts_with("NES_NES_") 
+    ) %>%
     dplyr::rename_with(
       .fn = ~gsub("ES_ES_", "ES_", .x), # Function to replace "ES_ES_" with "ES_"
       .cols = dplyr::starts_with("ES_ES_") # Apply only to columns starting with "ES_ES_"
@@ -711,9 +734,13 @@ calculate_combined_scores <- function(fgsea_df, analysis_name) {
     ) %>%
     # Now proceed with your mutate and select as originally intended, using ES_UP, etc.
     dplyr::mutate(
+      # Fill NAs for UP/DN NES and ES with 0 for calculation
+      NES_UP = if_else(is.na(NES_UP), 0, NES_UP), 
+      NES_DN = if_else(is.na(NES_DN), 0, NES_DN),  
       ES_UP = if_else(is.na(ES_UP), 0, ES_UP), 
-      ES_DN = if_else(is.na(ES_DN), 0, ES_DN),  
+      ES_DN = if_else(is.na(ES_DN), 0, ES_DN),   
       
+      combined_NES = NES_UP - NES_DN,
       combined_ES = ES_UP - ES_DN,
       
       combined_padj = purrr::pmap_dbl(list(padj_UP, padj_DN), function(p_up, p_dn) {
@@ -737,7 +764,9 @@ calculate_combined_scores <- function(fgsea_df, analysis_name) {
     dplyr::select(
       pathway, ranked_list_name, geneset_source_name, ranked_source_name,
       # Now these are the correctly named columns
-      ES_UP, padj_UP, ES_DN, padj_DN, combined_ES, combined_padj
+      NES_UP, padj_UP, NES_DN, padj_DN, # Include individual NES and padj
+      ES_UP, ES_DN,                       # Include individual ES
+      combined_NES, combined_ES, combined_padj # Include combined NES, ES and padj
     )
   
   # Add the 'size' from the original df (assuming size is the same for UP/DN of the same pathway)
@@ -771,7 +800,8 @@ calculate_combined_scores <- function(fgsea_df, analysis_name) {
 #' @param analysis_title_prefix A string for plot titles, e.g., "Age-Centered Analysis".
 #' @param output_dir Path to save the plots.
 #' @param top_n Numeric, number of top results to plot.
-plot_combined_fgsea_dotplot <- function(combined_fgsea_df, analysis_title_prefix, output_dir, top_n = 20) {
+#' @param essential_gene_list Character vector of essential genes for highlighting.
+plot_combined_fgsea_dotplot <- function(combined_fgsea_df, analysis_title_prefix, output_dir, top_n = 20, essential_gene_list = NULL) {
   
   if (is.null(combined_fgsea_df) || nrow(combined_fgsea_df) == 0) {
     message(paste("No combined fgsea results for", analysis_title_prefix, "to display or plot."))
@@ -804,17 +834,33 @@ plot_combined_fgsea_dotplot <- function(combined_fgsea_df, analysis_title_prefix
     ranked_list_label <- paste0(ranked_list_label, " Ranked List")
   }
   
-  # --- Plot 1: Top Positive combined_ES (Gero-advancer) ---
+  # Extract perturbation gene symbol and label essential genes
+  plot_data_base <- all_significant_combined_results %>%
+    dplyr::mutate(
+      perturb_gene_symbol = gsub("^(.*?)\\s+Knockdown Signature - .*", "\\1", pathway) # Extract gene symbol from pathway name
+    )
+  
+  if (!is.null(essential_gene_list) && length(essential_gene_list) > 0) {
+    plot_data_base <- plot_data_base %>%
+      dplyr::mutate(
+        is_essential = perturb_gene_symbol %in% essential_gene_list
+      )
+  } else {
+    plot_data_base$is_essential <- FALSE # Default to FALSE if no list provided
+  }
+  
+  # --- Plot 1: Top Positive combined_NES (Gero-advancer) ---
   data_pos <- all_significant_combined_results %>%
-    dplyr::filter(combined_ES > 0) %>%
-    dplyr::arrange(dplyr::desc(combined_ES)) %>%
+    dplyr::filter(combined_NES > 0) %>%
+    dplyr::arrange(dplyr::desc(combined_NES)) %>%
     dplyr::slice(1:min(dplyr::n(), top_n))
   
   plot_pos <- if (nrow(data_pos) > 0) {
-    ggplot(data_pos, aes(x = reorder(pathway, combined_ES), y = ranked_list_name)) +
-      geom_point(aes(size = size, color = combined_ES)) +
+    ggplot(data_pos, aes(x = reorder(pathway, combined_NES), y = ranked_list_name)) +
+      geom_point(aes(size = size, color = combined_NES, shape = is_essential)) + # Added shape for essential genes
       scale_size_continuous(name = "Gene Set Size") +
-      scale_color_gradient(low = "yellow", high = "red", name = "Combined ES\n(ES_UP - ES_DN)") + # Gero-advancer colors
+      scale_color_gradient(low = "yellow", high = "red", name = "Combined NES\n(NES_UP - NES_DN)") + 
+      scale_shape_manual(values = c("FALSE" = 16, "TRUE" = 18), name = "Essential Gene", labels = c("No", "Yes")) + # Square for essential
       coord_flip() +
       theme_bw() +
       theme(axis.text.x = element_text(angle = 45, hjust = 1),
@@ -822,23 +868,24 @@ plot_combined_fgsea_dotplot <- function(combined_fgsea_df, analysis_title_prefix
             axis.title = element_text(size = 8), axis.text = element_text(size = 7),
             legend.text = element_text(size = 7), legend.title = element_text(size = 8),
             legend.position = "bottom", plot.margin = margin(5, 5, 5, 5, "pt")) +
-      labs(x = gene_set_label, y = ranked_list_label, title = paste0("Top ", top_n, " Gero-Advancer Pathways (Positive Combined ES)"))
+      labs(x = gene_set_label, y = ranked_list_label, title = paste0("Top ", top_n, " Gero-Advancer Pathways (Positive Combined NES)")) 
   } else {
     ggplot() + geom_text(aes(x=0.5, y=0.5, label="No significant Gero-Advancer pathways"), size=4, color="grey50") + theme_void()
   }
   message(paste0("Prepared plot for Top ", top_n, " Gero-Advancer pathways (", nrow(data_pos), " results)."))
   
-  # --- Plot 2: Top Negative combined_ES (Gero-protector) ---
+  # --- Plot 2: Top Negative combined_NES (Gero-protector) ---
   data_neg <- all_significant_combined_results %>%
-    dplyr::filter(combined_ES < 0) %>%
-    dplyr::arrange(combined_ES) %>% # Arrange ascending for most negative first
+    dplyr::filter(combined_NES < 0) %>%
+    dplyr::arrange(combined_NES) %>% # Arrange ascending for most negative first
     dplyr::slice(1:min(dplyr::n(), top_n))
   
   plot_neg <- if (nrow(data_neg) > 0) {
-    ggplot(data_neg, aes(x = reorder(pathway, combined_ES), y = ranked_list_name)) +
-      geom_point(aes(size = size, color = combined_ES)) +
+    ggplot(data_neg, aes(x = reorder(pathway, combined_NES), y = ranked_list_name)) +
+      geom_point(aes(size = size, color = combined_NES, shape = is_essential)) + # Added shape for essential genes
       scale_size_continuous(name = "Gene Set Size") +
-      scale_color_gradient(low = "darkblue", high = "lightblue", name = "Combined ES\n(ES_UP - ES_DN)") + # Gero-protector colors
+      scale_color_gradient(low = "darkblue", high = "lightblue", name = "Combined NES\n(NES_UP - NES_DN)") + # Gero-protector colors
+      scale_shape_manual(values = c("FALSE" = 16, "TRUE" = 18), name = "Essential Gene", labels = c("No", "Yes")) +
       coord_flip() +
       theme_bw() +
       theme(axis.text.x = element_text(angle = 45, hjust = 1),
@@ -846,7 +893,7 @@ plot_combined_fgsea_dotplot <- function(combined_fgsea_df, analysis_title_prefix
             axis.title = element_text(size = 8), axis.text = element_text(size = 7),
             legend.text = element_text(size = 7), legend.title = element_text(size = 8),
             legend.position = "bottom", plot.margin = margin(5, 5, 5, 5, "pt")) +
-      labs(x = gene_set_label, y = ranked_list_label, title = paste0("Top ", top_n, " Gero-Protector Pathways (Negative Combined ES)"))
+      labs(x = gene_set_label, y = ranked_list_label, title = paste0("Top ", top_n, " Gero-Protector Pathways (Negative Combined NES)"))
   } else {
     ggplot() + geom_text(aes(x=0.5, y=0.5, label="No significant Gero-Protector pathways"), size=4, color="grey50") + theme_void()
   }
@@ -857,38 +904,40 @@ plot_combined_fgsea_dotplot <- function(combined_fgsea_df, analysis_title_prefix
     combined_plot <- plot_grid(plot_pos, plot_neg, ncol = 2, align = "hv", 
                                labels = c("A", "B"), label_size = 10)
     
-    final_title_text <- paste0("GSEA Combined ES: ", analysis_title_prefix, " (Top ", top_n, " Pathways)")
+    final_title_text <- paste0("GSEA Combined NES: ", analysis_title_prefix, " (Top ", top_n, " Pathways)") # Changed Combined ES to Combined NES
     final_title <- ggdraw() + 
       draw_label(final_title_text, fontface = 'bold', size = 16, x = 0.02, hjust = 0) +
       theme(plot.margin = margin(0, 0, 0, 7, "pt"))
     
     combined_plot_with_title <- plot_grid(final_title, combined_plot, ncol = 1, rel_heights = c(0.05, 1))
     
-    plot_filename_png <- file.path(output_dir, paste0(gsub(" ", "_", analysis_title_prefix), "_top_", top_n, "_gsea_combined_ES_dotplot.png"))
+    plot_filename_png <- file.path(output_dir, paste0(gsub(" ", "_", analysis_title_prefix), "_top_", top_n, "_gsea_combined_NES_dotplot.png")) 
     ggsave(plot_filename_png, combined_plot_with_title, width = 16, height = 10)
     
-    plot_filename_svg <- file.path(output_dir, paste0(gsub(" ", "_", analysis_title_prefix), "_top_", top_n, "_gsea_combined_ES_dotplot.svg"))
+    plot_filename_svg <- file.path(output_dir, paste0(gsub(" ", "_", analysis_title_prefix), "_top_", top_n, "_gsea_combined_NES_dotplot.svg")) 
     ggsave(plot_filename_svg, combined_plot_with_title, width = 16, height = 10)
     
-    message("  Combined ES dot plot generated and saved to: ", plot_filename_png)
+    message("  Combined NES dot plot generated and saved to: ", plot_filename_png) 
   } else {
     message("No combined dot plots generated for ", analysis_title_prefix, " due to lack of significant results.")
   }
 }
 
-#' Generates and saves a clustered heatmap from combined fgsea results (combined_ES).
+#' Generates and saves a clustered heatmap from combined fgsea results (combined_NES).
+#' Highlights essential perturbation genes as a column annotation.
 #'
 #' @param combined_fgsea_df A data frame of combined fgsea results (from calculate_combined_scores).
 #' @param analysis_title_prefix A string for plot titles, e.g., "Age-Centered Analysis".
 #' @param output_dir Path to save the plots.
-plot_combined_heatmap <- function(combined_fgsea_df, analysis_title_prefix, output_dir) {
+#' @param essential_gene_list Character vector of essential genes for highlighting.
+plot_combined_heatmap <- function(combined_fgsea_df, analysis_title_prefix, output_dir, essential_gene_list = NULL) {
   
   if (is.null(combined_fgsea_df) || nrow(combined_fgsea_df) == 0) {
     message(paste("No combined fgsea results for heatmap in", analysis_title_prefix, "."))
     return(invisible(NULL))
   }
   
-  message(paste0("Generating clustered heatmap for combined ES: ", analysis_title_prefix))
+  message(paste0("Generating clustered heatmap for combined NES: ", analysis_title_prefix)) 
   
   # Filter for significant results (combined_padj < 0.05)
   significant_combined_results <- combined_fgsea_df %>%
@@ -907,38 +956,58 @@ plot_combined_heatmap <- function(combined_fgsea_df, analysis_title_prefix, outp
     return(invisible(NULL))
   }
   
-  # Reshape data for heatmap: pathways as rows, ranked lists as columns, combined_ES as values
+  # Reshape data for heatmap: combined_NES as values
   heatmap_data <- significant_combined_results %>%
-    dplyr::select(pathway, ranked_list_name, combined_ES) %>%
-    tidyr::pivot_wider(names_from = ranked_list_name, values_from = combined_ES, values_fill = 0) 
+    dplyr::select(pathway, ranked_list_name, combined_NES) %>% # Changed combined_ES to combined_NES
+    tidyr::pivot_wider(names_from = ranked_list_name, values_from = combined_NES, values_fill = 0) 
   
-  # Filter heatmap_data rows where combined_ES != 0 for at least 5 columns (similar to original logic)
+  # Filter heatmap_data rows where combined_NES != 0 for at least 5 columns (similar to original logic)
   mat_for_filtering <- as.matrix(heatmap_data %>% dplyr::select(-pathway))
   rownames(mat_for_filtering) <- heatmap_data$pathway
   # Here, we filter for pathways that have at least 5 non-zero combined ES values,
-  row_non_zero_es_counts <- rowSums(mat_for_filtering != 0, na.rm = TRUE)
-  heatmap_data <- heatmap_data[row_non_zero_es_counts >= 5, ] # You might adjust this threshold
+  row_non_zero_nes_counts <- rowSums(mat_for_filtering != 0, na.rm = TRUE)
+  heatmap_data <- heatmap_data[row_non_zero_nes_counts >= 5, ] 
   
   if (nrow(heatmap_data) == 0) {
-    message(paste("  No pathways left after filtering for at least 5 non-zero combined ES enrichments for heatmap in", analysis_title_prefix, ". Skipping heatmap."))
+    message(paste("  No pathways left after filtering for at least 5 non-zero combined NES enrichments for heatmap in", analysis_title_prefix, ". Skipping heatmap."))
     return(invisible(NULL))
   }
   
   mat <- as.matrix(heatmap_data %>% dplyr::select(-pathway))
   rownames(mat) <- heatmap_data$pathway
   
-  max_abs_es <- max(abs(mat), na.rm = TRUE)
-  col_fun <- colorRamp2(c(-max_abs_es, -max_abs_es/2, 0, max_abs_es/2, max_abs_es), 
-                        c("darkblue", "lightblue", "white", "pink2", "darkred")) # Use diverging palette
+  # Determine symmetric color range based on max absolute combined_NES
+  max_abs_nes <- max(abs(mat), na.rm = TRUE) 
+  col_fun <- colorRamp2(c(-max_abs_nes, -max_abs_nes/2, 0, max_abs_nes/2, max_abs_nes), 
+                        c("darkblue", "lightblue", "white", "pink2", "darkred"))
   
-  hm_title <- paste0("Clustered Heatmap: ", analysis_title_prefix, "\n(Combined ES: ES_UP - ES_DN)")
-  file_name_base <- paste0(gsub(" ", "_", analysis_title_prefix), "_combined_ES_heatmap")
+  # Determine essential genes for columns (perturbation genes)
+  # Extract gene symbol from column names (e.g., "FOXO1 Knockdown Signature - K562")
+  perturb_gene_symbols_in_cols <- gsub("^(.*?)\\s+Knockdown Signature - .*", "\\1", colnames(mat))
+  is_perturb_gene_essential <- (perturb_gene_symbols_in_cols %in% essential_gene_list)
+  
+  column_ha = NULL
+  if (!is.null(essential_gene_list) && length(essential_gene_list) > 0) {
+    column_ha <- HeatmapAnnotation(
+      is_essential = anno_simple(is_perturb_gene_essential, col = c("TRUE" = "darkgreen", "FALSE" = "grey90"),
+                                 height = unit(3, "mm"), pch = ifelse(is_perturb_gene_essential, 18, NA), pt_gp = gpar(col = "black", fontsize = 8)),
+      annotation_name_side = "left",
+      annotation_legend_param = list(is_essential = list(title = "Essential Perturbation", at = c(FALSE, TRUE), labels = c("No", "Yes"),
+                                                         labels_gp = gpar(fontsize = 8), title_gp = gpar(fontsize = 9, fontface = "bold")))
+    )
+  }
+  
+  
+  # Title to reflect combined NES and include row/column counts
+  hm_title <- paste0("Clustered Heatmap: ", analysis_title_prefix, "\n(Combined NES: NES_UP - NES_DN)",
+                     "\nRows: ", nrow(mat), ", Cols: ", ncol(mat))
+  file_name_base <- paste0(gsub(" ", "_", analysis_title_prefix), "_combined_NES_heatmap")
   heatmap_output_path_png <- file.path(output_dir, paste0(file_name_base, ".png"))
   heatmap_output_path_svg <- file.path(output_dir, paste0(file_name_base, ".svg"))
   
   hm <- Heatmap(
     mat,
-    name = "Combined ES",
+    name = "Combined NES", 
     col = col_fun,
     na_col = "grey90",
     cluster_rows = TRUE,
@@ -946,7 +1015,8 @@ plot_combined_heatmap <- function(combined_fgsea_df, analysis_title_prefix, outp
     show_row_names = FALSE,
     row_names_gp = gpar(fontsize = 6),
     column_names_gp = gpar(fontsize = 8),
-    column_names_rot = 90
+    column_names_rot = 90,
+    top_annotation = column_ha 
   )
   
   png(heatmap_output_path_png, width = 2200, height = 1800, res = 300)
@@ -957,15 +1027,121 @@ plot_combined_heatmap <- function(combined_fgsea_df, analysis_title_prefix, outp
   draw(hm, column_title = hm_title)
   dev.off()
   
-  message("  Combined ES clustered heatmap generated and saved to: ", heatmap_output_path_png)
+  message("  Combined NES clustered heatmap generated and saved to: ", heatmap_output_path_png)
 }
+
+
+#' Generates and saves a clustered heatmap from combined fgsea results using a signed -log10(p-value) for coloring.
+#' The sign is determined by combined_NES. Highlights essential perturbation genes as a column annotation.
+#'
+#' @param combined_fgsea_df A data frame of combined fgsea results (from calculate_combined_scores).
+#' @param analysis_title_prefix A string for plot titles, e.g., "Age-Centered Analysis".
+#' @param output_dir Path to save the plots.
+#' @param essential_gene_list Character vector of essential genes for highlighting.
+plot_combined_heatmap_signed_pvalue_NES <- function(combined_fgsea_df, analysis_title_prefix, output_dir, essential_gene_list = NULL) {
+  
+  if (is.null(combined_fgsea_df) || nrow(combined_fgsea_df) == 0) {
+    message(paste("No combined fgsea results for signed -log10(p-value) heatmap (NES-based) in", analysis_title_prefix, "."))
+    return(invisible(NULL))
+  }
+  
+  message(paste0("Generating clustered heatmap for signed -log10(p-value) (NES-based): ", analysis_title_prefix))
+  
+  significant_combined_results <- combined_fgsea_df %>%
+    dplyr::filter(combined_padj < 0.05)
+  
+  if (nrow(significant_combined_results) == 0) {
+    message(paste("  No significant combined interactions (combined_padj < 0.05) found for signed -log10(p-value) heatmap (NES-based) in", analysis_title_prefix, "."))
+    return(invisible(NULL))
+  }
+  
+  num_pathways <- length(unique(significant_combined_results$pathway))
+  num_ranked_lists <- length(unique(significant_combined_results$ranked_list_name))
+  
+  if (num_pathways < 2 || num_ranked_lists < 2) {
+    message(paste("  Not enough unique pathways (", num_pathways, ") or ranked lists (", num_ranked_lists, ") for a meaningful signed -log10(p-value) heatmap (NES-based) in", analysis_title_prefix, ". Skipping heatmap."))
+    return(invisible(NULL))
+  }
+  
+  # Calculate signed_log10_p using combined_NES
+  heatmap_data <- significant_combined_results %>%
+    dplyr::mutate(
+      signed_log10_p = sign(combined_NES) * (-log10(combined_padj)) # Changed combined_ES to combined_NES
+    ) %>%
+    dplyr::select(pathway, ranked_list_name, signed_log10_p) %>%
+    tidyr::pivot_wider(names_from = ranked_list_name, values_from = signed_log10_p, values_fill = 0) 
+  
+  mat_for_filtering <- as.matrix(heatmap_data %>% dplyr::select(-pathway))
+  rownames(mat_for_filtering) <- heatmap_data$pathway
+  
+  row_non_zero_scores_counts <- rowSums(mat_for_filtering != 0, na.rm = TRUE)
+  heatmap_data <- heatmap_data[row_non_zero_scores_counts >= 5, ] 
+  
+  if (nrow(heatmap_data) == 0) {
+    message(paste("  No pathways left after filtering for at least 5 non-zero signed -log10(p-value) enrichments (NES-based) for heatmap in", analysis_title_prefix, ". Skipping heatmap."))
+    return(invisible(NULL))
+  }
+  
+  mat <- as.matrix(heatmap_data %>% dplyr::select(-pathway))
+  rownames(mat) <- heatmap_data$pathway
+  
+  max_abs_score <- max(abs(mat), na.rm = TRUE)
+  col_fun <- colorRamp2(c(-max_abs_score, -max_abs_score/2, 0, max_abs_score/2, max_abs_score), 
+                        c("darkblue", "lightblue", "white", "pink2", "darkred"))
+  
+  # Determine essential genes for columns (perturbation genes)
+  perturb_gene_symbols_in_cols <- gsub("^(.*?)\\s+Knockdown Signature - .*", "\\1", colnames(mat))
+  is_perturb_gene_essential <- (perturb_gene_symbols_in_cols %in% essential_gene_list)
+  
+  column_ha = NULL
+  if (!is.null(essential_gene_list) && length(essential_gene_list) > 0) {
+    column_ha <- HeatmapAnnotation(
+      is_essential = anno_simple(is_perturb_gene_essential, col = c("TRUE" = "darkgreen", "FALSE" = "grey90"),
+                                 height = unit(3, "mm"), pch = ifelse(is_perturb_gene_essential, 18, NA), pt_gp = gpar(col = "black", fontsize = 8)),
+      annotation_name_side = "left",
+      annotation_legend_param = list(is_essential = list(title = "Essential Perturbation", at = c(FALSE, TRUE), labels = c("No", "Yes"),
+                                                         labels_gp = gpar(fontsize = 8), title_gp = gpar(fontsize = 9, fontface = "bold")))
+    )
+  }
+  
+  hm_title <- paste0("Clustered Heatmap: ", analysis_title_prefix, "\n(Signed -log10(Combined P-value), by NES)", # Changed title
+                     "\nRows: ", nrow(mat), ", Cols: ", ncol(mat)) 
+  file_name_base <- paste0(gsub(" ", "_", analysis_title_prefix), "_signed_log10_pvalue_NES_heatmap") # Changed filename
+  heatmap_output_path_png <- file.path(output_dir, paste0(file_name_base, ".png"))
+  heatmap_output_path_svg <- file.path(output_dir, paste0(file_name_base, ".svg"))
+  
+  hm <- Heatmap(
+    mat,
+    name = "Signed -log10(P)",
+    col = col_fun,
+    na_col = "grey90",
+    cluster_rows = TRUE,
+    cluster_columns = TRUE,
+    show_row_names = FALSE,
+    row_names_gp = gpar(fontsize = 6),
+    column_names_gp = gpar(fontsize = 8),
+    column_names_rot = 90,
+    top_annotation = column_ha # Add annotation
+  )
+  
+  png(heatmap_output_path_png, width = 2200, height = 1800, res = 300)
+  draw(hm, column_title = hm_title)
+  dev.off()
+  
+  svg(heatmap_output_path_svg, width = 7.33, height = 6)
+  draw(hm, column_title = hm_title)
+  dev.off()
+  
+  message("  Signed -log10(p-value) (NES-based) clustered heatmap generated and saved to: ", heatmap_output_path_png)
+}
+
 
 #' Generates an exploratory plot of adjusted p-value vs. ES.
 #'
 #' @param fgsea_df A data frame of fgsea results (can be raw or combined, specify ES_col and pval_col).
 #' @param analysis_title_prefix A string for plot titles.
 #' @param output_dir Path to save the plots.
-#' @param es_col The name of the ES column (e.g., "NES", "ES", "combined_ES").
+#' @param es_col The name of the ES column (e.g., "NES", "ES", "combined_NES").
 #' @param pval_col The name of the p-value column (e.g., "padj", "combined_padj").
 #' @param max_plot_points Optional: maximum number of points to plot for performance, samples if more.
 plot_pval_vs_es <- function(fgsea_df, analysis_title_prefix, output_dir, 
@@ -1022,7 +1198,7 @@ plot_pval_vs_es <- function(fgsea_df, analysis_title_prefix, output_dir,
 #' @param fgsea_df A data frame of fgsea results (can be raw or combined, specify ES_col).
 #' @param analysis_title_prefix A string for plot titles.
 #' @param output_dir Path to save the plots.
-#' @param es_col The name of the ES column (e.g., "NES", "ES", "combined_ES").
+#' @param es_col The name of the ES column (e.g., "NES", "ES", "combined_NES").
 #' @param max_plot_points Optional: maximum number of points to plot for performance, samples if more.
 plot_geneset_size_vs_es <- function(fgsea_df, analysis_title_prefix, output_dir, 
                                     es_col = "NES", max_plot_points = 50000) {
@@ -1054,7 +1230,7 @@ plot_geneset_size_vs_es <- function(fgsea_df, analysis_title_prefix, output_dir,
   
   p <- ggplot(plot_data, aes(x = size, y = !!sym(es_col))) +
     geom_point(alpha = 0.5, size = 1) +
-    geom_smooth(method = "loess", color = "blue", se = TRUE) + # Add a smooth line
+    geom_smooth(method = "loess", color = "blue", se = FALSE) + 
     labs(
       title = paste0(analysis_title_prefix, ": Gene Set Size vs ", es_col),
       x = "Gene Set Size",
@@ -1072,6 +1248,120 @@ plot_geneset_size_vs_es <- function(fgsea_df, analysis_title_prefix, output_dir,
   message("  Gene set size vs ES plot generated and saved to: ", plot_filename_png)
 }
 
+
+#' Generates a scatter plot comparing combined NES from age-centered and perturbation-centered analyses.
+#' Each point represents a unique (Tissue, Perturbation_Gene, Cell_Line) triplet.
+#'
+#' @param age_combined_df A data frame of combined fgsea results from age-centered analysis.
+#' @param perturb_combined_df A data frame of combined fgsea results from perturbation-centered analysis.
+#' @param output_dir Path to save the plots.
+#' @param top_n_to_label Numeric, number of top/bottom points to label by default.
+#' @param essential_gene_list Character vector of essential genes for highlighting.
+plot_tissue_perturb_scatterplot <- function(age_combined_df, perturb_combined_df, output_dir, top_n_to_label = 20, essential_gene_list = NULL) {
+  message("Generating tissue-perturbation scatter plot...")
+  
+  if (is.null(age_combined_df) || nrow(age_combined_df) == 0) {
+    message("Age-centered combined results are empty. Skipping tissue-perturbation scatter plot.")
+    return(invisible(NULL))
+  }
+  if (is.null(perturb_combined_df) || nrow(perturb_combined_df) == 0) {
+    message("Perturbation-centered combined results are empty. Skipping tissue-perturbation scatter plot.")
+    return(invisible(NULL))
+  }
+  
+  # Helper to extract relevant names and clean them for joining
+  extract_meta_age <- age_combined_df %>%
+    dplyr::filter(combined_padj < 0.05) %>%
+    dplyr::mutate(
+      tissue = gsub("Aging Signature - (.*)", "\\1", ranked_list_name),
+      perturb_gene_cl = gsub("^(.*?)\\s+Knockdown Signature - (.*)", "\\1 in \\2", pathway) # Capture gene and cell line
+    ) %>%
+    dplyr::select(tissue, perturb_gene_cl, age_combined_NES = combined_NES, age_combined_padj = combined_padj) %>% 
+    dplyr::distinct(tissue, perturb_gene_cl, .keep_all = TRUE) 
+  
+  extract_meta_perturb <- perturb_combined_df %>%
+    dplyr::filter(combined_padj < 0.05) %>%
+    dplyr::mutate(
+      tissue = gsub("Aging Signature - (.*)", "\\1", pathway),
+      perturb_gene_cl = gsub("^(.*?)\\s+Knockdown Signature - (.*)", "\\1 in \\2", ranked_list_name) # Capture gene and cell line
+    ) %>%
+    dplyr::select(tissue, perturb_gene_cl, perturb_combined_NES = combined_NES, perturb_combined_padj = combined_padj) %>% 
+    dplyr::distinct(tissue, perturb_gene_cl, .keep_all = TRUE) 
+  
+  if (nrow(extract_meta_age) == 0 || nrow(extract_meta_perturb) == 0) {
+    message("No significant data after parsing for tissue-perturbation scatter plot. Skipping.")
+    return(invisible(NULL))
+  }
+  
+  merged_data <- dplyr::inner_join(
+    extract_meta_age,
+    extract_meta_perturb,
+    by = c("tissue", "perturb_gene_cl")
+  ) %>%
+    dplyr::mutate(
+      label = paste0(perturb_gene_cl, ", Tissue: ", tissue),
+      min_padj = pmin(age_combined_padj, perturb_combined_padj, na.rm = TRUE),
+      perturb_gene_symbol = gsub("^(.*?)\\s+in .*", "\\1", perturb_gene_cl) # Extract gene symbol for essential gene check
+    )
+  
+  if (nrow(merged_data) == 0) {
+    message("No common significant tissue-perturbation pairs found for scatter plot. Skipping.")
+    return(invisible(NULL))
+  }
+  
+  # Label essential genes in the data
+  if (!is.null(essential_gene_list) && length(essential_gene_list) > 0) {
+    merged_data <- merged_data %>%
+      dplyr::mutate(
+        is_essential = perturb_gene_symbol %in% essential_gene_list
+      )
+  } else {
+    merged_data$is_essential <- FALSE # Default if no list
+  }
+  
+  # Select top and bottom entries for labeling
+  top_pos <- merged_data %>% 
+    dplyr::arrange(dplyr::desc(age_combined_NES * perturb_combined_NES)) %>% 
+    dplyr::slice(1:min(dplyr::n(), top_n_to_label))
+  top_neg <- merged_data %>% 
+    dplyr::arrange(age_combined_NES * perturb_combined_NES) %>% 
+    dplyr::slice(1:min(dplyr::n(), top_n_to_label))
+  
+  labels_to_show <- unique(rbind(top_pos, top_neg)) %>% pull(label)
+  
+  plot_data <- merged_data %>%
+    dplyr::mutate(
+      is_labeled = label %in% labels_to_show
+    )
+  
+  # Plotting with combined_NES and highlighting essential genes
+  p <- ggplot(plot_data, aes(x = perturb_combined_NES, y = age_combined_NES)) + 
+    geom_point(aes(color = -log10(min_padj), size = -log10(min_padj), shape = is_essential), alpha = 0.7) + # Added shape
+    geom_vline(xintercept = 0, linetype = "dashed", color = "gray") +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "gray") +
+    geom_text(data = dplyr::filter(plot_data, is_labeled), aes(label = label), 
+              size = 2.5, vjust = -0.8, hjust = 0.5, check_overlap = TRUE) +
+    scale_color_viridis_c(name = "-log10(Min Adj. P)") +
+    scale_size_continuous(range = c(1, 5), name = "-log10(Min Adj. P)") +
+    scale_shape_manual(values = c("FALSE" = 16, "TRUE" = 18), name = "Essential Perturbation", labels = c("No", "Yes")) + # Square for essential
+    labs(
+      title = "Comparison of Age-Centered vs. Perturbation-Centered Combined NES", 
+      subtitle = "Each point represents a (Perturbation Gene + Cell Line, Tissue) pair",
+      x = "Perturbation-Centered Combined NES (Perturbation's effect on Aging)", 
+      y = "Age-Centered Combined NES (Aging's effect on Perturbation)" 
+    ) +
+    theme_minimal() +
+    theme(plot.title = element_text(face = "bold", hjust = 0.5),
+          plot.subtitle = element_text(hjust = 0.5))
+  
+  plot_filename_png <- file.path(output_dir, "age_vs_perturb_combined_NES_scatterplot.png") 
+  ggsave(plot_filename_png, p, width = 12, height = 10)
+  
+  plot_filename_svg <- file.path(output_dir, "age_vs_perturb_combined_NES_scatterplot.svg") 
+  ggsave(plot_filename_svg, p, width = 12, height = 10)
+  
+  message("  Tissue-perturbation scatter plot generated and saved to: ", plot_filename_png)
+}
 
 
 # --- Main Script Execution ---
@@ -1136,14 +1426,15 @@ if (!is.null(fgsea_res_age_centered)) {
   
   if (!is.null(fgsea_res_age_centered_combined) && nrow(fgsea_res_age_centered_combined) > 0) {
     message("\n--- Generating NEW Age-Centered Visualizations ---")
-    plot_combined_fgsea_dotplot(fgsea_res_age_centered_combined, "Age-Centered Analysis", output_dir, top_n_combined_plots)
-    plot_combined_heatmap(fgsea_res_age_centered_combined, "Age-Centered Analysis", output_dir)
+    plot_combined_fgsea_dotplot(fgsea_res_age_centered_combined, "Age-Centered Analysis", output_dir, top_n_combined_plots, essential_gene_list)
+    plot_combined_heatmap(fgsea_res_age_centered_combined, "Age-Centered Analysis", output_dir, essential_gene_list)
+    plot_combined_heatmap_signed_pvalue_NES(fgsea_res_age_centered_combined, "Age-Centered Analysis", output_dir, essential_gene_list)
     # Exploratory plots for raw fgsea results
     plot_pval_vs_es(fgsea_res_age_centered, "Age-Centered Analysis (Raw FGSEA)", output_dir, es_col = "NES", pval_col = "padj")
     plot_geneset_size_vs_es(fgsea_res_age_centered, "Age-Centered Analysis (Raw FGSEA)", output_dir, es_col = "NES")
     # Exploratory plots for combined scores
-    plot_pval_vs_es(fgsea_res_age_centered_combined, "Age-Centered Analysis (Combined ES)", output_dir, es_col = "combined_ES", pval_col = "combined_padj")
-    plot_geneset_size_vs_es(fgsea_res_age_centered_combined, "Age-Centered Analysis (Combined ES)", output_dir, es_col = "combined_ES")
+    plot_pval_vs_es(fgsea_res_age_centered_combined, "Age-Centered Analysis (Combined NES)", output_dir, es_col = "combined_NES", pval_col = "combined_padj")
+    plot_geneset_size_vs_es(fgsea_res_age_centered_combined, "Age-Centered Analysis (Combined NES)", output_dir, es_col = "combined_NES")
   } else {
     message("Skipping new Age-Centered visualizations due to no combined results.")
   }
@@ -1202,14 +1493,15 @@ if (!is.null(fgsea_res_perturb_centered)) {
   
   if (!is.null(fgsea_res_perturb_centered_combined) && nrow(fgsea_res_perturb_centered_combined) > 0) {
     message("\n--- Generating NEW Perturbation-Centered Visualizations ---")
-    plot_combined_fgsea_dotplot(fgsea_res_perturb_centered_combined, "Perturbation-Centered Analysis", output_dir, top_n_combined_plots)
-    plot_combined_heatmap(fgsea_res_perturb_centered_combined, "Perturbation-Centered Analysis", output_dir)
+    plot_combined_fgsea_dotplot(fgsea_res_perturb_centered_combined, "Perturbation-Centered Analysis", output_dir, top_n_combined_plots, essential_gene_list)
+    plot_combined_heatmap(fgsea_res_perturb_centered_combined, "Perturbation-Centered Analysis", output_dir, essential_gene_list)
+    plot_combined_heatmap_signed_pvalue_NES(fgsea_res_perturb_centered_combined, "Perturbation-Centered Analysis", output_dir, essential_gene_list)
     # Exploratory plots for raw fgsea results
     plot_pval_vs_es(fgsea_res_perturb_centered, "Perturbation-Centered Analysis (Raw FGSEA)", output_dir, es_col = "NES", pval_col = "padj")
     plot_geneset_size_vs_es(fgsea_res_perturb_centered, "Perturbation-Centered Analysis (Raw FGSEA)", output_dir, es_col = "NES")
     # Exploratory plots for combined scores
-    plot_pval_vs_es(fgsea_res_perturb_centered_combined, "Perturbation-Centered Analysis (Combined ES)", output_dir, es_col = "combined_ES", pval_col = "combined_padj")
-    plot_geneset_size_vs_es(fgsea_res_perturb_centered_combined, "Perturbation-Centered Analysis (Combined ES)", output_dir, es_col = "combined_ES")
+    plot_pval_vs_es(fgsea_res_perturb_centered_combined, "Perturbation-Centered Analysis (Combined NES)", output_dir, es_col = "combined_NES", pval_col = "combined_padj")
+    plot_geneset_size_vs_es(fgsea_res_perturb_centered_combined, "Perturbation-Centered Analysis (Combined NES)", output_dir, es_col = "combined_NES")
   } else {
     message("Skipping new Perturbation-Centered visualizations due to no combined results.")
   }
@@ -1221,6 +1513,14 @@ if (!is.null(fgsea_res_perturb_centered)) {
   data.table::fwrite(fgsea_res_perturb_centered, file.path(output_dir, "fgsea_results_perturbation_centered.csv"))
   message("Full Perturbation-Centered fgsea results saved to: ", file.path(output_dir, "fgsea_results_perturbation_centered.csv"))
 }
+
+# Cross-Analysis Scatter Plot (Pass essential gene list, now plots NES)
+if (!is.null(fgsea_res_age_centered_combined) && !is.null(fgsea_res_perturb_centered_combined)) {
+  plot_tissue_perturb_scatterplot(fgsea_res_age_centered_combined, fgsea_res_perturb_centered_combined, output_dir, essential_gene_list = essential_gene_list)
+} else {
+  message("\nSkipping Tissue-Perturbation scatter plot due to missing combined results from one or both analyses.")
+}
+
 
 message("\n--- GSEA Combined Analysis Complete ---")
 
