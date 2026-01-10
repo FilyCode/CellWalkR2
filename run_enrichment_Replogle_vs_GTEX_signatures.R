@@ -875,17 +875,17 @@ plot_combined_fgsea_dotplot <- function(combined_fgsea_df, analysis_title_prefix
   }
   
   # --- Plot 1: Top Positive combined_NES (Gero-advancer) ---
-  data_pos <- all_significant_combined_results %>%
+  data_pos <- plot_data_base %>%
     dplyr::filter(combined_NES > 0) %>%
     dplyr::arrange(dplyr::desc(combined_NES)) %>%
     dplyr::slice(1:min(dplyr::n(), top_n))
   
   plot_pos <- if (nrow(data_pos) > 0) {
     ggplot(data_pos, aes(x = reorder(pathway, combined_NES), y = ranked_list_name)) +
-      geom_point(aes(size = size, color = combined_NES, shape = is_essential)) + # Added shape for essential genes
+      geom_point(aes(size = size, color = combined_NES, shape = is_essential)) + # 'is_essential' is now available
       scale_size_continuous(name = "Gene Set Size") +
-      scale_color_gradient(low = "yellow", high = "red", name = "Combined NES\n(NES_UP - NES_DN)") + 
-      scale_shape_manual(values = c("FALSE" = 16, "TRUE" = 18), name = "Essential Gene", labels = c("No", "Yes")) + # Square for essential
+      scale_color_gradient(low = "yellow", high = "red", name = "Combined NES\n(NES_UP - NES_DN)") +
+      scale_shape_manual(values = c("FALSE" = 16, "TRUE" = 18), name = "Essential Gene", labels = c("No", "Yes")) +
       coord_flip() +
       theme_bw() +
       theme(axis.text.x = element_text(angle = 45, hjust = 1),
@@ -893,21 +893,21 @@ plot_combined_fgsea_dotplot <- function(combined_fgsea_df, analysis_title_prefix
             axis.title = element_text(size = 8), axis.text = element_text(size = 7),
             legend.text = element_text(size = 7), legend.title = element_text(size = 8),
             legend.position = "bottom", plot.margin = margin(5, 5, 5, 5, "pt")) +
-      labs(x = gene_set_label, y = ranked_list_label, title = paste0("Top ", top_n, " Gero-Advancer Pathways (Positive Combined NES)")) 
+      labs(x = gene_set_label, y = ranked_list_label, title = paste0("Top ", top_n, " Gero-Advancer Pathways (Positive Combined NES)"))
   } else {
     ggplot() + geom_text(aes(x=0.5, y=0.5, label="No significant Gero-Advancer pathways"), size=4, color="grey50") + theme_void()
   }
   message(paste0("Prepared plot for Top ", top_n, " Gero-Advancer pathways (", nrow(data_pos), " results)."))
   
   # --- Plot 2: Top Negative combined_NES (Gero-protector) ---
-  data_neg <- all_significant_combined_results %>%
+  data_neg <- plot_data_base %>%
     dplyr::filter(combined_NES < 0) %>%
     dplyr::arrange(combined_NES) %>% # Arrange ascending for most negative first
     dplyr::slice(1:min(dplyr::n(), top_n))
   
   plot_neg <- if (nrow(data_neg) > 0) {
     ggplot(data_neg, aes(x = reorder(pathway, combined_NES), y = ranked_list_name)) +
-      geom_point(aes(size = size, color = combined_NES, shape = is_essential)) + # Added shape for essential genes
+      geom_point(aes(size = size, color = combined_NES, shape = is_essential)) + # 'is_essential' is now available
       scale_size_continuous(name = "Gene Set Size") +
       scale_color_gradient(low = "darkblue", high = "lightblue", name = "Combined NES\n(NES_UP - NES_DN)") + # Gero-protector colors
       scale_shape_manual(values = c("FALSE" = 16, "TRUE" = 18), name = "Essential Gene", labels = c("No", "Yes")) +
