@@ -114,8 +114,34 @@ extract_ranked_lists <- function(omic_collection, collection_name, simplified_ge
       next
     }
     
-    # Use the pre-simplified gene_map for direct lookup
-    df_for_ranks$gene_name <- simplified_gene_map[df_for_ranks$probe_id]
+    # Use the pre-simplified gene_map for direct lookup if we have ENSG* names and not gene symbols, otherwise just use probe_id
+    # preserve original order
+    df_for_ranks$orig_row <- seq_len(nrow(df_for_ranks))
+    
+    # detect ENSG probe_ids
+    is_ensg <- grepl("^ENSG", df_for_ranks$probe_id)
+    
+    # vectorized lookup for ENSG rows (fast named-vector indexing)
+    gene_name <- rep(NA_character_, nrow(df_for_ranks))
+    gene_name[is_ensg] <- simplified_gene_map[df_for_ranks$probe_id[is_ensg]]
+    
+    # fallback: use probe_id when mapping failed or for non-ENSG rows
+    na_idx <- is.na(gene_name)
+    gene_name[na_idx] <- df_for_ranks$probe_id[na_idx]
+    
+    # assign gene_name
+    df_for_ranks$gene_name <- gene_name
+    
+    # deduplicate only among successfully mapped ENSG rows (keep first occurrence)
+    mapped_idx <- is_ensg & df_for_ranks$gene_name != df_for_ranks$probe_id
+    keep <- rep(TRUE, nrow(df_for_ranks))
+    dup_pos <- which(mapped_idx)[duplicated(df_for_ranks$gene_name[mapped_idx])]
+    keep[dup_pos] <- FALSE
+    
+    # filter and restore original order; drop helper column
+    df_for_ranks <- df_for_ranks[keep, , drop = FALSE]
+    df_for_ranks <- df_for_ranks[order(df_for_ranks$orig_row), ]
+    df_for_ranks$orig_row <- NULL
 
     current_ranks <- df_for_ranks %>%
       dplyr::select(gene_name, score) %>% 
