@@ -1349,26 +1349,56 @@ plot_cross_analysis_scatterplots <- function(age_combined_df, perturb_combined_d
     return(invisible(NULL))
   }
   
+  # Helper function to extract base name and direction
+  extract_components_vectorized <- function(signature_strings) {
+    direction <- rep("UNKNOWN", length(signature_strings))
+    base_name <- signature_strings
+    
+    # Identify entries ending with _UP or _DN
+    up_idx <- grepl("_UP$", signature_strings)
+    dn_idx <- grepl("_DN$", signature_strings)
+    
+    # Assign direction and remove suffix for _UP entries
+    direction[up_idx] <- "UP"
+    base_name[up_idx] <- gsub("_UP$", "", signature_strings[up_idx])
+    
+    # Assign direction and remove suffix for _DN entries
+    direction[dn_idx] <- "DN"
+    base_name[dn_idx] <- gsub("_DN$", "", signature_strings[dn_idx])
+    
+    list(base = base_name, direction = direction)
+  }
+  
   # Create symmetric identifiers for joining the two dataframes.
-  # For age_filt: 'pathway' is the Perturbation signature, 'ranked_list_name' is the Aging tissue.
-  # For perturb_filt: 'ranked_list_name' is the Perturbation signature, 'pathway' is the Aging tissue.
-  # The goal is to join on (Perturbation_Signature, Aging_Tissue).
+  # The goal is to join on (Perturbation_Signature_Base, Aging_Tissue_Base, Direction).
   
   age_filt_for_join <- age_filt %>%
     dplyr::mutate(
-      perturb_signature = pathway, # e.g., "FOXO1 Knockdown Signature - K562"
-      aging_tissue = ranked_list_name, # e.g., "Lung"
+      # 'pathway' column contains the perturbation signature with _UP/_DN suffix
+      # Directly extract base and direction
+      perturb_base_signature = extract_components_vectorized(pathway)$base,
+      direction = extract_components_vectorized(pathway)$direction, 
+      
+      # 'ranked_list_name' column contains the clean aging tissue name
+      aging_tissue = ranked_list_name, 
+      
       # Create a consistent identifier string for joining
-      identifier = paste0(perturb_signature, "__", aging_tissue)
+      identifier = paste0(perturb_base_signature, "__", aging_tissue, "__", direction)
     ) %>%
     dplyr::select(identifier, combined_ES_age, combined_NES_age, combined_padj_age, size_age)
   
   perturb_filt_for_join <- perturb_filt %>%
     dplyr::mutate(
-      perturb_signature = ranked_list_name, # e.g., "FOXO1 Knockdown Signature - K562"
-      aging_tissue = pathway, # e.g., "Lung"
+      # 'ranked_list_name' column contains the clean perturbation signature name
+      perturb_base_signature = ranked_list_name, 
+      
+      # 'pathway' column contains the aging tissue name with _UP/_DN suffix
+      # Directly extract base and direction
+      aging_tissue = extract_components_vectorized(pathway)$base,
+      direction = extract_components_vectorized(pathway)$direction, 
+      
       # Create a consistent identifier string for joining
-      identifier = paste0(perturb_signature, "__", aging_tissue)
+      identifier = paste0(perturb_base_signature, "__", aging_tissue, "__", direction)
     ) %>%
     dplyr::select(identifier, combined_ES_perturb, combined_NES_perturb, combined_padj_perturb, size_perturb)
   
@@ -1383,13 +1413,15 @@ plot_cross_analysis_scatterplots <- function(age_combined_df, perturb_combined_d
     return(invisible(NULL))
   }
   
-  # Add metadata for plotting (perturb_gene_cl, tissue, perturb_gene_symbol, is_essential)
+  # Add metadata for plotting (perturb_gene_cl, tissue, direction, perturb_gene_symbol, is_essential)
   merged_data <- merged_data %>%
-    # Extract perturb_gene_cl and tissue back from the identifier
-    tidyr::separate(identifier, into = c("perturb_gene_cl", "tissue"), sep = "__", remove = FALSE) %>%
+    # Extract perturb_gene_cl, tissue, and direction back from the identifier
+    tidyr::separate(identifier, into = c("perturb_gene_cl", "tissue", "direction"), sep = "__", remove = FALSE) %>%
     dplyr::mutate(
-      label = paste0(perturb_gene_cl, ", Tissue: ", tissue), # Label for text annotation
-      perturb_gene_symbol = gsub("^(.*?)\\s+Knockdown Signature - .*", "\\1", perturb_gene_cl) # Extract gene symbol for essential gene check
+      # Label for text annotation, now including direction
+      label = paste0(perturb_gene_cl, " (", direction, "), Tissue: ", tissue), 
+      # Extract gene symbol (e.g., "UBL5" from "UBL5 Knockdown Signature - K562")
+      perturb_gene_symbol = gsub("^(.*?)\\s+Knockdown Signature - .*", "\\1", perturb_gene_cl) 
     )
   
   # Label essential genes
