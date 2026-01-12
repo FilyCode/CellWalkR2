@@ -735,7 +735,7 @@ calculate_combined_scores <- function(fgsea_df, analysis_name) {
   }
   
   combined_df <- fgsea_df %>%
-    dplyr::select(pathway, ranked_list_name, geneset_direction, NES, ES, padj, geneset_source_name, ranked_source_name) %>%
+    dplyr::select(pathway, ranked_list_name, geneset_direction, NES, ES, padj, size, geneset_source_name, ranked_source_name) %>%
     dplyr::mutate(geneset_direction = factor(geneset_direction, levels = c("UP", "DN"))) %>% 
     tidyr::pivot_wider(
       id_cols = c(pathway, ranked_list_name, geneset_source_name, ranked_source_name), 
@@ -999,14 +999,22 @@ plot_combined_heatmap <- function(combined_fgsea_df, analysis_title_prefix, outp
   perturb_gene_symbols_in_cols <- gsub("^(.*?)\\s+Knockdown Signature - .*", "\\1", colnames(mat))
   is_perturb_gene_essential <- (perturb_gene_symbols_in_cols %in% essential_gene_list)
   
-  column_ha = NULL
+  column_ha <- NULL
   if (!is.null(essential_gene_list) && length(essential_gene_list) > 0) {
+    # Align to columns explicitly
+    perturb_gene_symbols_in_cols <- gsub("^(.*?)\\s+Knockdown Signature - .*", "\\1", colnames(mat))
+    is_ess_chr <- ifelse(perturb_gene_symbols_in_cols %in% essential_gene_list, "TRUE", "FALSE")
+    # Ensure a plain character vector of same length as columns
+    is_ess_chr <- as.character(is_ess_chr)
+    # Named colors keyed by character values
+    ann_colors <- c("FALSE" = "grey90", "TRUE" = "darkgreen")
+    
+    # Minimal HeatmapAnnotation using a plain character vector (no anno_simple)
+    # This hands ComplexHeatmap an atomic vector directly.
     column_ha <- HeatmapAnnotation(
-      is_essential = anno_simple(is_perturb_gene_essential, col = c("TRUE" = "darkgreen", "FALSE" = "grey90"),
-                                 height = unit(3, "mm"), pch = ifelse(is_perturb_gene_essential, 18, NA), pt_gp = gpar(col = "black", fontsize = 8)),
-      annotation_name_side = "left",
-      annotation_legend_param = list(is_essential = list(title = "Essential Perturbation", at = c(FALSE, TRUE), labels = c("No", "Yes"),
-                                                         labels_gp = gpar(fontsize = 8), title_gp = gpar(fontsize = 9, fontface = "bold")))
+      is_essential = is_ess_chr,
+      col = list(is_essential = ann_colors),
+      annotation_name_side = "left"
     )
   }
   
@@ -1106,14 +1114,22 @@ plot_combined_heatmap_signed_pvalue_NES <- function(combined_fgsea_df, analysis_
   perturb_gene_symbols_in_cols <- gsub("^(.*?)\\s+Knockdown Signature - .*", "\\1", colnames(mat))
   is_perturb_gene_essential <- (perturb_gene_symbols_in_cols %in% essential_gene_list)
   
-  column_ha = NULL
+  column_ha <- NULL
   if (!is.null(essential_gene_list) && length(essential_gene_list) > 0) {
+    # Align to columns explicitly
+    perturb_gene_symbols_in_cols <- gsub("^(.*?)\\s+Knockdown Signature - .*", "\\1", colnames(mat))
+    is_ess_chr <- ifelse(perturb_gene_symbols_in_cols %in% essential_gene_list, "TRUE", "FALSE")
+    # Ensure a plain character vector of same length as columns
+    is_ess_chr <- as.character(is_ess_chr)
+    # Named colors keyed by character values
+    ann_colors <- c("FALSE" = "grey90", "TRUE" = "darkgreen")
+    
+    # Minimal HeatmapAnnotation using a plain character vector (no anno_simple)
+    # This hands ComplexHeatmap an atomic vector directly.
     column_ha <- HeatmapAnnotation(
-      is_essential = anno_simple(is_perturb_gene_essential, col = c("TRUE" = "darkgreen", "FALSE" = "grey90"),
-                                 height = unit(3, "mm"), pch = ifelse(is_perturb_gene_essential, 18, NA), pt_gp = gpar(col = "black", fontsize = 8)),
-      annotation_name_side = "left",
-      annotation_legend_param = list(is_essential = list(title = "Essential Perturbation", at = c(FALSE, TRUE), labels = c("No", "Yes"),
-                                                         labels_gp = gpar(fontsize = 8), title_gp = gpar(fontsize = 9, fontface = "bold")))
+      is_essential = is_ess_chr,
+      col = list(is_essential = ann_colors),
+      annotation_name_side = "left"
     )
   }
   
