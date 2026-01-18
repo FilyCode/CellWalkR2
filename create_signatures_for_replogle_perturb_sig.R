@@ -7,164 +7,267 @@
 # into OmicSignature objects. Finally, it organizes these into
 # OmicSignatureCollection objects for each cell line and a combined one.
 
-# --- 1. Setup and Load Libraries ---
-library(tidyverse)    # For data manipulation
-library(OmicSignature) # To work with OmicSignature objects and collections
-library(biomaRt)      # For gene ID mapping
-# For faster gene ID mapping, use a local annotation database.
-if (!requireNamespace("BiocManager", quietly=TRUE)) install.packages("BiocManager")
+# --- 0. Helper Function for Named Vector Deduplication ---
+# Merges named vectors, keeping the first occurrence for duplicate names.
+unique_names_merge <- function(vec1, vec2) {
+  combined_vec <- c(vec1, vec2)
+  # Deduplicates by name, keeping the first value encountered
+  tapply(combined_vec, names(combined_vec), `[`, 1)
+}
 
-# Create local gene annotation mapping
-# BiocManager::install("org.Hs.eg.db")
-# BiocManager::install("ensembldb")
-library(org.Hs.eg.db) # Local Human Gene annotation database
-library(ensembldb)
+# --- 1. Setup Environment and Libraries ---
+#' @title Setup R environment and load necessary libraries
+#' @description Loads required R packages and initializes the EnsDb object from a GTF file.
+#' @param gtf_path Path to the GTF file.
+#' @param output_db_path Desired path for the EnsDb SQLite database file.
+#' @return An EnsDb object for gene annotation.
+setup_environment <- function(gtf_path, output_db_path) {
+  # Load core libraries, suppressing startup messages for cleaner output
+  suppressPackageStartupMessages({
+    library(tidyverse)     # For data manipulation
+    library(OmicSignature) # To work with OmicSignature objects
+    library(biomaRt)       # For gene ID mapping (fallback, if needed)
+    library(org.Hs.eg.db)  # Local Human Gene annotation database
+    library(ensembldb)     # For EnsDb functionalities
+    library(gprofiler2)    # For functional enrichment (loaded, not used in this script)
+    library(rentrez)       # For NCBI E-utilities (loaded, not used in this script)
+    library(anndata)       # For reading H5AD files
+  })
+  
+  message("--- Setting up R Environment and EnsDb ---")
+  
+  # Create local EnsDb from GTF if it doesn't already exist
+  if (!file.exists(output_db_path)) {
+    message(paste0("  Creating EnsDb from GTF: ", gtf_path))
+    ensembldb::ensDbFromGtf(
+      gtf = gtf_path,
+      outfile = output_db_path,
+      path = dirname(output_db_path),
+      organism = "Homo sapiens",
+      genomeVersion = "GRCh38",
+      version = 114
+    )
+  } else {
+    message(paste0("  EnsDb already exists at: ", output_db_path))
+  }
+  
+  # Load the local SQLite EnsDb file
+  edb <- EnsDb(output_db_path)
+  metadata_edb <- metadata(edb)
+  message(paste0("  EnsDb loaded: Organism=", organism(edb),
+                 "; GenomeVersion=", metadata_edb[metadata_edb$name == "genome_build","value"],
+                 "; EnsemblVersion=", ensemblVersion(edb)))
+  return(edb)
+}
 
-gtf <- "/restricted/projectnb/agedisease/projects/challenge2025/data/Homo_sapiens.GRCh38.114.gtf"
-outdb <- "/restricted/projectnb/agedisease/projects/challenge2025/data/EnsDb.Hsapiens.GRCh38.114.sqlite"
-DBfile <- ensembldb::ensDbFromGtf(
-  gtf = gtf,
-  outfile = outdb,
-  path = dirname(outdb),
-  organism = "Homo sapiens",
-  genomeVersion = "GRCh38",
-  version = 114
+# --- 2. Configuration Parameters ---
+# Centralized list for all file paths and analysis parameters.
+config <- list(
+  # GTF and EnsDb paths
+  gtf_file = "/restricted/projectnb/agedisease/projects/challenge2025/data/Homo_sapiens.GRCh38.114.gtf",
+  ensdb_output_db = "/restricted/projectnb/agedisease/projects/challenge2025/data/EnsDb.Hsapiens.GRCh38.114.sqlite",
+  
+  # Input data paths for Perturb-seq experiments
+  data_input_dir = file.path("/restricted/projectnb/agedisease/projects/challenge2025/data/perturbational_sigs/replogle_2022"),
+  k562_data_file = "k562_ps_sig_all.rds",
+  rpe1_data_file = "rpe1_ps_sig_all.rds",
+  
+  # Output paths for processed data and gene mapping cache
+  output_base_dir = file.path("/restricted/projectnb/agedisease/projects/challenge2025/results/perturbational_omic_sigs/replogle_2022"),
+  k562_collection_output_file = "Replogle_K562_Perturb_OmicSignatureCollection.rds",
+  rpe1_collection_output_file = "Replogle_RPE1_Perturb_OmicSignatureCollection.rds",
+  combined_collection_output_file = "Replogle_Perturb_Combined_OmicSignatureCollection.rds",
+  gene_mapping_cache_file = "gene_symbol_to_ensembl_map.rds",
+  
+  # External H5AD data paths for additional gene mapping
+  k562_h5ad_file = "/restricted/projectnb/agedisease/CBMrepositoryData/replogle_2022/K562_essential_raw_singlecell_01.h5ad",
+  rpe1_h5ad_file = "/restricted/projectnb/agedisease/CBMrepositoryData/replogle_2022/rpe1_raw_singlecell_01.h5ad",
+  
+  # Filter parameters for OmicSignature objects (not used in this mapping script)
+  adj_p_cutoff = 0.05,
+  log2fc_abs_cutoff = 0.25,
+  max_genes_in_signature = 500
 )
 
-# Load the local SQLite EnsDb file to annotate the gene symbols
-edb <- EnsDb(outdb)
-metadata = metadata(edb)
-message("Created EnsDb with organism: ", organism(edb),
-        "; genomeVersion: ", metadata[metadata$name == "genome_build","value"],
-        "; ensemblVersion: ", ensemblVersion(edb))
-
-# --- 2. Define Paths and Parameters ---
-data_input_path <- file.path("/restricted/projectnb/agedisease/projects/challenge2025/data/perturbational_sigs/replogle_2022")
-k562_data_file <- file.path(data_input_path, "k562_ps_sig_all.rds")
-rpe1_data_file <- file.path(data_input_path, "rpe1_ps_sig_all.rds")
-
-output_base_path <- file.path("/restricted/projectnb/agedisease/projects/challenge2025/results/perturbational_omic_sigs/replogle_2022")
-
-k562_collection_output_file <- file.path(output_base_path, "Replogle_K562_Perturb_OmicSignatureCollection.rds")
-rpe1_collection_output_file <- file.path(output_base_path, "Replogle_RPE1_Perturb_OmicSignatureCollection.rds")
-combined_collection_output_file <- file.path(output_base_path, "Replogle_Perturb_Combined_OmicSignatureCollection.rds")
-gene_mapping_cache_file <- file.path(output_base_path, "gene_symbol_to_ensembl_map.rds") # Cache file for gene mapping
-
-# Define filter parameters
-adj_p_cutoff <- 0.05                # Adjusted p-value cutoff for significant genes in signature
-log2fc_abs_cutoff <- 0.25           # Absolute log2FC cutoff for significant genes in signature
-max_genes_in_signature <- 500       # Max. number of significant genes saved in the signature part of the OmicSignature object
-
-
-# --- 3. Load Data Files ---
-message("--- Loading Perturb-seq Data ---")
-k562_ps_sig_all <- readRDS(k562_data_file)
-rpe1_ps_sig_all <- readRDS(rpe1_data_file)
-
-message(paste0("Loaded K562 data: ", length(k562_ps_sig_all), " perturbation experiments."))
-message(paste0("Loaded RPE1 data: ", length(rpe1_ps_sig_all), " perturbation experiments."))
-
-
-# --- 4. Gene Symbol to Ensembl ID Mapping (Optimized with org.Hs.eg.db + biomaRt fallback) ---
-message("\n--- Mapping Gene Symbols to Ensembl IDs ---")
-
-# Extract all unique gene symbols
-all_gene_symbols <- unique(c(
-  unlist(lapply(k562_ps_sig_all, rownames)),
-  unlist(lapply(rpe1_ps_sig_all, rownames))
-))
-all_gene_symbols <- all_gene_symbols[all_gene_symbols != "" & !is.na(all_gene_symbols)]
-message(paste0("Found ", length(all_gene_symbols), " unique gene symbols across all datasets."))
-
-# Check if a cached mapping exists and load it
-gene_symbol_to_ensembl <- NULL
-if (file.exists(gene_mapping_cache_file)) {
-  message("  Loading gene mapping from cache...")
-  gene_symbol_to_ensembl <- readRDS(gene_mapping_cache_file)
-  # Filter to only symbols needed for this run
-  gene_symbol_to_ensembl <- gene_symbol_to_ensembl[names(gene_symbol_to_ensembl) %in% all_gene_symbols]
-  # Identify any new symbols not in cache
-  symbols_to_map <- setdiff(all_gene_symbols, names(gene_symbol_to_ensembl))
-  message(paste0("  Loaded ", length(gene_symbol_to_ensembl), " genes mapped from cache..."))
-} else {
-  symbols_to_map <- all_gene_symbols
+# --- 3. Data Loading ---
+#' @title Load Perturb-seq datasets
+#' @description Loads K562 and RPE1 Perturb-seq data from RDS files.
+#' @param config A list containing data file paths.
+#' @return A list with loaded K562 and RPE1 data.
+load_perturb_data <- function(config) {
+  message("\n--- Loading Perturb-seq Data ---")
+  k562_data <- readRDS(file.path(config$data_input_dir, config$k562_data_file))
+  rpe1_data <- readRDS(file.path(config$data_input_dir, config$rpe1_data_file))
+  
+  message(paste0("  Loaded K562 data: ", length(k562_data), " perturbation experiments."))
+  message(paste0("  Loaded RPE1 data: ", length(rpe1_data), " perturbation experiments."))
+  return(list(k562 = k562_data, rpe1 = rpe1_data))
 }
 
-
-if (length(symbols_to_map) > 0) {
-  # Step 1: Map using org.Hs.eg.db (local and fast)
-  message(paste0("  Attempting to map ", length(symbols_to_map), " symbols using org.Hs.eg.db..."))
-  ensembl_ids_from_db <- AnnotationDbi::mapIds(
-    org.Hs.eg.db,
-    keys = symbols_to_map,
-    column = "ENSEMBL",
-    keytype = "SYMBOL",
-    multiVals = "first"
-  )
-  ensembl_ids_from_db <- ensembl_ids_from_db[!is.na(ensembl_ids_from_db)]
-  if (is.null(gene_symbol_to_ensembl)) {
-    gene_symbol_to_ensembl <- ensembl_ids_from_db
+# --- 4. Gene Symbol to Ensembl ID Mapping ---
+#' @title Map gene symbols to Ensembl IDs using a layered approach
+#' @description Implements a robust strategy for mapping gene symbols to Ensembl IDs,
+#'   using cached mappings, org.Hs.eg.db, EnsDb, and external H5AD files.
+#' @param all_gene_symbols A character vector of unique gene symbols to map.
+#' @param edb An EnsDb object for gene annotation.
+#' @param config A list containing configuration parameters, especially paths for cache and H5AD files.
+#' @return A named character vector where names are gene symbols and values are Ensembl IDs.
+map_gene_symbols_to_ensembl <- function(all_gene_symbols, edb, config) {
+  message("\n--- Mapping Gene Symbols to Ensembl IDs ---")
+  # Clean up gene symbols: remove empty strings and NAs
+  all_gene_symbols <- all_gene_symbols[all_gene_symbols != "" & !is.na(all_gene_symbols)]
+  message(paste0("  Found ", length(all_gene_symbols), " unique gene symbols across all datasets."))
+  
+  gene_mapping_cache_file <- file.path(config$output_base_dir, config$gene_mapping_cache_file)
+  current_gene_map <- character(0) # Initialize an empty named vector for accumulating mappings
+  
+  # Load existing mapping from cache to avoid re-mapping known symbols
+  if (file.exists(gene_mapping_cache_file)) {
+    message("  Loading gene mapping from cache...")
+    cached_map <- readRDS(gene_mapping_cache_file)
+    # Filter cached map to only include symbols relevant for the current run
+    current_gene_map <- cached_map[names(cached_map) %in% all_gene_symbols]
+    message(paste0("  ", length(current_gene_map), " genes mapped from cache."))
+  }
+  
+  # Identify symbols that still need mapping
+  symbols_to_map <- setdiff(all_gene_symbols, names(current_gene_map))
+  
+  if (length(symbols_to_map) > 0) {
+    message(paste0("  ", length(symbols_to_map), " symbols still need mapping. Starting layered approach."))
+    
+    # Step 1: Map using org.Hs.eg.db (direct SYMBOL -> ENSEMBL)
+    mapped_by_orghs <- AnnotationDbi::mapIds(org.Hs.eg.db, keys = symbols_to_map,
+                                             column = "ENSEMBL", keytype = "SYMBOL", multiVals = "first")
+    mapped_by_orghs <- mapped_by_orghs[!is.na(mapped_by_orghs)]
+    current_gene_map <- unique_names_merge(current_gene_map, mapped_by_orghs)
+    message(paste0("  Mapped ", length(mapped_by_orghs), " symbols using org.Hs.eg.db (direct)."))
+    
+    symbols_to_map <- setdiff(all_gene_symbols, names(current_gene_map)) # Update remaining symbols
+    
+    # Step 2: Resolve aliases using org.Hs.eg.db (ALIAS -> SYMBOL -> ENSEMBL)
+    if (length(symbols_to_map) > 0) {
+      message(paste0("  Attempting to resolve aliases for ", length(symbols_to_map), " remaining symbols."))
+      alias_to_symbol <- AnnotationDbi::mapIds(org.Hs.eg.db, keys = symbols_to_map,
+                                               keytype = "ALIAS", column = "SYMBOL", multiVals = "first")
+      alias_to_symbol <- alias_to_symbol[!is.na(alias_to_symbol)]
+      
+      if (length(alias_to_symbol) > 0) {
+        # Map these canonical symbols to Ensembl IDs
+        canonical_symbols <- unique(alias_to_symbol)
+        mapped_canonical_to_ensembl <- AnnotationDbi::mapIds(org.Hs.eg.db, keys = canonical_symbols,
+                                                             column = "ENSEMBL", keytype = "SYMBOL", multiVals = "first")
+        mapped_canonical_to_ensembl <- mapped_canonical_to_ensembl[!is.na(mapped_canonical_to_ensembl)]
+        
+        # Reconstruct ALIAS -> ENSEMBL map from successful resolutions
+        resolved_alias_map <- character(0)
+        for (alias_key in names(alias_to_symbol)) {
+          canonical_sym <- alias_to_symbol[[alias_key]]
+          if (canonical_sym %in% names(mapped_canonical_to_ensembl)) {
+            resolved_alias_map[alias_key] <- mapped_canonical_to_ensembl[[canonical_sym]]
+          }
+        }
+        resolved_alias_map <- resolved_alias_map[!is.na(resolved_alias_map)]
+        current_gene_map <- unique_names_merge(current_gene_map, resolved_alias_map)
+        message(paste0("  Resolved and mapped ", length(resolved_alias_map), " symbols via aliases using org.Hs.eg.db."))
+      }
+    }
+    
+    symbols_to_map <- setdiff(all_gene_symbols, names(current_gene_map)) # Update remaining symbols
+    
+    # Step 3: Map using local EnsDb v114 (SYMBOL -> GENEID)
+    if (length(symbols_to_map) > 0) {
+      message(paste0("  Attempting to map ", length(symbols_to_map), " symbols using local EnsDb (v114)."))
+      res_ensdb <- ensembldb::select(edb, keys = symbols_to_map, keytype = "SYMBOL", columns = c("GENEID", "SYMBOL"))
+      ensdb_map <- setNames(res_ensdb$GENEID, res_ensdb$SYMBOL)
+      ensdb_map <- ensdb_map[!is.na(ensdb_map) & ensdb_map != ""]
+      current_gene_map <- unique_names_merge(current_gene_map, ensdb_map)
+      message(paste0("  Mapped ", length(ensdb_map), " symbols using EnsDb."))
+    }
+    
+    symbols_to_map <- setdiff(all_gene_symbols, names(current_gene_map)) # Update remaining symbols
+    
+    # Step 4: Map using external H5AD files (SYMBOL -> ENSG)
+    if (length(symbols_to_map) > 0) {
+      message(paste0("  Attempting to map ", length(symbols_to_map), " symbols using external h5ad data."))
+      k562_h5ad <- anndata::read_h5ad(config$k562_h5ad_file)
+      rpe1_h5ad <- anndata::read_h5ad(config$rpe1_h5ad_file)
+      
+      # Extract and combine mappings from H5AD files
+      map_k562 <- data.frame(symbol = as.character(k562_h5ad$obs$gene), ensg = as.character(k562_h5ad$obs$gene_id), stringsAsFactors = FALSE)
+      map_rpe1 <- data.frame(symbol = as.character(rpe1_h5ad$obs$gene), ensg = as.character(rpe1_h5ad$obs$gene_id), stringsAsFactors = FALSE)
+      
+      combined_h5ad_map_df <- unique(rbind(map_k562, map_rpe1))
+      # Remove rows with NA/empty symbol or Ensembl ID
+      combined_h5ad_map_df <- combined_h5ad_map_df[!(is.na(combined_h5ad_map_df$symbol) | combined_h5ad_map_df$symbol == "" |
+                                                       is.na(combined_h5ad_map_df$ensg)   | combined_h5ad_map_df$ensg == ""), ]
+      # Create one-to-one mapping, preferring first ENSG per symbol
+      h5ad_symbol_to_ensg <- tapply(combined_h5ad_map_df$ensg, combined_h5ad_map_df$symbol, function(x) unique(x)[1])
+      
+      # Apply this map to the currently remaining symbols
+      mapped_by_h5ad <- h5ad_symbol_to_ensg[symbols_to_map]
+      mapped_by_h5ad <- mapped_by_h5ad[!is.na(mapped_by_h5ad)]
+      current_gene_map <- unique_names_merge(current_gene_map, mapped_by_h5ad)
+      message(paste0("  Mapped ", length(mapped_by_h5ad), " symbols using h5ad data."))
+      
+      # Report symbols still unmapped after H5AD attempt
+      unmapped_h5ad_post <- symbols_to_map[!symbols_to_map %in% names(mapped_by_h5ad)]
+      if (length(unmapped_h5ad_post) > 0) {
+        warning(paste0("  ", length(unmapped_h5ad_post), " symbols were not found in the combined h5ad mapping (e.g., ",
+                       paste(head(unmapped_h5ad_post, 5), collapse = ", "),
+                       if (length(unmapped_h5ad_post) > 5) paste0(" ... (+", length(unmapped_h5ad_post) - 5, " more)")))
+      }
+    }
+    
+    # Step 5: Strip version suffix from Ensembl IDs (e.g., ENSG00000123456.10 -> ENSG00000123456)
+    current_gene_map <- sub("\\.\\d+$","", current_gene_map)
+    
+    # Save updated cache to disk
+    saveRDS(current_gene_map, file = gene_mapping_cache_file)
+    message(paste0("  Saved updated gene mapping cache to '", gene_mapping_cache_file, "'."))
+    
   } else {
-    gene_symbol_to_ensembl <- c(gene_symbol_to_ensembl, ensembl_ids_from_db)
+    message("  All gene symbols already mapped and present in cache. No new mapping performed.")
   }
-  mapped_by_db_count <- length(ensembl_ids_from_db)
-  
-  # Resolve aliases/deprecated symbols to boost mapping
-  symbols_remaining <- setdiff(symbols_to_map, names(ensembl_ids_from_db))
-  message(paste0("  Mapped ", mapped_by_db_count, " symbols using org.Hs.eg.db. ",
-                 "Resolving aliases for ", length(symbols_remaining), " remaining..."))
-  alias2symbol <- AnnotationDbi::mapIds(
-    org.Hs.eg.db,
-    keys = symbols_remaining,
-    keytype = "ALIAS",
-    column = "SYMBOL",
-    multiVals = "first"
-  )
-  symbols_resolved <- ifelse(!is.na(alias2symbol), alias2symbol, symbols_remaining)
-  
-  # Map remaining using EnsDb v114 offline
-  if (length(symbols_resolved) > 0) {
-    message(paste0("  Attempting to map ", length(symbols_resolved), " symbols using EnsDb.Hsapiens.v114..."))
-    res <- ensembldb::select(
-      edb,
-      keys = symbols_resolved,
-      keytype = "SYMBOL",
-      columns = c("GENEID", "SYMBOL")
-    )
-    # Build named vector SYMBOL -> GENEID
-    ensdb_map <- setNames(res$GENEID, res$SYMBOL)
-    ensdb_map <- ensdb_map[!is.na(ensdb_map) & ensdb_map != ""]
-    
-    # Prefer mappings for symbols that were originally requested
-    ensdb_map <- ensdb_map[names(ensdb_map) %in% symbols_remaining]
-    
-    # Merge and deduplicate (prefer existing org.Hs.eg.db mappings)
-    gene_symbol_to_ensembl <- c(gene_symbol_to_ensembl, ensdb_map)
-    gene_symbol_to_ensembl <- tapply(gene_symbol_to_ensembl, names(gene_symbol_to_ensembl), `[`, 1)
-  }
-  
-  # Strip version suffix from Ensembl IDs (e.g., ENSG... .xx)
-  strip_ver <- function(x) sub("\\.\\d+$","", x)
-  gene_symbol_to_ensembl <- strip_ver(gene_symbol_to_ensembl)
-  
-  # Save cache
-  saveRDS(gene_symbol_to_ensembl, file = gene_mapping_cache_file)
-  message(paste0("  Saved updated gene mapping cache to '", gene_mapping_cache_file, "'."))
-} else {
-  message("  All gene symbols already mapped and present in cache.")
+  return(current_gene_map)
 }
 
 
-final_mapped_count <- length(unique(names(gene_symbol_to_ensembl)))
-unmapped_overall_count <- length(all_gene_symbols) - final_mapped_count
+# --- Main Script Execution ---
+# This section executes the primary workflow of the script.
 
-message(paste0("Total successfully mapped symbols: ", final_mapped_count, " out of ", length(all_gene_symbols), "."))
+# 1. Setup Environment: Load libraries and initialize EnsDb object
+ens_db_obj <- setup_environment(config$gtf_file, config$ensdb_output_db)
+
+# 2. Load Perturb-seq Data for K562 and RPE1 cell lines
+perturb_data <- load_perturb_data(config)
+
+# 3. Extract all unique gene symbols from the loaded datasets
+all_gene_symbols_k562 <- unlist(lapply(perturb_data$k562, rownames))
+all_gene_symbols_rpe1 <- unlist(lapply(perturb_data$rpe1, rownames))
+all_unique_symbols <- unique(c(all_gene_symbols_k562, all_gene_symbols_rpe1))
+
+# 4. Perform Gene Symbol to Ensembl ID Mapping using the layered approach
+gene_symbol_to_ensembl <- map_gene_symbols_to_ensembl(all_unique_symbols, ens_db_obj, config)
+
+# 5. Final Mapping Summary: Report statistics on mapped and unmapped symbols
+final_mapped_count <- length(gene_symbol_to_ensembl)
+overall_symbols_count <- length(all_unique_symbols)
+unmapped_overall_count <- overall_symbols_count - final_mapped_count
+
+message("\n--- Gene Mapping Summary ---")
+message(paste0("  Total unique gene symbols requested: ", overall_symbols_count))
+message(paste0("  Successfully mapped to Ensembl IDs: ", final_mapped_count))
+message(paste0("  Symbols remaining unmapped: ", unmapped_overall_count))
+
 if (unmapped_overall_count > 0) {
-  message(paste0("  (Note: ", unmapped_overall_count, " gene symbols could not be mapped to Ensembl IDs and will use the gene symbol as ID)."))
+  unmapped_symbols <- setdiff(all_unique_symbols, names(gene_symbol_to_ensembl))
+  message(paste0("  First 10 unmapped symbols: ", paste(head(unmapped_symbols, 10), collapse = ", ")))
 }
 
 
-# --- 5. Helper Function to Create OmicSignature for a Single Perturbation ---
+
+# --- Helper Function to Create OmicSignature for a Single Perturbation ---
 create_perturb_omic_signature <- function(
     perturbation_df, perturbation_gene_symbol, cell_line,
     gene_symbol_to_ensembl_map,
