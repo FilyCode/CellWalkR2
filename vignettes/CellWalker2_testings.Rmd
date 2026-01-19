@@ -1,0 +1,584 @@
+---
+title: "Spatial Multi-Omics Preprocessing for CellWalker2"
+author: "AI Assistant"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, cache = FALSE, dev = "png", fig.width = 10, fig.height = 8)
+```
+
+
+```{r libraries, message=FALSE}
+library(CellWalkR)
+library(ArchR)
+library(Seurat) # For scRNA-seq data handling and mock spatial data
+library(Matrix)
+library(ggplot2)
+library(data.table)
+library(GenomicRanges) # For ATAC-seq peak handling
+library(FNN) # For KNN search in spatial data
+set.seed(123) # For reproducibility
+```
+
+```{r data import and processing}
+# Set ArchR threads
+addArchRThreads(threads = 1) 
+
+# Download tutorial data. 
+inputFiles <- getTutorialData("Hematopoiesis") 
+
+# Add genome annotation
+addArchRGenome("hg19")
+
+# Create Arrow Files
+ArrowFiles <- createArrowFiles(
+  inputFiles = inputFiles,
+  sampleNames = names(inputFiles),
+  filterTSS = 4,
+  filterFrags = 1000, 
+  addTileMat = TRUE,
+  addGeneScoreMat = TRUE
+)
+
+# Infer Doublets
+doubScores <- addDoubletScores(
+  input = ArrowFiles,
+  k = 10,
+  knnMethod = "UMAP",
+  LSIMethod = 1
+)
+
+# Create ArchRProject
+proj <- ArchRProject(
+  ArrowFiles = ArrowFiles, 
+  outputDirectory = "HemeTutorial",
+  copyArrows = TRUE 
+)
+
+# Filter Doublets
+proj <- filterDoublets(ArchRProj = proj)
+
+# Dimensionality Reduction and Clustering
+proj <- addIterativeLSI(ArchRProj = proj, useMatrix = "TileMatrix", name = "IterativeLSI")
+proj <- addClusters(input = proj, reducedDims = "IterativeLSI")
+
+# --- Now, how CellWalker2 uses this ArchRProject ---
+```
+
+```{r using ArchR in CellWalker}
+# 1. Compute cell-to-cell similarity from ArchRProject
+#    This will create a cell-by-cell similarity matrix using the 'TileMatrix'
+atac_cell_graph_archr <- computeCellSim(proj, method = "sparseJaccard")
+message("Dimensions of ATAC cell graph from ArchRProject: ", paste(dim(atac_cell_graph_archr), collapse = "x"))
+
+# 2. Map peaks to genes (requires marker genes and genomic regions)
+#    For demonstration, let's load sample marker genes and genomic regions
+data("SampleCellWalkRData") 
+labelGenes_atac <- SampleCellWalkRData$labelGenes
+regions_atac <- getRegions(genome = "hg38") 
+
+atac_gene_peak_map <- mapArchRToGenes(labelGenes_atac, proj, whichMat = "TileMatrix", regions = regions_atac)
+message("Structure of ATAC gene-peak map (first label):")
+str(atac_gene_peak_map[[1]])
+
+# 3. Compute cell-to-label edges
+atac_label_edges <- computeLabelEdges(labelGenes_atac, proj, atac_gene_peak_map, method = "None", whichMat = "TileMatrix")
+message("Dimensions of ATAC label edges: ", paste(dim(atac_label_edges), collapse = "x"))
+
+# Note: For now, we are keeping the ArchRProject active.
+# In a real workflow, you might clean up temporary files/projects after extraction.
+# Example cleanup (uncomment if you wish to run it after validating the steps):
+# unlink("HemeTutorial", recursive = TRUE)
+# unlink("ArchRLogs", recursive = TRUE)
+# file.remove(ArrowFiles)
+
+```
+
+```{r mock spatial data generation}
+# Number of cells/spots (matched to ArchR project for consistency in later steps)
+num_cells <- ncol(atac_cell_graph_archr) 
+# Number of genes
+num_genes <- 500
+
+# Generate random gene expression matrix
+mock_rna_counts <- Matrix(
+  rpois(num_cells * num_genes, lambda = 1), 
+  nrow = num_genes, 
+  ncol = num_cells, 
+  sparse = TRUE
+)
+rownames(mock_rna_counts) <- paste0("gene_", 1:num_genes)
+colnames(mock_rna_counts) <- colnames(atac_cell_graph_archr) # Use cell names from ArchR project
+
+# Generate random spatial coordinates
+spatial_coords <- data.frame(
+  x = runif(num_cells, 0, 100),
+  y = runif(num_cells, 0, 100)
+)
+rownames(spatial_coords) <- colnames(mock_rna_counts)
+
+# Create a Seurat object (can be used to represent spatial data, e.g., 10x Visium)
+mock_seurat_obj <- CreateSeuratObject(counts = mock_rna_counts)
+mock_seurat_obj <- AddMetaData(mock_seurat_obj, metadata = spatial_coords, col.name = c("spatial_x", "spatial_y"))
+
+message("Mock Seurat object created with ", ncol(mock_seurat_obj), " cells and ", nrow(mock_seurat_obj), " genes.")
+print(head(mock_seurat_obj@meta.data))
+
+# Extract spatial coordinates for use in graph creation
+spatial_coords_matrix <- as.matrix(mock_seurat_obj@meta.data[, c("spatial_x", "spatial_y")])
+```
+
+
+```{r helper function}
+#' Create Spatial KNN Graph
+#'
+#' \code{createSpatialKNNGraph()} computes a cell-to-cell similarity matrix based on spatial proximity
+#' using a K-nearest neighbors approach.
+#'
+#' @param spatialCoords matrix or data.frame with columns for spatial x and y coordinates,
+#'                      rownames should be cell barcodes.
+#' @param k_neighbors integer, the number of nearest neighbors to consider for each cell.
+#' @return a sparseMatrix of cell-to-cell similarity, with values normalized between 0 and 1.
+#' @export
+createSpatialKNNGraph <- function(spatialCoords, k_neighbors = 10) {
+  if (!requireNamespace("FNN", quietly = TRUE)) {
+    stop("Package 'FNN' is required for spatial KNN graph. Please install it with install.packages('FNN')")
+  }
+  if (missing(spatialCoords) || !(is.matrix(spatialCoords) || is.data.frame(spatialCoords))) {
+    stop("Must provide 'spatialCoords' as a matrix or data.frame with cell barcodes as rownames.")
+  }
+  if (ncol(spatialCoords) < 2) {
+    stop("'spatialCoords' must have at least two columns (e.g., x and y coordinates).")
+  }
+  if (is.null(rownames(spatialCoords))) {
+    stop("'spatialCoords' must have rownames (cell barcodes).")
+  }
+  if (k_neighbors >= nrow(spatialCoords)) {
+    warning("'k_neighbors' is greater than or equal to the number of cells. Setting k_neighbors to num_cells - 1.")
+    k_neighbors <- nrow(spatialCoords) - 1
+  }
+  if (k_neighbors < 1) {
+    stop("'k_neighbors' must be at least 1.")
+  }
+
+  message("Computing spatial distances and KNN graph...")
+  
+  # Compute k-nearest neighbors
+  # FNN::get.knn finds k-nearest neighbors and their distances
+  knn_result <- FNN::get.knn(spatialCoords, k = k_neighbors)
+  
+  # Create adjacency list for KNN graph
+  # Each cell 'i' is connected to its 'k_neighbors' neighbors 'j'
+  adj_list_i <- rep(1:nrow(spatialCoords), each = k_neighbors)
+  adj_list_j <- as.vector(knn_result$index)
+  
+  # Distances to neighbors
+  distances <- as.vector(knn_result$distance)
+  
+  # Normalize distances to create similarity scores (0 to 1, where 1 is most similar/closest)
+  # A common approach for similarity: 1 - (distance / max_distance_in_set)
+  # We find the max distance *among the k-nearest neighbors* to normalize for meaningful local similarities.
+  max_dist_in_knn <- max(distances)
+  if (max_dist_in_knn == 0) { 
+    # Handle case where all distances are 0 (e.g., all spatial points are identical, or k=1 with duplicates)
+    similarity <- rep(1, length(distances)) 
+  } else {
+    similarity <- 1 - (distances / max_dist_in_knn)
+  }
+  
+  # Build a sparse adjacency matrix
+  # Ensure indices are valid (should be by FNN, but good practice)
+  valid_indices <- adj_list_j <= nrow(spatialCoords) & adj_list_j >= 1
+  adj_list_i <- adj_list_i[valid_indices]
+  adj_list_j <- adj_list_j[valid_indices]
+  similarity <- similarity[valid_indices]
+
+  spatial_graph <- Matrix::sparseMatrix(
+    i = adj_list_i,
+    j = adj_list_j,
+    x = similarity,
+    dims = c(nrow(spatialCoords), nrow(spatialCoords)),
+    dimnames = list(rownames(spatialCoords), rownames(spatialCoords))
+  )
+  
+  # Make the graph symmetric (undirected) by taking the maximum of A and A_transpose.
+  # If cell A is a neighbor of B, then B should be a neighbor of A for consistent influence.
+  spatial_graph <- pmax(spatial_graph, t(spatial_graph))
+  
+  # Set diagonal to 1 (self-similarity, a cell is maximally similar to itself)
+  diag(spatial_graph) <- 1
+
+  message("Spatial KNN graph created.")
+  return(spatial_graph)
+}
+
+#' Combine Multiple Cell-to-Cell Graphs
+#'
+#' \code{combineMultiModalCellGraphs()} takes a list of cell-to-cell similarity matrices
+#' and combines them into a single matrix using a weighted sum. This allows integrating
+#' similarity information from different modalities (e.g., RNA, ATAC, Spatial).
+#'
+#' @param listOfCellGraphs list of sparseMatrix or matrix objects, each representing
+#'                         cell-to-cell similarity. Rownames and colnames must be consistent
+#'                         across all matrices and represent cell barcodes.
+#' @param weights numeric vector of weights, corresponding to the order of matrices
+#'                in `listOfCellGraphs`. Weights will be normalized to sum to 1.
+#' @return a sparseMatrix representing the combined cell-to-cell similarity graph.
+#' @export
+combineMultiModalCellGraphs <- function(listOfCellGraphs, weights) {
+  if (missing(listOfCellGraphs) || !is.list(listOfCellGraphs) || length(listOfCellGraphs) == 0) {
+    stop("Must provide 'listOfCellGraphs' as a non-empty list of matrices.")
+  }
+  if (missing(weights) || !is.numeric(weights) || length(weights) != length(listOfCellGraphs)) {
+    stop("Must provide 'weights' as a numeric vector of the same length as 'listOfCellGraphs'.")
+  }
+  if (sum(weights) != 1) {
+    message("Weights do not sum to 1. Normalizing weights to sum to 1.")
+    weights <- weights / sum(weights)
+  }
+
+  # Validate matrix dimensions and names for consistency
+  first_graph <- listOfCellGraphs[[1]]
+  num_cells <- nrow(first_graph)
+  cell_names <- rownames(first_graph)
+
+  if (is.null(cell_names)) {
+    stop("All matrices in 'listOfCellGraphs' must have rownames (cell barcodes).")
+  }
+
+  for (i in 2:length(listOfCellGraphs)) {
+    current_graph <- listOfCellGraphs[[i]]
+    if (!all.equal(dim(current_graph), c(num_cells, num_cells))) {
+      stop(paste0("Graph ", i, " has inconsistent dimensions. All graphs must be ", num_cells, "x", num_cells, "."))
+    }
+    # Check if cell names are exactly the same and in the same order
+    if (!identical(rownames(current_graph), cell_names) || !identical(colnames(current_graph), cell_names)) {
+      stop(paste0("Graph ", i, " has inconsistent cell names or order. All graphs must have the same rownames/colnames in the same order. Please reorder matrices if necessary."))
+    }
+  }
+
+  message("Combining cell graphs using weighted sum...")
+  # Initialize combined graph with appropriate dimensions and sparsity
+  combined_graph <- Matrix::Matrix(0, nrow = num_cells, ncol = num_cells, sparse = TRUE, dimnames = list(cell_names, cell_names))
+
+  # Perform weighted sum
+  for (i in 1:length(listOfCellGraphs)) {
+    combined_graph <- combined_graph + (listOfCellGraphs[[i]] * weights[i])
+  }
+  
+  message("Multi-modal cell graph created.")
+  return(combined_graph)
+}
+```
+
+
+```{r testing new functions}
+# Extract raw counts from mock Seurat object
+rna_counts_matrix <- GetAssayData(mock_seurat_obj, assay = "RNA", slot = "counts")
+
+# Process RNA-seq data to get cell-cell graph
+# Set computeSimilarity = TRUE to get a similarity matrix based on PCs.
+rna_processed_output <- processRNASeq(
+  RNAMat = rna_counts_matrix,
+  computeKNN = FALSE, 
+  computeSimilarity = TRUE, 
+  dims = 1:20 # Use first 20 PCs for PCA distance
+)
+rna_cell_graph <- rna_processed_output$cellGraph
+message("Dimensions of RNA cell graph: ", paste(dim(rna_cell_graph), collapse = "x"))
+```
+
+
+```{r spatial cell graph}
+spatial_knn_graph <- createSpatialKNNGraph(spatial_coords_matrix, k_neighbors = 15)
+message("Dimensions of Spatial KNN graph: ", paste(dim(spatial_knn_graph), collapse = "x"))
+
+
+# Combine RNA, ATAC and spatial graphs
+
+# Ensure all graphs have consistent cell order and names for combination
+# We'll use the cell order from the ArchR project (atac_cell_graph_archr) as the reference.
+reference_cells <- rownames(atac_cell_graph_archr)
+
+# Reorder/subset RNA graph
+rna_cell_graph_ordered <- rna_cell_graph[reference_cells, reference_cells]
+
+# Reorder/subset Spatial graph
+spatial_knn_graph_ordered <- spatial_knn_graph[reference_cells, reference_cells]
+
+# ATAC graph is already in the correct order (from ArchR)
+atac_cell_graph_archr_ordered <- atac_cell_graph_archr[reference_cells, reference_cells]
+
+
+message("Number of common cells for combination: ", length(reference_cells))
+
+# Create a list of graphs to combine (order matters for weights)
+list_of_graphs_to_combine <- list(
+  rna_cell_graph_ordered, 
+  spatial_knn_graph_ordered,
+  atac_cell_graph_archr_ordered
+)
+
+# Define weights for each modality (e.g., 0.4 for RNA, 0.3 for Spatial, 0.3 for ATAC)
+# These weights will be normalized to sum to 1 by the function.
+modal_weights <- c(0.4, 0.3, 0.3) 
+
+combined_cell_graph <- combineMultiModalCellGraphs(list_of_graphs_to_combine, modal_weights)
+message("Dimensions of Combined Multi-Modal Cell Graph: ", paste(dim(combined_cell_graph), collapse = "x"))
+
+# Verify properties (e.g., symmetry, diagonal)
+# isSymmetric(combined_cell_graph)
+# all(diag(combined_cell_graph) == 1)
+
+```
+
+```{r running CellWalker2 with combined graph}
+# For simplicity, let's assume we have some arbitrary cell types in our mock data
+mock_seurat_obj$mock_cell_type <- sample(paste0("Type_", 1:5), size = ncol(mock_seurat_obj), replace = TRUE)
+# Ensure cell names are consistent before adding to Seurat obj if it was subsetted earlier
+mock_seurat_obj <- mock_seurat_obj[, reference_cells] 
+Idents(mock_seurat_obj) <- "mock_cell_type"
+
+# Find mock markers from the processed RNA data
+mock_markers <- FindAllMarkers(mock_seurat_obj, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+mock_markers <- data.frame(gene = mock_markers$gene, cluster = mock_markers$cluster, avg_log2FC = mock_markers$avg_log2FC)
+
+# Create mock label edges using the normalized RNA expression data
+# Ensure the expression matrix has the same cell order as the combined graph
+rna_expr_norm_ordered <- rna_processed_output$expr_norm[, reference_cells]
+mock_label_edges <- computeTypeEdges(rna_expr_norm_ordered, mock_markers)
+
+# The mock_label_edges should now have rows corresponding to `reference_cells`.
+# The combined_cell_graph also has these cells.
+message("Dimensions of mock label edges: ", paste(dim(mock_label_edges), collapse = "x"))
+
+
+# running walkCells from CellWalker to test compatibility
+
+label_edges_list_final <- list(mock_label_edges)
+# Example label edge weight. In a real scenario, this would be tuned using tuneEdgeWeights.
+label_edge_weights_final <- c(1000) 
+
+message("Running walkCells with the combined multi-modal graph...")
+cell_walk_results_spatial <- walkCells(
+  cellEdges = combined_cell_graph,
+  labelEdgesList = label_edges_list_final,
+  labelEdgeWeights = label_edge_weights_final,
+  sampleDepth = min(2000, nrow(combined_cell_graph)) # Adjust sample depth for tuning/speed if needed
+)
+
+message("CellWalker results obtained with spatial integration:")
+print(head(cell_walk_results_spatial$cellLabels))
+```
+
+
+
+```{r data import tests}
+# xenium_read_save.R
+library(Seurat)
+library(arrow)   # for read_parquet
+
+h5_path <- "/projectnb/paxlab/DATA/DriesSpatial/Xenium/output-XETG00253__0048833__488A__20241217__182301/cell_feature_matrix.h5"
+cells_csv <- "/projectnb/paxlab/DATA/DriesSpatial/Xenium/output-XETG00253__0048833__488A__20241217__182301/cells.csv.gz"
+
+# Read count matrix (10x-style H5)
+mat <- Read10X_h5(h5_path)
+if (is.list(mat) && "matrix" %in% names(mat)) mat <- mat$matrix
+
+# Create Seurat object
+seurat_rna <- CreateSeuratObject(counts = mat, project = "Xenium_RNA")
+
+# Add cell metadata (centroids etc.)
+meta <- read.csv(cells_csv)
+rownames(meta) <- meta$cell_id
+common_cells <- intersect(colnames(seurat_rna), rownames(meta))
+seurat_rna <- subset(seurat_rna, cells = common_cells)
+seurat_rna <- AddMetaData(seurat_rna, metadata = meta[common_cells, , drop = FALSE])
+
+
+
+# atac_read_save.R
+library(zellkonverter)    # readH5AD
+library(SingleCellExperiment)
+library(Signac)
+library(Seurat)
+library(Matrix)
+library(GenomicRanges)
+
+h5ad_path <- "/projectnb/paxlab/DATA/DriesSpatial/Atlasxomics/D1942_deepseq/ultima1942optimize/set1_vf25000-cr1-0-vi1-nc30/combined.h5ad"
+
+# Read AnnData into SingleCellExperiment
+sce <- readH5AD(h5ad_path)
+
+# Ensure spatial coord columns (if present) are numeric and in colData
+if (!is.null(colData(sce))) {
+  if ("xcor" %in% colnames(colData(sce))) colData(sce)$x <- as.numeric(colData(sce)$xcor)
+  if ("ycor" %in% colnames(colData(sce))) colData(sce)$y <- as.numeric(colData(sce)$ycor)
+}
+
+# 1) prepare ATAC counts (sparse dgCMatrix)
+counts_atac <- as(assay(sce, "X"), "dgCMatrix") 
+
+# 2) parse peak names into GRanges (row names look like "chr:start-end")
+peaks <- rownames(sce)
+# Use Signac helper
+gr_peaks <- tryCatch(
+  StringToGRanges(peaks),
+  error = function(e) {
+    # fallback: manual parsing
+    parsed <- strcapture("^([^:]+):(\\d+)-(\\d+)$", peaks,
+                         proto = data.frame(chr=character(), start=integer(), end=integer()))
+    if (nrow(parsed) != length(peaks)) stop("Peak names not in expected chr:start-end format")
+    GRanges(seqnames = parsed$chr,
+            ranges = IRanges(start = as.integer(parsed$start), end = as.integer(parsed$end)))
+  }
+)
+
+# 3) create ChromatinAssay (sparse-safe)
+chrom_assay <- CreateChromatinAssay(
+  counts = counts_atac,
+  ranges = gr_peaks,
+  sep = c(":", "-"),
+  genome = "hg38"
+)
+
+# 4) create Seurat object using the chromatin assay and existing colData
+meta <- as.data.frame(colData(sce))
+seurat_atac <- CreateSeuratObject(counts = chrom_assay, assay = "peaks", meta.data = meta)
+DefaultAssay(seurat_atac) <- "peaks"
+
+
+
+
+# 1) bounding-box filter for RNA and ATAC
+bbox_filter <- function(seurat_rna, seurat_atac,
+                        x_min = 5000, x_max = 11000, y_min_atac = 4000) {
+  seurat_rna@meta.data <- seurat_rna@meta.data %>%
+    filter(!is.na(x_centroid) & !is.na(y_centroid) &
+           x_centroid >= x_min & x_centroid <= x_max)
+  seurat_atac@meta.data <- seurat_atac@meta.data %>%
+    filter(!is.na(xcor) & !is.na(ycor) & ycor >= y_min_atac)
+  invisible(list(rna = seurat_rna, atac = seurat_atac))
+}
+
+# 2) proximity filter: remove isolated points with fewer than min_neighbors within radius (euclidean)
+proximity_filter <- function(meta, xcol, ycol, radius = 50, min_neighbors = 1) {
+  coords <- as.matrix(meta[, c(xcol, ycol)])
+  # compute pairwise squared distances efficiently
+  rx <- coords[,1]; ry <- coords[,2]
+  # vectorized squared distance: (xi-xj)^2+(yi-yj)^2
+  # using crossprod trick is memory-heavy; do blockwise if very large.
+  n <- nrow(coords)
+  if (n == 0) return(meta[0,,drop=FALSE])
+  # Use RANN for speed if available, fallback to simple loop
+  if (requireNamespace("RANN", quietly = TRUE)) {
+    nn <- RANN::nn2(coords, coords, k = min(100, n))$nn.dists  # distances to neighbors
+    # count neighbors within radius (exclude self at distance 0)
+    within <- rowSums(nn <= radius) - 1
+    keep <- within >= min_neighbors
+  } else {
+    # small/medium n fallback: compute squared distances in blocks
+    keep <- logical(n)
+    r2 <- radius * radius
+    for (i in seq_len(n)) {
+      dx <- rx - rx[i]
+      dy <- ry - ry[i]
+      d2 <- dx*dx + dy*dy
+      # exclude self, count others within radius
+      keep[i] <- sum(d2 <= r2) - 1 >= min_neighbors
+    }
+  }
+  meta[keep, , drop = FALSE]
+}
+
+# apply bbox
+res <- bbox_filter(seurat_rna, seurat_atac, x_min = 4700, x_max = 10100, y_min_atac = 4000)
+seurat_rna_f <- res$rna
+seurat_atac_f <- res$atac
+
+# apply proximity filter 
+seurat_rna_f@meta.data <- proximity_filter(seurat_rna_f@meta.data, "x_centroid", "y_centroid", radius = 50, min_neighbors = 10)
+seurat_atac_f@meta.data <- proximity_filter(seurat_atac_f@meta.data, "xcor", "ycor", radius = 50, min_neighbors = 5)
+
+```
+
+```{r plot spatials}
+library(ggplot2)
+library(cowplot)
+library(dplyr)
+
+# concise, professional spatial plot: RNA (x_centroid,y_centroid) above ATAC (xcor,ycor)
+plot_spatial_rna_atac <- function(seurat_rna, seurat_atac,
+                                  color_by = NULL,
+                                  pt_size = 0.6, pt_alpha = 0.8,
+                                  same_limits = FALSE,
+                                  rna_title = "RNA (spatial)",
+                                  atac_title = "ATAC (spatial)") {
+  # extract and rename coords
+  df_rna <- seurat_rna@meta.data %>%
+    transmute(x = as.numeric(x_centroid), y = as.numeric(y_centroid),
+              .col = if (!is.null(color_by)) .data[[color_by]] else NULL)
+  df_atac <- seurat_atac@meta.data %>%
+    transmute(x = as.numeric(xcor), y = as.numeric(ycor),
+              .col = if (!is.null(color_by)) .data[[color_by]] else NULL)
+  if (!is.null(color_by)) {
+    names(df_rna)[3] <- names(df_atac)[3] <- color_by
+  }
+
+  # common limits
+  if (same_limits) {
+    xlim <- range(c(df_rna$x, df_atac$x), na.rm = TRUE)
+    ylim <- range(c(df_rna$y, df_atac$y), na.rm = TRUE)
+  } else { xlim <- ylim <- NULL }
+
+  make_plot <- function(df, title) {
+    p <- ggplot(df, aes(x = x, y = -y)) +
+      coord_fixed() + ggtitle(title) + theme_minimal() +
+      theme(plot.title = element_text(hjust = 0.5))
+    if (!is.null(xlim)) p <- p + xlim(xlim) + ylim(ylim)
+    if (!is.null(color_by)) {
+      if (is.numeric(df[[color_by]])) {
+        p <- p + geom_point(aes_string(color = color_by), size = pt_size, alpha = pt_alpha) +
+          scale_color_viridis_c()
+      } else {
+        p <- p + geom_point(aes_string(color = color_by), size = pt_size, alpha = pt_alpha) +
+          scale_color_brewer(palette = "Set1", na.value = "grey70")
+      }
+    } else {
+      p <- p + geom_point(color = "#2c3e50", size = pt_size, alpha = pt_alpha)
+    }
+    p + xlab("x") + ylab("y")
+  }
+  
+  make_plot2 <- function(df, title) {
+    p <- ggplot(df, aes(x = x, y = y)) +
+      coord_fixed() + ggtitle(title) + theme_minimal() +
+      theme(plot.title = element_text(hjust = 0.5))
+    if (!is.null(xlim)) p <- p + xlim(xlim) + ylim(ylim)
+    if (!is.null(color_by)) {
+      if (is.numeric(df[[color_by]])) {
+        p <- p + geom_point(aes_string(color = color_by), size = pt_size, alpha = pt_alpha) +
+          scale_color_viridis_c()
+      } else {
+        p <- p + geom_point(aes_string(color = color_by), size = pt_size, alpha = pt_alpha) +
+          scale_color_brewer(palette = "Set1", na.value = "grey70")
+      }
+    } else {
+      p <- p + geom_point(color = "#2c3e50", size = pt_size, alpha = pt_alpha)
+    }
+    p + xlab("x") + ylab("y")
+  }
+
+  p_rna <- make_plot(df_rna, rna_title)
+  p_atac <- make_plot2(df_atac, atac_title)
+
+  plot_grid(p_rna, p_atac, ncol = 1, align = "v", rel_heights = c(1, 1))
+}
+
+
+p <- plot_spatial_rna_atac(seurat_rna_f, seurat_atac_f, color_by = NULL)
+ggsave("/projectnb/paxlab/phitro/figures/spatial_RNA-ATAC_filtered.png", p)
+
+```
