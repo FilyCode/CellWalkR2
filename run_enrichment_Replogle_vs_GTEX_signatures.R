@@ -1142,11 +1142,7 @@ plot_combined_heatmap <- function(combined_fgsea_df, analysis_title_prefix, outp
   }
   
   # Draw the heatmap object to extract dendrograms
-  # Open a null device to suppress immediate plotting when `draw` is called
-  pdf(NULL) 
-  ht_list <- draw(hm, column_title = hm_title)
-  dev.off() # Close the null device immediately
-  
+  ht_list <- draw(hm, column_title = hm_title, plot = FALSE)
   row_dend_res <- row_dend(ht_list)
   col_dend_res <- column_dend(ht_list)
   
@@ -1206,27 +1202,19 @@ plot_combined_heatmap_signed_pvalue_NES <- function(combined_fgsea_df, analysis_
       signed_log10_p = sign(combined_NES) * (-log10(combined_padj)),
       # Discretize the combined_padj values into categories for coloring
       p_category = case_when(
-        combined_padj < 0.0001 & combined_NES > 0 ~ "p < 0.0001 (UP)",
-        combined_padj < 0.001 & combined_NES > 0 ~ "p < 0.001 (UP)",
         combined_padj < 0.01 & combined_NES > 0 ~ "p < 0.01 (UP)",
         combined_padj >= 0.01 & combined_padj < 0.05 & combined_NES > 0 ~ "p < 0.05 (UP)",
-        combined_padj < 0.0001 & combined_NES < 0 ~ "p < 0.0001 (DN)",
-        combined_padj < 0.001 & combined_NES < 0 ~ "p < 0.001 (DN)",
         combined_padj < 0.01 & combined_NES < 0 ~ "p < 0.01 (DN)",
         combined_padj >= 0.01 & combined_padj < 0.05 & combined_NES < 0 ~ "p < 0.05 (DN)",
         TRUE ~ "Not significant" # For combined_padj >= 0.05 or NES == 0
       ),
       # Ensure explicit factor levels for consistent legend order (DN -> Not Sig -> UP)
       p_category = factor(p_category, levels = c(
-        "p < 0.0001 (DN)",
-        "p < 0.001 (DN)",
         "p < 0.01 (DN)", 
         "p < 0.05 (DN)", 
         "Not significant", 
         "p < 0.05 (UP)", 
-        "p < 0.01 (UP)",
-        "p < 0.001 (UP)",
-        "p < 0.0001 (UP)"
+        "p < 0.01 (UP)"
       )) 
     ) %>%
     dplyr::select(pathway, ranked_list_name, signed_log10_p, p_category) %>% # Keep p_category for coloring
@@ -1272,7 +1260,7 @@ plot_combined_heatmap_signed_pvalue_NES <- function(combined_fgsea_df, analysis_
   initial_perturb_gene_symbols <- gsub("^(.*?)\\s+Knockdown Signature - .*", "\\1", gene_names_for_annotation_initial)
   initial_is_essential_vector <- (initial_perturb_gene_symbols %in% essential_gene_list)
   
-  # Apply filtering to matrices if filter == TRUE and essential_gene_list is provided
+  # Apply filtering to matrices if filter is TRUE and essential_gene_list is provided
   if (filter == TRUE && !is.null(essential_gene_list) && length(essential_gene_list) > 0) {
     if (annotate_on_rows) {
       mat_signed_p_val <- mat_signed_p_val[!initial_is_essential_vector, , drop = FALSE]
@@ -1300,15 +1288,11 @@ plot_combined_heatmap_signed_pvalue_NES <- function(combined_fgsea_df, analysis_
   
   # Define discrete color palette for p_category, matching volcano plot colors
   p_category_colors <- c(
-    "p < 0.0001 (DN)" = "darkblue",       # Deepest blue for highest DN significance
-    "p < 0.001 (DN)" = "steelblue",       # Darker blue
-    "p < 0.01 (DN)" = "skyblue",          # Medium blue
-    "p < 0.05 (DN)" = "lightblue",        # Light blue
-    "Not significant" = "grey90",         # Grey for no significance
-    "p < 0.05 (UP)" = "lightcoral",       # Light red
-    "p < 0.01 (UP)" = "salmon",           # Medium red
-    "p < 0.001 (UP)" = "firebrick",       # Darker red
-    "p < 0.0001 (UP)" = "darkred"         # Deepest red for highest UP significance
+    "p < 0.01 (DN)" = "darkblue",       # Highest significance DN
+    "p < 0.05 (DN)" = "lightblue",      # Medium significance DN
+    "Not significant" = "grey90",       # No significance
+    "p < 0.05 (UP)" = "lightcoral",     # Medium significance UP
+    "p < 0.01 (UP)" = "darkred"         # Highest significance UP
   )
   
   annotation_obj <- NULL
