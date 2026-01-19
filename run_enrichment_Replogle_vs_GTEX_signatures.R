@@ -790,13 +790,20 @@ calculate_combined_scores <- function(fgsea_df, analysis_name) {
       size = if_else(size_UP > 0, size_UP, size_DN),
       size = if_else(size == 0 & size_UP == 0 & size_DN == 0, 0, size), # Ensure it's 0 if no valid size
       
-      combined_padj = purrr::pmap_dbl(list(padj_UP, padj_DN), function(p_up, p_dn) {
+      combined_padj = purrr::pmap_dbl(list(padj_UP, padj_DN, NES_UP, NES_DN), function(p_up, p_dn, nes_up, nes_dn) {
         p_values_to_combine <- c()
-        if (!is.na(p_up)) p_values_to_combine <- c(p_values_to_combine, p_up)
-        if (!is.na(p_dn)) p_values_to_combine <- c(p_values_to_combine, p_dn)
+        
+        # Only include p_up if it's not NA and NES_UP is positive
+        if (!is.na(p_up) && nes_up > 0) {
+          p_values_to_combine <- c(p_values_to_combine, p_up)
+        }
+        # Only include p_dn if it's not NA and NES_DN is negative
+        if (!is.na(p_dn) && nes_dn < 0) {
+          p_values_to_combine <- c(p_values_to_combine, p_dn)
+        }
         
         if (length(p_values_to_combine) == 0) {
-          return(NA_real_)
+          return(1) # Set to 1 if no p-values meet criteria or are available
         } else if (length(p_values_to_combine) == 1) {
           return(p_values_to_combine[1])
         } else {
@@ -815,7 +822,7 @@ calculate_combined_scores <- function(fgsea_df, analysis_name) {
       ES_UP, ES_DN,
       combined_NES, combined_ES, combined_padj, size # Include combined size
     ) %>%
-    # Filter out rows where combined_padj could not be calculated (e.g., if both padj_UP and padj_DN were NA)
+    # Filter out rows where combined_padj could not be calculated (e.g., if both padj_UP and padj_DN were NA and didn't meet criteria)
     dplyr::filter(!is.na(combined_padj)) %>%
     # Annotate pathways based on combined p-value (colleague's suggestion)
     dplyr::mutate(
@@ -969,11 +976,14 @@ plot_combined_fgsea_dotplot <- function(combined_fgsea_df, analysis_title_prefix
 #' @param analysis_title_prefix A string for plot titles, e.g., "Age-Centered Analysis".
 #' @param output_dir Path to save the plots.
 #' @param essential_gene_list Character vector of essential genes for highlighting.
-plot_combined_heatmap <- function(combined_fgsea_df, analysis_title_prefix, output_dir, essential_gene_list = NULL) {
+#' @param filter Logical, if TRUE, filters out essential genes from columns.
+#' @param ranked_source_name A string, e.g., "Aging" or "Perturbation", indicating the source of the ranked lists.
+#' @return A list containing the heatmap's row dendrogram (`row_dend`) and column dendrogram (`col_dend`) if generated, else a list of NULLs.
+plot_combined_heatmap <- function(combined_fgsea_df, analysis_title_prefix, output_dir, essential_gene_list = NULL, filter = FALSE, ranked_source_name) {
   
   if (is.null(combined_fgsea_df) || nrow(combined_fgsea_df) == 0) {
     message(paste("No combined fgsea results for heatmap in", analysis_title_prefix, "."))
-    return(invisible(NULL))
+    return(list(row_dend = NULL, col_dend = NULL))
   }
   
   message(paste0("Generating clustered heatmap for combined NES: ", analysis_title_prefix)) 
@@ -984,7 +994,7 @@ plot_combined_heatmap <- function(combined_fgsea_df, analysis_title_prefix, outp
   
   if (nrow(significant_combined_results) == 0) {
     message(paste("  No significant combined interactions (combined_padj < 0.05) found for heatmap in", analysis_title_prefix, "."))
-    return(invisible(NULL))
+    return(list(row_dend = NULL, col_dend = NULL))
   }
   
   num_pathways <- length(unique(significant_combined_results$pathway))
@@ -992,58 +1002,106 @@ plot_combined_heatmap <- function(combined_fgsea_df, analysis_title_prefix, outp
   
   if (num_pathways < 2 || num_ranked_lists < 2) {
     message(paste("  Not enough unique pathways (", num_pathways, ") or ranked lists (", num_ranked_lists, ") for a meaningful combined heatmap in", analysis_title_prefix, ". Skipping heatmap."))
-    return(invisible(NULL))
+    return(list(row_dend = NULL, col_dend = NULL))
   }
   
   # Reshape data for heatmap: combined_NES as values
   heatmap_data <- significant_combined_results %>%
-    dplyr::select(pathway, ranked_list_name, combined_NES) %>% # Changed combined_ES to combined_NES
+    dplyr::select(pathway, ranked_list_name, combined_NES) %>%
     tidyr::pivot_wider(names_from = ranked_list_name, values_from = combined_NES, values_fill = 0) 
   
   # Filter heatmap_data rows where combined_NES != 0 for at least 5 columns (similar to original logic)
   mat_for_filtering <- as.matrix(heatmap_data %>% dplyr::select(-pathway))
   rownames(mat_for_filtering) <- heatmap_data$pathway
-  # Here, we filter for pathways that have at least 5 non-zero combined ES values,
   row_non_zero_nes_counts <- rowSums(mat_for_filtering != 0, na.rm = TRUE)
   heatmap_data <- heatmap_data[row_non_zero_nes_counts >= 5, ] 
   
   if (nrow(heatmap_data) == 0) {
     message(paste("  No pathways left after filtering for at least 5 non-zero combined NES enrichments for heatmap in", analysis_title_prefix, ". Skipping heatmap."))
-    return(invisible(NULL))
+    return(list(row_dend = NULL, col_dend = NULL))
   }
   
   mat <- as.matrix(heatmap_data %>% dplyr::select(-pathway))
   rownames(mat) <- heatmap_data$pathway
+  
+  # Determine which axis represents perturbation genes for annotation
+  # In Age-Centered analysis, perturbation signatures are pathways (rows).
+  # In Perturbation-Centered analysis, perturbation signatures are ranked_list_name (columns).
+  annotate_on_rows <- (ranked_source_name == "Aging")
+  
+  # Determine the gene names for initial essentiality check based on the annotation axis
+  if (annotate_on_rows) {
+    gene_names_for_annotation_initial <- rownames(mat)
+  } else { # Annotate on columns
+    gene_names_for_annotation_initial <- colnames(mat)
+  }
+  
+  # Ensure essential_gene_list is a character vector for robust %in% operation
+  if (!is.null(essential_gene_list)) {
+    essential_gene_list <- as.character(essential_gene_list)
+  }
+  
+  initial_perturb_gene_symbols <- gsub("^(.*?)\\s+Knockdown Signature - .*", "\\1", gene_names_for_annotation_initial)
+  initial_is_essential_vector <- (initial_perturb_gene_symbols %in% essential_gene_list)
+  
+  # Apply filtering to 'mat' if filter is TRUE and essential_gene_list is provided
+  if (filter == TRUE && !is.null(essential_gene_list) && length(essential_gene_list) > 0) {
+    if (annotate_on_rows) {
+      mat <- mat[!initial_is_essential_vector, , drop = FALSE]
+    } else { # Filter columns
+      mat <- mat[, !initial_is_essential_vector, drop = FALSE]
+    }
+    
+    if (nrow(mat) == 0 || ncol(mat) == 0) {
+      message(paste("  No non-essential perturbation genes remaining after filtering for heatmap in", analysis_title_prefix, ". Skipping heatmap."))
+      return(list(row_dend = NULL, col_dend = NULL))
+    }
+  }
+  
+  # After (potential) filtering, determine the final gene names for annotation
+  if (annotate_on_rows) {
+    final_gene_names_for_annotation <- rownames(mat)
+  } else {
+    final_gene_names_for_annotation <- colnames(mat)
+  }
+  
+  final_perturb_gene_symbols <- gsub("^(.*?)\\s+Knockdown Signature - .*", "\\1", final_gene_names_for_annotation)
+  final_is_essential_vector <- (final_perturb_gene_symbols %in% essential_gene_list)
   
   # Determine symmetric color range based on max absolute combined_NES
   max_abs_nes <- max(abs(mat), na.rm = TRUE) 
   col_fun <- colorRamp2(c(-max_abs_nes, -max_abs_nes/2, 0, max_abs_nes/2, max_abs_nes), 
                         c("darkblue", "lightblue", "white", "pink2", "darkred"))
   
-  # Determine essential genes for columns (perturbation genes)
-  # Extract gene symbol from column names (e.g., "FOXO1 Knockdown Signature - K562")
-  perturb_gene_symbols_in_cols <- gsub("^(.*?)\\s+Knockdown Signature - .*", "\\1", colnames(mat))
-  is_perturb_gene_essential <- (perturb_gene_symbols_in_cols %in% essential_gene_list)
-  
-  column_ha <- NULL
+  annotation_obj <- NULL
+  # Create annotation_obj ONLY if essential_gene_list was provided AND is not empty
   if (!is.null(essential_gene_list) && length(essential_gene_list) > 0) {
-    # Align to columns explicitly
-    perturb_gene_symbols_in_cols <- gsub("^(.*?)\\s+Knockdown Signature - .*", "\\1", colnames(mat))
-    is_ess_chr <- ifelse(perturb_gene_symbols_in_cols %in% essential_gene_list, "TRUE", "FALSE")
-    # Ensure a plain character vector of same length as columns
-    is_ess_chr <- as.character(is_ess_chr)
-    # Named colors keyed by character values
+    # Explicit check for annotation length consistency
+    actual_length <- if (annotate_on_rows) nrow(mat) else ncol(mat)
+    if (length(final_is_essential_vector) != actual_length) {
+      stop(paste0("Annotation length mismatch: Annotation vector has ", length(final_is_essential_vector), 
+                  " elements, but matrix has ", actual_length, " ", ifelse(annotate_on_rows, "rows", "columns"), ". This should not happen."))
+    }
+    
+    is_ess_chr <- ifelse(final_is_essential_vector, "TRUE", "FALSE")
     ann_colors <- c("FALSE" = "grey90", "TRUE" = "darkgreen")
     
-    # Minimal HeatmapAnnotation using a plain character vector (no anno_simple)
-    # This hands ComplexHeatmap an atomic vector directly.
-    column_ha <- HeatmapAnnotation(
-      is_essential = is_ess_chr,
-      col = list(is_essential = ann_colors),
-      annotation_name_side = "left"
-    )
+    if (annotate_on_rows) {
+      annotation_obj <- rowAnnotation(
+        is_essential = is_ess_chr,
+        col = list(is_essential = ann_colors),
+        annotation_name_side = "bottom", # Place row annotation name at the bottom
+        width = unit(5, "mm") # Adjust width for better appearance
+      )
+    } else {
+      annotation_obj <- HeatmapAnnotation(
+        is_essential = is_ess_chr,
+        col = list(is_essential = ann_colors),
+        annotation_name_side = "left", # Place column annotation name at the left
+        height = unit(5, "mm") # Adjust height for better appearance
+      )
+    }
   }
-  
   
   # Title to reflect combined NES and include row/column counts
   hm_title <- paste0("Clustered Heatmap: ", analysis_title_prefix, "\n(Combined NES: NES_UP - NES_DN)",
@@ -1052,29 +1110,53 @@ plot_combined_heatmap <- function(combined_fgsea_df, analysis_title_prefix, outp
   heatmap_output_path_png <- file.path(output_dir, paste0(file_name_base, ".png"))
   heatmap_output_path_svg <- file.path(output_dir, paste0(file_name_base, ".svg"))
   
-  hm <- Heatmap(
-    mat,
-    name = "Combined NES", 
-    col = col_fun,
-    na_col = "grey90",
-    cluster_rows = TRUE,
-    cluster_columns = TRUE,
-    show_row_names = FALSE,
-    row_names_gp = gpar(fontsize = 6),
-    column_names_gp = gpar(fontsize = 8),
-    column_names_rot = 90,
-    top_annotation = column_ha 
-  )
+  # Heatmap call with conditional annotation placement
+  if (annotate_on_rows) {
+    hm <- Heatmap(
+      mat,
+      name = "Combined NES", 
+      col = col_fun,
+      na_col = "grey90",
+      cluster_rows = TRUE,
+      cluster_columns = TRUE,
+      show_row_names = FALSE,
+      row_names_gp = gpar(fontsize = 6),
+      column_names_gp = gpar(fontsize = 8),
+      column_names_rot = 90,
+      left_annotation = if (filter == TRUE) NULL else annotation_obj # Add annotation if not filtering
+    )
+  } else {
+    hm <- Heatmap(
+      mat,
+      name = "Combined NES", 
+      col = col_fun,
+      na_col = "grey90",
+      cluster_rows = TRUE,
+      cluster_columns = TRUE,
+      show_row_names = FALSE,
+      row_names_gp = gpar(fontsize = 6),
+      column_names_gp = gpar(fontsize = 8),
+      column_names_rot = 90,
+      top_annotation = if (filter == TRUE) NULL else annotation_obj # Add annotation if not filtering
+    )
+  }
+  
+  # Draw the heatmap object to extract dendrograms
+  ht_list <- draw(hm, column_title = hm_title, plot = FALSE)
+  row_dend_res <- row_dend(ht_list)
+  col_dend_res <- column_dend(ht_list)
   
   png(heatmap_output_path_png, width = 2200, height = 1800, res = 300)
-  draw(hm, column_title = hm_title)
+  draw(ht_list, column_title = hm_title) # Redraw for saving purposes
   dev.off()
   
   svg(heatmap_output_path_svg, width = 7.33, height = 6)
-  draw(hm, column_title = hm_title)
+  draw(ht_list, column_title = hm_title) # Redraw for saving purposes
   dev.off()
   
   message("  Combined NES clustered heatmap generated and saved to: ", heatmap_output_path_png)
+  
+  return(list(row_dend = row_dend_res, col_dend = col_dend_res)) # Return dendrograms
 }
 
 
@@ -1085,7 +1167,11 @@ plot_combined_heatmap <- function(combined_fgsea_df, analysis_title_prefix, outp
 #' @param analysis_title_prefix A string for plot titles, e.g., "Age-Centered Analysis".
 #' @param output_dir Path to save the plots.
 #' @param essential_gene_list Character vector of essential genes for highlighting.
-plot_combined_heatmap_signed_pvalue_NES <- function(combined_fgsea_df, analysis_title_prefix, output_dir, essential_gene_list = NULL) {
+#' @param filter Logical, if TRUE, filters out essential genes from columns.
+#' @param ranked_source_name A string, e.g., "Aging" or "Perturbation", indicating the source of the ranked lists.
+#' @param row_dend Optional, dendrogram for row clustering (from NES heatmap).
+#' @param col_dend Optional, dendrogram for column clustering (from NES heatmap).
+plot_combined_heatmap_signed_pvalue_NES <- function(combined_fgsea_df, analysis_title_prefix, output_dir, essential_gene_list = NULL, filter = FALSE, ranked_source_name, row_dend = NULL, col_dend = NULL) {
   
   if (is.null(combined_fgsea_df) || nrow(combined_fgsea_df) == 0) {
     message(paste("No combined fgsea results for signed -log10(p-value) heatmap (NES-based) in", analysis_title_prefix, "."))
@@ -1110,74 +1196,171 @@ plot_combined_heatmap_signed_pvalue_NES <- function(combined_fgsea_df, analysis_
     return(invisible(NULL))
   }
   
-  # Calculate signed_log10_p using combined_NES
+  # Calculate signed_log10_p using combined_NES and categorize p-values
   heatmap_data <- significant_combined_results %>%
     dplyr::mutate(
-      signed_log10_p = sign(combined_NES) * (-log10(combined_padj)) # Changed combined_ES to combined_NES
+      signed_log10_p = sign(combined_NES) * (-log10(combined_padj)),
+      # Discretize the combined_padj values into categories for coloring
+      p_category = case_when(
+        combined_padj < 0.01 & combined_NES > 0 ~ "p < 0.01 (UP)",
+        combined_padj >= 0.01 & combined_padj < 0.05 & combined_NES > 0 ~ "p < 0.05 (UP)",
+        combined_padj < 0.01 & combined_NES < 0 ~ "p < 0.01 (DN)",
+        combined_padj >= 0.01 & combined_padj < 0.05 & combined_NES < 0 ~ "p < 0.05 (DN)",
+        TRUE ~ "Not significant" # For combined_padj >= 0.05 or NES == 0
+      ),
+      # Ensure explicit factor levels for consistent legend order (DN -> Not Sig -> UP)
+      p_category = factor(p_category, levels = c(
+        "p < 0.01 (DN)", 
+        "p < 0.05 (DN)", 
+        "Not significant", 
+        "p < 0.05 (UP)", 
+        "p < 0.01 (UP)"
+      )) 
     ) %>%
-    dplyr::select(pathway, ranked_list_name, signed_log10_p) %>%
-    tidyr::pivot_wider(names_from = ranked_list_name, values_from = signed_log10_p, values_fill = 0) 
+    dplyr::select(pathway, ranked_list_name, signed_log10_p, p_category) %>% # Keep p_category for coloring
+    tidyr::pivot_wider(names_from = ranked_list_name, values_from = c(signed_log10_p, p_category), names_glue = "{.value}_{ranked_list_name}", values_fill = NA)
   
-  mat_for_filtering <- as.matrix(heatmap_data %>% dplyr::select(-pathway))
-  rownames(mat_for_filtering) <- heatmap_data$pathway
+  # Extract matrices for signed_log10_p (for values/filtering) and p_category (for coloring)
+  mat_signed_p_val <- as.matrix(heatmap_data %>% dplyr::select(starts_with("signed_log10_p_")))
+  colnames(mat_signed_p_val) <- gsub("signed_log10_p_", "", colnames(mat_signed_p_val))
+  rownames(mat_signed_p_val) <- heatmap_data$pathway
   
+  mat_p_category <- as.matrix(heatmap_data %>% dplyr::select(starts_with("p_category_")))
+  colnames(mat_p_category) <- gsub("p_category_", "", colnames(mat_p_category))
+  rownames(mat_p_category) <- heatmap_data$pathway
+  
+  # Filter based on mat_signed_p_val (if values are 0, they are not considered enriched)
+  mat_for_filtering <- mat_signed_p_val
   row_non_zero_scores_counts <- rowSums(mat_for_filtering != 0, na.rm = TRUE)
-  heatmap_data <- heatmap_data[row_non_zero_scores_counts >= 5, ] 
   
-  if (nrow(heatmap_data) == 0) {
+  # Apply the row filtering to both matrices
+  mat_signed_p_val <- mat_signed_p_val[row_non_zero_scores_counts >= 5, , drop = FALSE]
+  mat_p_category <- mat_p_category[row_non_zero_scores_counts >= 5, , drop = FALSE]
+  
+  if (nrow(mat_signed_p_val) == 0) {
     message(paste("  No pathways left after filtering for at least 5 non-zero signed -log10(p-value) enrichments (NES-based) for heatmap in", analysis_title_prefix, ". Skipping heatmap."))
     return(invisible(NULL))
   }
   
-  mat <- as.matrix(heatmap_data %>% dplyr::select(-pathway))
-  rownames(mat) <- heatmap_data$pathway
+  # Determine which axis represents perturbation genes for annotation
+  annotate_on_rows <- (ranked_source_name == "Aging")
   
-  max_abs_score <- max(abs(mat), na.rm = TRUE)
-  col_fun <- colorRamp2(c(-max_abs_score, -max_abs_score/2, 0, max_abs_score/2, max_abs_score), 
-                        c("darkblue", "lightblue", "white", "pink2", "darkred"))
-  
-  # Determine essential genes for columns (perturbation genes)
-  perturb_gene_symbols_in_cols <- gsub("^(.*?)\\s+Knockdown Signature - .*", "\\1", colnames(mat))
-  is_perturb_gene_essential <- (perturb_gene_symbols_in_cols %in% essential_gene_list)
-  
-  column_ha <- NULL
-  if (!is.null(essential_gene_list) && length(essential_gene_list) > 0) {
-    # Align to columns explicitly
-    perturb_gene_symbols_in_cols <- gsub("^(.*?)\\s+Knockdown Signature - .*", "\\1", colnames(mat))
-    is_ess_chr <- ifelse(perturb_gene_symbols_in_cols %in% essential_gene_list, "TRUE", "FALSE")
-    # Ensure a plain character vector of same length as columns
-    is_ess_chr <- as.character(is_ess_chr)
-    # Named colors keyed by character values
-    ann_colors <- c("FALSE" = "grey90", "TRUE" = "darkgreen")
-    
-    # Minimal HeatmapAnnotation using a plain character vector (no anno_simple)
-    # This hands ComplexHeatmap an atomic vector directly.
-    column_ha <- HeatmapAnnotation(
-      is_essential = is_ess_chr,
-      col = list(is_essential = ann_colors),
-      annotation_name_side = "left"
-    )
+  # Determine the gene names for initial essentiality check based on the annotation axis
+  if (annotate_on_rows) {
+    gene_names_for_annotation_initial <- rownames(mat_signed_p_val)
+  } else { # Annotate on columns
+    gene_names_for_annotation_initial <- colnames(mat_signed_p_val)
   }
   
-  hm_title <- paste0("Clustered Heatmap: ", analysis_title_prefix, "\n(Signed -log10(Combined P-value), by NES)", # Changed title
-                     "\nRows: ", nrow(mat), ", Cols: ", ncol(mat)) 
-  file_name_base <- paste0(gsub(" ", "_", analysis_title_prefix), "_signed_log10_pvalue_NES_heatmap") # Changed filename
+  # Ensure essential_gene_list is a character vector for robust %in% operation
+  if (!is.null(essential_gene_list)) {
+    essential_gene_list <- as.character(essential_gene_list)
+  }
+  
+  initial_perturb_gene_symbols <- gsub("^(.*?)\\s+Knockdown Signature - .*", "\\1", gene_names_for_annotation_initial)
+  initial_is_essential_vector <- (initial_perturb_gene_symbols %in% essential_gene_list)
+  
+  # Apply filtering to matrices if filter is TRUE and essential_gene_list is provided
+  if (filter == TRUE && !is.null(essential_gene_list) && length(essential_gene_list) > 0) {
+    if (annotate_on_rows) {
+      mat_signed_p_val <- mat_signed_p_val[!initial_is_essential_vector, , drop = FALSE]
+      mat_p_category <- mat_p_category[!initial_is_essential_vector, , drop = FALSE]
+    } else { # Filter columns
+      mat_signed_p_val <- mat_signed_p_val[, !initial_is_essential_vector, drop = FALSE]
+      mat_p_category <- mat_p_category[, !initial_is_essential_vector, drop = FALSE]
+    }
+    
+    if (nrow(mat_signed_p_val) == 0 || ncol(mat_signed_p_val) == 0) {
+      message(paste("  No non-essential perturbation genes remaining after filtering for heatmap in", analysis_title_prefix, ". Skipping heatmap."))
+      return(invisible(NULL))
+    }
+  }
+  
+  # After (potential) filtering, determine the final gene names for annotation
+  if (annotate_on_rows) {
+    final_gene_names_for_annotation <- rownames(mat_signed_p_val)
+  } else {
+    final_gene_names_for_annotation <- colnames(mat_signed_p_val)
+  }
+  
+  final_perturb_gene_symbols <- gsub("^(.*?)\\s+Knockdown Signature - .*", "\\1", final_gene_names_for_annotation)
+  final_is_essential_vector <- (final_perturb_gene_symbols %in% essential_gene_list)
+  
+  # Define discrete color palette for p_category, matching volcano plot colors
+  p_category_colors <- c(
+    "p < 0.01 (DN)" = "darkblue",       # Highest significance DN
+    "p < 0.05 (DN)" = "lightblue",      # Medium significance DN
+    "Not significant" = "grey90",       # No significance
+    "p < 0.05 (UP)" = "lightcoral",     # Medium significance UP
+    "p < 0.01 (UP)" = "darkred"         # Highest significance UP
+  )
+  
+  annotation_obj <- NULL
+  # Create annotation_obj ONLY if essential_gene_list was provided AND is not empty
+  if (!is.null(essential_gene_list) && length(essential_gene_list) > 0) {
+    # Check length consistency after filtering
+    actual_length <- if (annotate_on_rows) nrow(mat_signed_p_val) else ncol(mat_signed_p_val)
+    if (length(final_is_essential_vector) != actual_length) {
+      stop(paste0("Annotation length mismatch: Annotation vector has ", length(final_is_essential_vector), 
+                  " elements, but matrix has ", actual_length, " ", ifelse(annotate_on_rows, "rows", "columns"), ". This should not happen."))
+    }
+    
+    is_ess_chr <- ifelse(final_is_essential_vector, "TRUE", "FALSE")
+    ann_colors <- c("FALSE" = "grey90", "TRUE" = "darkgreen")
+    
+    if (annotate_on_rows) {
+      annotation_obj <- rowAnnotation(
+        is_essential = is_ess_chr,
+        col = list(is_essential = ann_colors),
+        annotation_name_side = "bottom", # Place row annotation name at the bottom
+        width = unit(5, "mm") # Adjust width for better appearance
+      )
+    } else {
+      annotation_obj <- HeatmapAnnotation(
+        is_essential = is_ess_chr,
+        col = list(is_essential = ann_colors),
+        annotation_name_side = "left", # Place column annotation name at the left
+        height = unit(5, "mm") # Adjust height for better appearance
+      )
+    }
+  }
+  
+  hm_title <- paste0("Clustered Heatmap: ", analysis_title_prefix, "\n(Signed -log10(Combined P-value) Categories, by NES)", 
+                     "\nRows: ", nrow(mat_signed_p_val), ", Cols: ", ncol(mat_signed_p_val)) 
+  file_name_base <- paste0(gsub(" ", "_", analysis_title_prefix), "_signed_log10_pvalue_NES_categories_heatmap") 
   heatmap_output_path_png <- file.path(output_dir, paste0(file_name_base, ".png"))
   heatmap_output_path_svg <- file.path(output_dir, paste0(file_name_base, ".svg"))
   
-  hm <- Heatmap(
-    mat,
-    name = "Signed -log10(P)",
-    col = col_fun,
-    na_col = "grey90",
-    cluster_rows = TRUE,
-    cluster_columns = TRUE,
-    show_row_names = FALSE,
-    row_names_gp = gpar(fontsize = 6),
-    column_names_gp = gpar(fontsize = 8),
-    column_names_rot = 90,
-    top_annotation = column_ha # Add annotation
-  )
+  # Heatmap call with conditional annotation placement and clustering
+  if (annotate_on_rows) {
+    hm <- Heatmap(
+      mat_p_category, # Use the categorical matrix for coloring
+      name = "Combined P-value\nCategory", # Legend name reflects categories
+      col = p_category_colors, # Use discrete color mapping
+      na_col = "grey90",
+      cluster_rows = row_dend, # Use provided row dendrogram
+      cluster_columns = col_dend, # Use provided column dendrogram
+      show_row_names = FALSE,
+      row_names_gp = gpar(fontsize = 6),
+      column_names_gp = gpar(fontsize = 8),
+      column_names_rot = 90,
+      left_annotation = if (filter == TRUE) NULL else annotation_obj # Add annotation if not filtering
+    )
+  } else {
+    hm <- Heatmap(
+      mat_p_category, # Use the categorical matrix for coloring
+      name = "Combined P-value\nCategory", # Legend name reflects categories
+      col = p_category_colors, # Use discrete color mapping
+      na_col = "grey90",
+      cluster_rows = row_dend, # Use provided row dendrogram
+      cluster_columns = col_dend, # Use provided column dendrogram
+      show_row_names = FALSE,
+      row_names_gp = gpar(fontsize = 6),
+      column_names_gp = gpar(fontsize = 8),
+      column_names_rot = 90,
+      top_annotation = if (filter == TRUE) NULL else annotation_obj # Add annotation if not filtering
+    )
+  }
   
   png(heatmap_output_path_png, width = 2200, height = 1800, res = 300)
   draw(hm, column_title = hm_title)
@@ -1304,7 +1487,103 @@ plot_geneset_size_vs_es <- function(fgsea_df, analysis_title_prefix, output_dir,
 }
 
 
-#' Generates scatter plots comparing combined NES and ES between age-centered and perturbation-centered analyses.
+#' Generates and saves a volcano plot of combined NES against adjusted p-value,
+#' with points colored by specific categories based on individual and combined significance.
+#'
+#' @param combined_fgsea_df A data frame of combined fgsea results from calculate_combined_scores.
+#' @param analysis_title_prefix A string for plot titles, e.g., "Age-Centered Analysis".
+#' @param output_dir Path to save the plots.
+#' @param indiv_padj_thresh Numeric, threshold for individual padj significance (e.g., 0.05).
+plot_volcano_with_coloring <- function(combined_fgsea_df, analysis_title_prefix, output_dir, indiv_padj_thresh = 0.05) {
+  
+  if (is.null(combined_fgsea_df) || nrow(combined_fgsea_df) == 0) {
+    message(paste("No combined fgsea results for volcano plot with coloring in", analysis_title_prefix, "."))
+    return(invisible(NULL))
+  }
+  
+  message(paste0("Generating volcano plot with coloring for: ", analysis_title_prefix))
+  
+  # Ensure necessary columns exist for plotting
+  required_cols <- c("combined_NES", "combined_padj", "padj_UP", "padj_DN", "ES_UP", "ES_DN", "combined_padj_status")
+  if (!all(required_cols %in% colnames(combined_fgsea_df))) {
+    warning(paste("Missing required columns for volcano plot with coloring:", setdiff(required_cols, colnames(combined_fgsea_df)), ". Skipping plot."))
+    return(invisible(NULL))
+  }
+  
+  # Prepare plot_data based on user's provided logic
+  plot_data <- combined_fgsea_df %>%
+    dplyr::filter(!is.na(combined_NES), !is.na(combined_padj), combined_padj != 0) %>% # Filter out NA/zero p-values
+    dplyr::mutate(
+      log10_combined_padj = -log10(combined_padj),
+      
+      # Determine significance for individual UP/DN padj (handling NAs)
+      padj_UP_sig = !is.na(padj_UP) & (padj_UP < indiv_padj_thresh),
+      padj_DN_sig = !is.na(padj_DN) & (padj_DN < indiv_padj_thresh),
+      
+      # Define coloring_category with more interpretable labels
+      coloring_category = case_when(
+        # Both individual padj are significant, and ES have same sign (or one is zero)
+        combined_padj_status == "Significant" & padj_UP_sig & padj_DN_sig & (sign(ES_UP) == sign(ES_DN) | ES_UP == 0 | ES_DN == 0) ~ "Highly Significant & Consistent", # Dark Red
+        
+        # Both individual padj are significant, and ES have opposite signs
+        combined_padj_status == "Significant" & padj_UP_sig & padj_DN_sig & sign(ES_UP) != sign(ES_DN) ~ "Highly Significant & Bidirectional", # Dark Green
+        
+        # Combined significant, but one individual padj is NOT significant (or NA) and ES have same sign (or one is zero)
+        combined_padj_status == "Significant" & ((!padj_UP_sig & !is.na(padj_UP)) | (!padj_DN_sig & !is.na(padj_DN))) & (sign(ES_UP) == sign(ES_DN) | ES_UP == 0 | ES_DN == 0) ~ "Significant (Weak Individual P)", # Light Red
+        
+        # Any other significant case not covered above (e.g. one-sided padj_UP_sig but ES_DN=0)
+        combined_padj_status == "Significant" ~ "Significant (Other Cases)", # Purple
+        
+        TRUE ~ "Not Significant" # Default for non-significant combined_padj (Grey)
+      ),
+      # Ensure factor order for legend consistency
+      coloring_category = factor(coloring_category, levels = c(
+        "Highly Significant & Consistent",
+        "Highly Significant & Bidirectional",
+        "Significant (Weak Individual P)",
+        "Significant (Other Cases)",
+        "Not Significant"
+      ))
+    )
+  
+  # Define plot_colors
+  plot_colors <- c(
+    "Highly Significant & Consistent" = "darkred",
+    "Highly Significant & Bidirectional" = "darkgreen",
+    "Significant (Weak Individual P)" = "lightcoral",
+    "Significant (Other Cases)" = "purple",
+    "Not Significant" = "grey80"
+  )
+  
+  if (nrow(plot_data) == 0) {
+    message(paste("No valid data points for volcano plot with coloring in", analysis_title_prefix, "after filtering. Skipping."))
+    return(invisible(NULL))
+  }
+  
+  # Create the Volcano Plot
+  volcano_plot <- ggplot(plot_data, aes(x = combined_NES, y = log10_combined_padj, color = coloring_category)) +
+    geom_point(alpha = 0.7, size = 2) +
+    scale_color_manual(values = plot_colors, name = "Combined Status") +
+    geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "red") + # Combined padj threshold
+    labs(
+      title = paste0("Volcano Plot: ", analysis_title_prefix, " Perturbation-Aging Signature Analysis"),
+      x = "Combined Normalized Enrichment Score (NES)",
+      y = "-log10(Combined Adjusted p-value)"
+    ) +
+    theme_minimal() +
+    theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+  
+  plot_filename_png <- file.path(output_dir, paste0(gsub(" ", "_", analysis_title_prefix), "_volcano_plot_colored.png"))
+  ggsave(plot_filename_png, volcano_plot, width = 10, height = 8)
+  
+  plot_filename_svg <- file.path(output_dir, paste0(gsub(" ", "_", analysis_title_prefix), "_volcano_plot_colored.svg"))
+  ggsave(plot_filename_svg, volcano_plot, width = 10, height = 8)
+  
+  message("  Volcano plot with coloring generated and saved to: ", plot_filename_png)
+}
+
+
+#' Generates scatter plots comparing combined NES between age-centered and perturbation-centered analyses.
 #' Each point represents a unique (Perturbation_Gene, Cell_Line, Tissue) triplet.
 #' The plots include a y=x reference line, and highlight essential perturbation genes.
 #'
@@ -1313,8 +1592,8 @@ plot_geneset_size_vs_es <- function(fgsea_df, analysis_title_prefix, output_dir,
 #' @param output_dir Path to save the plots.
 #' @param essential_gene_list Character vector of essential genes for highlighting.
 #' @param top_n_to_label Numeric, number of top/bottom points to label by default.
-plot_cross_analysis_scatterplots <- function(age_combined_df, perturb_combined_df, output_dir, essential_gene_list = NULL, top_n_to_label = 20) {
-  message("Generating cross-analysis scatter plots (Combined NES and Combined ES)...")
+plot_cross_analysis_scatterplots <- function(age_combined_df, perturb_combined_df, output_dir, essential_gene_list = NULL, top_n_to_label = 20, filter = TRUE) {
+  message("Generating cross-analysis scatter plots (Combined NES)...") # Removed ES from message
   
   if (is.null(age_combined_df) || nrow(age_combined_df) == 0) {
     message("Age-centered combined results are empty. Skipping cross-analysis scatter plots.")
@@ -1327,7 +1606,13 @@ plot_cross_analysis_scatterplots <- function(age_combined_df, perturb_combined_d
   
   # Filter for significant results using the new 'combined_padj_status'
   age_filt <- age_combined_df %>%
-    dplyr::filter(combined_padj_status == 'Significant') %>%
+    {
+      if (filter) {
+        dplyr::filter(., combined_padj_status == 'Significant')
+      } else {
+        . # If 'filter' is FALSE, pass the data through unchanged
+      }
+    } %>%
     dplyr::rename(
       combined_ES_age = combined_ES,
       combined_NES_age = combined_NES,
@@ -1336,7 +1621,13 @@ plot_cross_analysis_scatterplots <- function(age_combined_df, perturb_combined_d
     )
   
   perturb_filt <- perturb_combined_df %>%
-    dplyr::filter(combined_padj_status == 'Significant') %>%
+    {
+      if (filter) {
+        dplyr::filter(., combined_padj_status == 'Significant')
+      } else {
+        . # If 'filter' is FALSE, pass the data through unchanged
+      }
+    } %>%
     dplyr::rename(
       combined_ES_perturb = combined_ES,
       combined_NES_perturb = combined_NES,
@@ -1377,10 +1668,10 @@ plot_cross_analysis_scatterplots <- function(age_combined_df, perturb_combined_d
       # 'pathway' column contains the perturbation signature with _UP/_DN suffix
       # Directly extract base and direction
       perturb_base_signature = extract_components_vectorized(pathway)$base,
-      direction = extract_components_vectorized(pathway)$direction, 
+      direction = extract_components_vectorized(pathway)$direction,
       
       # 'ranked_list_name' column contains the clean aging tissue name
-      aging_tissue = ranked_list_name, 
+      aging_tissue = ranked_list_name,
       
       # Create a consistent identifier string for joining
       identifier = paste0(perturb_base_signature, "__", aging_tissue, "__", direction)
@@ -1390,12 +1681,12 @@ plot_cross_analysis_scatterplots <- function(age_combined_df, perturb_combined_d
   perturb_filt_for_join <- perturb_filt %>%
     dplyr::mutate(
       # 'ranked_list_name' column contains the clean perturbation signature name
-      perturb_base_signature = ranked_list_name, 
+      perturb_base_signature = ranked_list_name,
       
       # 'pathway' column contains the aging tissue name with _UP/_DN suffix
       # Directly extract base and direction
       aging_tissue = extract_components_vectorized(pathway)$base,
-      direction = extract_components_vectorized(pathway)$direction, 
+      direction = extract_components_vectorized(pathway)$direction,
       
       # Create a consistent identifier string for joining
       identifier = paste0(perturb_base_signature, "__", aging_tissue, "__", direction)
@@ -1419,9 +1710,9 @@ plot_cross_analysis_scatterplots <- function(age_combined_df, perturb_combined_d
     tidyr::separate(identifier, into = c("perturb_gene_cl", "tissue", "direction"), sep = "__", remove = FALSE) %>%
     dplyr::mutate(
       # Label for text annotation, now including direction
-      label = paste0(perturb_gene_cl, " (", direction, "), Tissue: ", tissue), 
+      label = paste0(perturb_gene_cl, " (", direction, "), Tissue: ", tissue),
       # Extract gene symbol (e.g., "UBL5" from "UBL5 Knockdown Signature - K562")
-      perturb_gene_symbol = gsub("^(.*?)\\s+Knockdown Signature - .*", "\\1", perturb_gene_cl) 
+      perturb_gene_symbol = gsub("^(.*?)\\s+Knockdown Signature - .*", "\\1", perturb_gene_cl)
     )
   
   # Label essential genes
@@ -1449,6 +1740,11 @@ plot_cross_analysis_scatterplots <- function(age_combined_df, perturb_combined_d
   plot_data_final <- merged_data %>%
     dplyr::mutate(is_labeled = label %in% labels_to_show)
   
+  if (filter) {
+    title = "Comparison of Combined NES: Perturbation-Centered vs. Age-Centered Analysis"
+  } else {
+    title = "Comparison of Combined NES: Perturbation-Centered vs. Age-Centered Analysis, non-filtered"
+  }
   
   # --- Plot 1: Combined NES Comparison ---
   plot_nes_comparison <- ggplot(plot_data_final, aes(x = combined_NES_perturb, y = combined_NES_age)) +
@@ -1462,7 +1758,7 @@ plot_cross_analysis_scatterplots <- function(age_combined_df, perturb_combined_d
     scale_size_continuous(range = c(1, 5), name = "Perturb. Geneset Size") +
     scale_shape_manual(values = c("FALSE" = 16, "TRUE" = 18), name = "Essential Perturbation", labels = c("No", "Yes")) +
     labs(
-      title = "Comparison of Combined NES: Perturbation-Centered vs. Age-Centered Analysis",
+      title = title,
       subtitle = "Each point: (Perturbation Gene + Cell Line, Tissue) pair; Shape: Essential Gene",
       x = "Perturbation-Centered Combined NES (Perturbation's effect on Aging)",
       y = "Age-Centered Combined NES (Aging's effect on Perturbation)"
@@ -1472,40 +1768,16 @@ plot_cross_analysis_scatterplots <- function(age_combined_df, perturb_combined_d
           plot.subtitle = element_text(hjust = 0.5),
           legend.position = "bottom")
   
-  plot_filename_nes_png <- file.path(output_dir, "cross_analysis_combined_NES_scatterplot.png")
+  if (filter) {
+    plot_filename_nes_png <- file.path(output_dir, "cross_analysis_combined_NES_scatterplot.png")
+    plot_filename_nes_svg <- file.path(output_dir, "cross_analysis_combined_NES_scatterplot.svg")
+  } else {
+    plot_filename_nes_png <- file.path(output_dir, "cross_analysis_combined_NES_scatterplot_non-filtered.png")
+    plot_filename_nes_svg <- file.path(output_dir, "cross_analysis_combined_NES_scatterplot_non-filtered.svg")
+  }
   ggsave(plot_filename_nes_png, plot_nes_comparison, width = 12, height = 10)
-  plot_filename_nes_svg <- file.path(output_dir, "cross_analysis_combined_NES_scatterplot.svg")
   ggsave(plot_filename_nes_svg, plot_nes_comparison, width = 12, height = 10)
   message("  Cross-analysis Combined NES scatter plot generated and saved to: ", plot_filename_nes_png)
-  
-  
-  # --- Plot 2: Combined ES Comparison ---
-  plot_es_comparison <- ggplot(plot_data_final, aes(x = combined_ES_perturb, y = combined_ES_age)) +
-    geom_point(aes(color = combined_ES_perturb, size = size_perturb, shape = is_essential), alpha = 0.7) +
-    geom_vline(xintercept = 0, linetype = "dashed", color = "gray") +
-    geom_hline(yintercept = 0, linetype = "dashed", color = "gray") +
-    geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "grey50") + # Add y=x line
-    geom_text(data = dplyr::filter(plot_data_final, is_labeled), aes(label = label),
-              size = 2.5, vjust = -0.8, hjust = 0.5, check_overlap = TRUE) +
-    scale_color_gradient2(low = "darkblue", mid = "white", high = "darkred", midpoint = 0, name = "Perturb. ES") + # Symmetric colors
-    scale_size_continuous(range = c(1, 5), name = "Perturb. Geneset Size") +
-    scale_shape_manual(values = c("FALSE" = 16, "TRUE" = 18), name = "Essential Perturbation", labels = c("No", "Yes")) +
-    labs(
-      title = "Comparison of Combined ES: Perturbation-Centered vs. Age-Centered Analysis",
-      subtitle = "Each point: (Perturbation Gene + Cell Line, Tissue) pair; Shape: Essential Gene",
-      x = "Perturbation-Centered Combined ES (Perturbation's effect on Aging)",
-      y = "Age-Centered Combined ES (Aging's effect on Perturbation)"
-    ) +
-    theme_minimal() +
-    theme(plot.title = element_text(face = "bold", hjust = 0.5),
-          plot.subtitle = element_text(hjust = 0.5),
-          legend.position = "bottom")
-  
-  plot_filename_es_png <- file.path(output_dir, "cross_analysis_combined_ES_scatterplot.png")
-  ggsave(plot_filename_es_png, plot_es_comparison, width = 12, height = 10)
-  plot_filename_es_svg <- file.path(output_dir, "cross_analysis_combined_ES_scatterplot.svg")
-  ggsave(plot_filename_es_svg, plot_es_comparison, width = 12, height = 10)
-  message("  Cross-analysis Combined ES scatter plot generated and saved to: ", plot_filename_es_png)
 }
 
 
@@ -1527,6 +1799,8 @@ message("Pre-processing gene_map for faster lookups (applying simplify_entry onc
 gene_map_simplified <- sapply(gene_map, simplify_entry, USE.NAMES = FALSE)
 names(gene_map_simplified) <- names(gene_map) 
 message("Gene map pre-processing complete.")
+
+
 
 # 2. Age-Centered Analysis
 message("\n--- Running Age-Centered Analysis ---")
@@ -1573,8 +1847,31 @@ if (!is.null(fgsea_res_age_centered)) {
   if (!is.null(fgsea_res_age_centered_combined) && nrow(fgsea_res_age_centered_combined) > 0) {
     message("\n--- Generating NEW Age-Centered Visualizations ---")
     plot_combined_fgsea_dotplot(fgsea_res_age_centered_combined, "Age-Centered Analysis", output_dir, top_n_combined_plots, essential_gene_list)
-    plot_combined_heatmap(fgsea_res_age_centered_combined, "Age-Centered Analysis", output_dir, essential_gene_list)
-    plot_combined_heatmap_signed_pvalue_NES(fgsea_res_age_centered_combined, "Age-Centered Analysis", output_dir, essential_gene_list)
+    plot_combined_fgsea_dotplot(fgsea_res_age_centered_combined, "Age-Centered Analysis", output_dir, 100, essential_gene_list)
+    
+    # Store heatmap clustering results to pass to the p-value heatmap
+    nes_heatmap_clusters_age <- plot_combined_heatmap(
+      combined_fgsea_df = fgsea_res_age_centered_combined, 
+      analysis_title_prefix = "Age-Centered Analysis", 
+      output_dir = output_dir, 
+      essential_gene_list = essential_gene_list,
+      ranked_source_name = "Aging" # Specify that ranked lists are from Aging, so perturbation genes are in rows
+    )
+    
+    # Pass clustering results to the signed p-value heatmap
+    plot_combined_heatmap_signed_pvalue_NES(
+      combined_fgsea_df = fgsea_res_age_centered_combined, 
+      analysis_title_prefix = "Age-Centered Analysis", 
+      output_dir = output_dir, 
+      essential_gene_list = essential_gene_list,
+      ranked_source_name = "Aging", # Specify that ranked lists are from Aging, so perturbation genes are in rows
+      row_dend = nes_heatmap_clusters_age$row_dend,
+      col_dend = nes_heatmap_clusters_age$col_dend
+    )
+    
+    # New volcano plot with coloring
+    plot_volcano_with_coloring(fgsea_res_age_centered_combined, "Age-Centered Analysis", output_dir)
+    
     # Exploratory plots for raw fgsea results
     plot_pval_vs_es(fgsea_res_age_centered, "Age-Centered Analysis (Raw FGSEA)", output_dir, es_col = "NES", pval_col = "padj")
     plot_geneset_size_vs_es(fgsea_res_age_centered, "Age-Centered Analysis (Raw FGSEA)", output_dir, es_col = "NES")
@@ -1585,7 +1882,6 @@ if (!is.null(fgsea_res_age_centered)) {
     message("Skipping new Age-Centered visualizations due to no combined results.")
   }
 }
-
 
 # Save the full results table
 if (!is.null(fgsea_res_age_centered)) {
@@ -1640,19 +1936,61 @@ if (!is.null(fgsea_res_perturb_centered)) {
   if (!is.null(fgsea_res_perturb_centered_combined) && nrow(fgsea_res_perturb_centered_combined) > 0) {
     message("\n--- Generating NEW Perturbation-Centered Visualizations ---")
     plot_combined_fgsea_dotplot(fgsea_res_perturb_centered_combined, "Perturbation-Centered Analysis", output_dir, top_n_combined_plots, essential_gene_list)
-    plot_combined_heatmap(fgsea_res_perturb_centered_combined, "Perturbation-Centered Analysis", output_dir, essential_gene_list)
-    plot_combined_heatmap_signed_pvalue_NES(fgsea_res_perturb_centered_combined, "Perturbation-Centered Analysis", output_dir, essential_gene_list)
+    plot_combined_fgsea_dotplot(fgsea_res_perturb_centered_combined, "Perturbation-Centered Analysis", output_dir, 100, essential_gene_list)
+    
+    # Store heatmap clustering results to pass to the p-value heatmap
+    nes_heatmap_clusters_perturb <- plot_combined_heatmap(
+      combined_fgsea_df = fgsea_res_perturb_centered_combined, 
+      analysis_title_prefix = "Perturbation-Centered Analysis", 
+      output_dir = output_dir, 
+      essential_gene_list = essential_gene_list,
+      ranked_source_name = "Perturbation" # Specify that ranked lists are from Perturbation, so perturbation genes are in columns
+    )
+    
+    # Pass clustering results to the signed p-value heatmap
+    plot_combined_heatmap_signed_pvalue_NES(
+      combined_fgsea_df = fgsea_res_perturb_centered_combined, 
+      analysis_title_prefix = "Perturbation-Centered Analysis", 
+      output_dir = output_dir, 
+      essential_gene_list = essential_gene_list,
+      ranked_source_name = "Perturbation", # Specify that ranked lists are from Perturbation, so perturbation genes are in columns
+      row_dend = nes_heatmap_clusters_perturb$row_dend,
+      col_dend = nes_heatmap_clusters_perturb$col_dend
+    )
+    
+    # New volcano plot with coloring
+    plot_volcano_with_coloring(fgsea_res_perturb_centered_combined, "Perturbation-Centered Analysis", output_dir)
+    
     # Exploratory plots for raw fgsea results
     plot_pval_vs_es(fgsea_res_perturb_centered, "Perturbation-Centered Analysis (Raw FGSEA)", output_dir, es_col = "NES", pval_col = "padj")
     plot_geneset_size_vs_es(fgsea_res_perturb_centered, "Perturbation-Centered Analysis (Raw FGSEA)", output_dir, es_col = "NES")
     # Exploratory plots for combined scores
     plot_pval_vs_es(fgsea_res_perturb_centered_combined, "Perturbation-Centered Analysis (Combined NES)", output_dir, es_col = "combined_NES", pval_col = "combined_padj")
     plot_geneset_size_vs_es(fgsea_res_perturb_centered_combined, "Perturbation-Centered Analysis (Combined NES)", output_dir, es_col = "combined_NES")
+    
+    # filtered for non-essential genes - also pass clustering
+    nes_heatmap_clusters_perturb_filtered <- plot_combined_heatmap(
+      combined_fgsea_df = fgsea_res_perturb_centered_combined, 
+      analysis_title_prefix = "Perturbation-Centered Analysis only non-essential genes", 
+      output_dir = output_dir, 
+      essential_gene_list = essential_gene_list, 
+      filter = TRUE,
+      ranked_source_name = "Perturbation" # Specify that ranked lists are from Perturbation, so perturbation genes are in columns
+    )
+    plot_combined_heatmap_signed_pvalue_NES(
+      combined_fgsea_df = fgsea_res_perturb_centered_combined, 
+      analysis_title_prefix = "Perturbation-Centered Analysis only non-essential genes", 
+      output_dir = output_dir, 
+      essential_gene_list = essential_gene_list, 
+      filter = TRUE,
+      ranked_source_name = "Perturbation", # Specify that ranked lists are from Perturbation, so perturbation genes are in columns
+      row_dend = nes_heatmap_clusters_perturb_filtered$row_dend,
+      col_dend = nes_heatmap_clusters_perturb_filtered$col_dend
+    )
   } else {
     message("Skipping new Perturbation-Centered visualizations due to no combined results.")
   }
 }
-
 
 # Save the full results table
 if (!is.null(fgsea_res_perturb_centered)) {
@@ -1660,13 +1998,16 @@ if (!is.null(fgsea_res_perturb_centered)) {
   message("Full Perturbation-Centered fgsea results saved to: ", file.path(output_dir, "fgsea_results_perturbation_centered.csv"))
 }
 
-# Cross-Analysis Scatter Plot (Pass essential gene list, now plots NES)
+
+
+
+# Cross-Analysis Scatter Plot (Pass essential gene list, now plots NES only)
 if (!is.null(fgsea_res_age_centered_combined) && !is.null(fgsea_res_perturb_centered_combined)) {
   plot_cross_analysis_scatterplots(fgsea_res_age_centered_combined, fgsea_res_perturb_centered_combined, output_dir, essential_gene_list = essential_gene_list)
+  plot_cross_analysis_scatterplots(fgsea_res_age_centered_combined, fgsea_res_perturb_centered_combined, output_dir, essential_gene_list = essential_gene_list, filter = FALSE)
 } else {
   message("\nSkipping Cross-Analysis scatter plots due to missing combined results from one or both analyses.")
 }
 
 
 message("\n--- GSEA Combined Analysis Complete ---")
-
