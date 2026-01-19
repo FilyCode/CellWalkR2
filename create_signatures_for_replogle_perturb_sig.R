@@ -267,6 +267,22 @@ if (unmapped_overall_count > 0) {
 
 
 
+
+# Create signatures for perturbation data 
+k562_ps_sig_all <- perturb_data$k562
+rpe1_ps_sig_all <- perturb_data$rpe1
+
+adj_p_cutoff <- 0.05                # Adjusted p-value cutoff for significant genes in signature
+log2fc_abs_cutoff <- 0.25           # Absolute log2FC cutoff for significant genes in signature
+max_genes_in_signature <- 500       # Max. number of significant genes saved in the signature part of the OmicSignature object
+
+output_base_path <- file.path("/restricted/projectnb/agedisease/projects/challenge2025/results/perturbational_omic_sigs/replogle_2022")
+
+k562_collection_output_file <- file.path(output_base_path, "Replogle_K562_Perturb_OmicSignatureCollection.rds")
+rpe1_collection_output_file <- file.path(output_base_path, "Replogle_RPE1_Perturb_OmicSignatureCollection.rds")
+combined_collection_output_file <- file.path(output_base_path, "Replogle_Perturb_Combined_OmicSignatureCollection.rds")
+
+
 # --- Helper Function to Create OmicSignature for a Single Perturbation ---
 create_perturb_omic_signature <- function(
     perturbation_df, perturbation_gene_symbol, cell_line,
@@ -549,3 +565,4 @@ if (length(all_omicsigs_combined) > 0) {
 }
 
 message("\nScript finished successfully!")
+
