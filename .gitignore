@@ -4,6 +4,6 @@
 .Ruserdata
 *.o*
 .rds
-.Rproj
+*.Rproj
 *.csv
 *.tsv
