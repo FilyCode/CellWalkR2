@@ -793,17 +793,32 @@ calculate_combined_scores <- function(fgsea_df, analysis_name) {
       combined_padj = purrr::pmap_dbl(list(padj_UP, padj_DN, NES_UP, NES_DN), function(p_up, p_dn, nes_up, nes_dn) {
         p_values_to_combine <- c()
         
-        # Only include p_up if it's not NA and NES_UP is positive
-        if (!is.na(p_up) && nes_up > 0) {
-          p_values_to_combine <- c(p_values_to_combine, p_up)
-        }
-        # Only include p_dn if it's not NA and NES_DN is negative
-        if (!is.na(p_dn) && nes_dn < 0) {
-          p_values_to_combine <- c(p_values_to_combine, p_dn)
+        # Condition 1: Concordant Effect (UP positive, DN negative)
+        is_concordant_effect <- (nes_up > 0 && nes_dn < 0)
+        
+        # Condition 2: Inverse Effect (UP negative, DN positive)
+        is_inverse_effect <- (nes_up < 0 && nes_dn > 0)
+        
+        # If either a consistent concordant OR inverse bidirectional signal is present,
+        # combine both p_up and p_dn, if they are available (not NA).
+        if (is_concordant_effect || is_inverse_effect) {
+          if (!is.na(p_up)) p_values_to_combine <- c(p_values_to_combine, p_up)
+          if (!is.na(p_dn)) p_values_to_combine <- c(p_values_to_combine, p_dn)
+        } else {
+          # If no strong, consistent bidirectional pattern, we can still include
+          # individual p-values if their corresponding NES is non-zero.
+          # This handles cases where only one side is enriched, or where the
+          # directions are "mixed" but still statistically significant individually.
+          if (!is.na(p_up) && nes_up != 0) {
+            p_values_to_combine <- c(p_values_to_combine, p_up)
+          }
+          if (!is.na(p_dn) && nes_dn != 0) {
+            p_values_to_combine <- c(p_values_to_combine, p_dn)
+          }
         }
         
         if (length(p_values_to_combine) == 0) {
-          return(1) # Set to 1 if no p-values meet criteria or are available
+          return(1) # Default to 1 if no p-values contributed
         } else if (length(p_values_to_combine) == 1) {
           return(p_values_to_combine[1])
         } else {
@@ -815,16 +830,16 @@ calculate_combined_scores <- function(fgsea_df, analysis_name) {
         }
       })
     ) %>%
-    # Select final desired columns, including the new 'size'
+    # Select final desired columns
     dplyr::select(
       pathway, ranked_list_name, geneset_source_name, ranked_source_name,
       NES_UP, padj_UP, NES_DN, padj_DN,
       ES_UP, ES_DN,
-      combined_NES, combined_ES, combined_padj, size # Include combined size
+      combined_NES, combined_ES, combined_padj, size
     ) %>%
     # Filter out rows where combined_padj could not be calculated (e.g., if both padj_UP and padj_DN were NA and didn't meet criteria)
     dplyr::filter(!is.na(combined_padj)) %>%
-    # Annotate pathways based on combined p-value (colleague's suggestion)
+    # Annotate pathways based on combined p-value
     dplyr::mutate(
       combined_padj_status = case_when(
         combined_padj == 0 ~ "p=0", # Handle exact zero p-values
@@ -1829,6 +1844,12 @@ fgsea_res_age_centered <- perform_fgsea_and_combine(
   fgsea_max_size = fgsea_max_size
 )
 
+# Save the full results table
+if (!is.null(fgsea_res_age_centered)) {
+  data.table::fwrite(fgsea_res_age_centered, file.path(output_dir, "fgsea_results_age_centered.csv"))
+  message("Full Age-Centered fgsea results saved to: ", file.path(output_dir, "fgsea_results_age_centered.csv"))
+}
+
 # Visualize results
 plot_fgsea_results(fgsea_res_age_centered, "Age-Centered Analysis", output_dir, top_n_genesets_to_plot)
 plot_fgsea_results(fgsea_res_age_centered, "Age-Centered Analysis", output_dir, 100) # Plot with bigger number of top genes
@@ -1883,12 +1904,6 @@ if (!is.null(fgsea_res_age_centered)) {
   }
 }
 
-# Save the full results table
-if (!is.null(fgsea_res_age_centered)) {
-  data.table::fwrite(fgsea_res_age_centered, file.path(output_dir, "fgsea_results_age_centered.csv"))
-  message("Full Age-Centered fgsea results saved to: ", file.path(output_dir, "fgsea_results_age_centered.csv"))
-}
-
 
 
 # 3. Perturbation-Centered Analysis
@@ -1917,6 +1932,12 @@ fgsea_res_perturb_centered <- perform_fgsea_and_combine(
   fgsea_min_size = fgsea_min_size,
   fgsea_max_size = fgsea_max_size
 )
+
+# Save the full results table
+if (!is.null(fgsea_res_perturb_centered)) {
+  data.table::fwrite(fgsea_res_perturb_centered, file.path(output_dir, "fgsea_results_perturbation_centered.csv"))
+  message("Full Perturbation-Centered fgsea results saved to: ", file.path(output_dir, "fgsea_results_perturbation_centered.csv"))
+}
 
 # Visualize results
 plot_fgsea_results(fgsea_res_perturb_centered, "Perturbation-Centered Analysis", output_dir, top_n_genesets_to_plot)
@@ -1991,13 +2012,6 @@ if (!is.null(fgsea_res_perturb_centered)) {
     message("Skipping new Perturbation-Centered visualizations due to no combined results.")
   }
 }
-
-# Save the full results table
-if (!is.null(fgsea_res_perturb_centered)) {
-  data.table::fwrite(fgsea_res_perturb_centered, file.path(output_dir, "fgsea_results_perturbation_centered.csv"))
-  message("Full Perturbation-Centered fgsea results saved to: ", file.path(output_dir, "fgsea_results_perturbation_centered.csv"))
-}
-
 
 
 
