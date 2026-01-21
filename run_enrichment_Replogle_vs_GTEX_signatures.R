@@ -369,10 +369,10 @@ extract_gene_sets_up_dn <- function(omic_collection, logFC_thresh, pval_thresh, 
     
     # Add to gene sets list
     if (length(up_genes) > 0) {
-      up_gene_sets[[paste0(sig_name, "_UP")]] <- up_genes
+      up_gene_sets[[sig_name]] <- up_genes
     }
     if (length(dn_genes) > 0) {
-      dn_gene_sets[[paste0(sig_name, "_DN")]] <- dn_genes
+      dn_gene_sets[[sig_name]] <- dn_genes
     }
   }
   
