@@ -43,9 +43,12 @@ total_num_cores <- 28
 
 # Load essential genes from DepMap
 message("--- Loading Essential Genes from DepMap ---")
+full_essential_genes_df <- read.csv(essential_genes_file)
+nr_all_depmap_genes = nrow(unique(full_essential_genes_df))
 essential_genes_df <- read.csv(essential_genes_file) %>%
   dplyr::filter(Dataset == "DependencyEnum.Chronos_Combined", Common.Essential == 'True')
 essential_gene_list <- unique(essential_genes_df$Gene)
+nr_ess_depmap_genes = length(essential_gene_list)
 message(paste0("Loaded ", length(essential_gene_list), " common essential genes from DepMap for highlighting."))
 
 
@@ -142,7 +145,7 @@ extract_ranked_lists <- function(omic_collection, collection_name, simplified_ge
     df_for_ranks <- df_for_ranks[keep, , drop = FALSE]
     df_for_ranks <- df_for_ranks[order(df_for_ranks$orig_row), ]
     df_for_ranks$orig_row <- NULL
-
+    
     current_ranks <- df_for_ranks %>%
       dplyr::select(gene_name, score) %>% 
       drop_na(score, gene_name) %>% # Remove NAs in score and gene_name 
@@ -784,58 +787,64 @@ calculate_combined_scores <- function(fgsea_df, analysis_name) {
       size_UP = if_else(is.na(size_UP), 0, size_UP), # Default missing sizes to 0
       size_DN = if_else(is.na(size_DN), 0, size_DN), # Default missing sizes to 0
       
+      # Classification label
+      classification = case_when(
+        (padj_UP < adj_pval_filter_val & padj_DN < adj_pval_filter_val & NES_UP > 0 & NES_DN < 0) ~ "Gero-Advancer",
+        (padj_UP < adj_pval_filter_val & (is.na(padj_DN) | padj_DN >= adj_pval_filter_val) & NES_UP > 0 & NES_DN < 0) ~ "Partial UP Gero-Advancer",
+        (padj_DN < adj_pval_filter_val & (is.na(padj_UP) | padj_UP >= adj_pval_filter_val) & NES_UP > 0 & NES_DN < 0) ~ "Partial DN Gero-Advancer",
+        (padj_UP < adj_pval_filter_val & padj_DN < adj_pval_filter_val & NES_UP < 0 & NES_DN > 0) ~ "Gero-Protector",
+        (padj_UP < adj_pval_filter_val & (is.na(padj_DN) | padj_DN >= adj_pval_filter_val) & NES_UP < 0 & NES_DN > 0) ~ "Partial UP Gero-Protector",
+        (padj_DN < adj_pval_filter_val & (is.na(padj_UP) | padj_UP >= adj_pval_filter_val) & NES_UP < 0 & NES_DN > 0) ~ "Partial DN Gero-Protector",
+        TRUE ~ "Not Significant"
+      ),
+      
+      ## Compute combined scores
       combined_NES = NES_UP - NES_DN,
-      combined_ES = ES_UP - ES_DN,
+      # combined_ES = ES_UP - ES_DN,
       # Take the size, prioritizing UP if available, otherwise DN. If both 0/NA, size is 0.
       size = if_else(size_UP > 0, size_UP, size_DN),
       size = if_else(size == 0 & size_UP == 0 & size_DN == 0, 0, size), # Ensure it's 0 if no valid size
       
-      combined_padj = purrr::pmap_dbl(list(padj_UP, padj_DN, NES_UP, NES_DN), function(p_up, p_dn, nes_up, nes_dn) {
+      # Combined P-val
+      combined_padj = purrr::pmap_dbl(list(padj_UP, padj_DN, NES_UP, NES_DN, classification), function(p_up, p_dn, nes_up, nes_dn, class) {
         p_values_to_combine <- c()
         
-        # Condition 1: Concordant Effect (UP positive, DN negative)
-        is_concordant_effect <- (nes_up > 0 && nes_dn < 0)
         
-        # Condition 2: Inverse Effect (UP negative, DN positive)
-        is_inverse_effect <- (nes_up < 0 && nes_dn > 0)
-        
-        # If either a consistent concordant OR inverse bidirectional signal is present,
-        # combine both p_up and p_dn, if they are available (not NA).
-        if (is_concordant_effect || is_inverse_effect) {
-          if (!is.na(p_up)) p_values_to_combine <- c(p_values_to_combine, p_up)
-          if (!is.na(p_dn)) p_values_to_combine <- c(p_values_to_combine, p_dn)
-        } else {
-          # If no strong, consistent bidirectional pattern, we can still include
-          # individual p-values if their corresponding NES is non-zero.
-          # This handles cases where only one side is enriched, or where the
-          # directions are "mixed" but still statistically significant individually.
-          if (!is.na(p_up) && nes_up != 0) {
-            p_values_to_combine <- c(p_values_to_combine, p_up)
-          }
-          if (!is.na(p_dn) && nes_dn != 0) {
-            p_values_to_combine <- c(p_values_to_combine, p_dn)
-          }
+        if (class == "Gero-Advancer" || class == "Gero-Protector") {
+          p_values_to_combine <- c(p_up, p_dn) 
+        } 
+        else if (class == "Partial UP Gero-Advancer" || class == "Partial UP Gero-Protector") {
+          p_values_to_combine <- p_up
         }
-        
+        else if (class == "Partial DN Gero-Advancer" || class == "Partial DN Gero-Protector") {
+          p_values_to_combine <- p_dn
+        }
+  
+        ## Combined p value estimation
+        # Set to 1 if no p-values meet criteria or are available
         if (length(p_values_to_combine) == 0) {
-          return(1) # Default to 1 if no p-values contributed
-        } else if (length(p_values_to_combine) == 1) {
+          return(1) 
+        } else if(length(p_values_to_combine) == 1) {
           return(p_values_to_combine[1])
         } else {
+          # Both p-values available
           # Ensure p-values are not exactly zero for log calculation
           p_values_to_combine <- pmax(p_values_to_combine, .Machine$double.xmin)
+        
+          # Compute Fisher
           chisq <- -2 * sum(log(p_values_to_combine))
           df_fisher <- 2 * length(p_values_to_combine)
+        
           return(stats::pchisq(chisq, df = df_fisher, lower.tail = FALSE))
         }
-      })
-    ) %>%
+        })
+      ) %>%
     # Select final desired columns
     dplyr::select(
       pathway, ranked_list_name, geneset_source_name, ranked_source_name,
       NES_UP, padj_UP, NES_DN, padj_DN,
-      ES_UP, ES_DN,
-      combined_NES, combined_ES, combined_padj, size
+      #ES_UP, ES_DN,combined_ES,
+      combined_NES, combined_padj, size, classification
     ) %>%
     # Filter out rows where combined_padj could not be calculated (e.g., if both padj_UP and padj_DN were NA and didn't meet criteria)
     dplyr::filter(!is.na(combined_padj)) %>%
@@ -1157,7 +1166,7 @@ plot_combined_heatmap <- function(combined_fgsea_df, analysis_title_prefix, outp
   }
   
   # Draw the heatmap object to extract dendrograms
-  ht_list <- draw(hm, column_title = hm_title, plot = FALSE)
+  ht_list <- draw(hm, column_title = hm_title)
   row_dend_res <- row_dend(ht_list)
   col_dend_res <- column_dend(ht_list)
   
@@ -1217,19 +1226,23 @@ plot_combined_heatmap_signed_pvalue_NES <- function(combined_fgsea_df, analysis_
       signed_log10_p = sign(combined_NES) * (-log10(combined_padj)),
       # Discretize the combined_padj values into categories for coloring
       p_category = case_when(
+        combined_padj < 0.001 & combined_NES > 0 ~ "p < 0.001 (UP)",
         combined_padj < 0.01 & combined_NES > 0 ~ "p < 0.01 (UP)",
         combined_padj >= 0.01 & combined_padj < 0.05 & combined_NES > 0 ~ "p < 0.05 (UP)",
+        combined_padj < 0.001 & combined_NES < 0 ~ "p < 0.001 (DN)",
         combined_padj < 0.01 & combined_NES < 0 ~ "p < 0.01 (DN)",
         combined_padj >= 0.01 & combined_padj < 0.05 & combined_NES < 0 ~ "p < 0.05 (DN)",
         TRUE ~ "Not significant" # For combined_padj >= 0.05 or NES == 0
       ),
       # Ensure explicit factor levels for consistent legend order (DN -> Not Sig -> UP)
       p_category = factor(p_category, levels = c(
+        "p < 0.001 (DN)",
         "p < 0.01 (DN)", 
         "p < 0.05 (DN)", 
         "Not significant", 
         "p < 0.05 (UP)", 
-        "p < 0.01 (UP)"
+        "p < 0.01 (UP)",
+        "p < 0.001 (UP)"
       )) 
     ) %>%
     dplyr::select(pathway, ranked_list_name, signed_log10_p, p_category) %>% # Keep p_category for coloring
@@ -1303,11 +1316,13 @@ plot_combined_heatmap_signed_pvalue_NES <- function(combined_fgsea_df, analysis_
   
   # Define discrete color palette for p_category, matching volcano plot colors
   p_category_colors <- c(
-    "p < 0.01 (DN)" = "darkblue",       # Highest significance DN
+    "p < 0.001 (DN)" = "darkblue",       # Highest significance DN
+    "p < 0.01 (DN)" = "blue",       # Highest significance DN
     "p < 0.05 (DN)" = "lightblue",      # Medium significance DN
     "Not significant" = "grey90",       # No significance
     "p < 0.05 (UP)" = "lightcoral",     # Medium significance UP
-    "p < 0.01 (UP)" = "darkred"         # Highest significance UP
+    "p < 0.01 (UP)" = "red",         # Highest significance UP
+    "p < 0.001 (UP)" = "darkred"         # Highest significance UP
   )
   
   annotation_obj <- NULL
@@ -1519,7 +1534,7 @@ plot_volcano_with_coloring <- function(combined_fgsea_df, analysis_title_prefix,
   message(paste0("Generating volcano plot with coloring for: ", analysis_title_prefix))
   
   # Ensure necessary columns exist for plotting
-  required_cols <- c("combined_NES", "combined_padj", "padj_UP", "padj_DN", "ES_UP", "ES_DN", "combined_padj_status")
+  required_cols <- c("combined_NES", "combined_padj", "padj_UP", "padj_DN", "NES_UP", "NES_DN", "combined_padj_status")
   if (!all(required_cols %in% colnames(combined_fgsea_df))) {
     warning(paste("Missing required columns for volcano plot with coloring:", setdiff(required_cols, colnames(combined_fgsea_df)), ". Skipping plot."))
     return(invisible(NULL))
@@ -1538,15 +1553,15 @@ plot_volcano_with_coloring <- function(combined_fgsea_df, analysis_title_prefix,
       # Define coloring_category with more interpretable labels
       coloring_category = case_when(
         # Both individual padj are significant, and ES have same sign (or one is zero)
-        combined_padj_status == "Significant" & padj_UP_sig & padj_DN_sig & (sign(ES_UP) == sign(ES_DN) | ES_UP == 0 | ES_DN == 0) ~ "Highly Significant & Consistent", # Dark Red
+        combined_padj_status == "Significant" & padj_UP_sig & padj_DN_sig & (sign(NES_UP) == sign(NES_DN) | NES_UP == 0 | NES_DN == 0) ~ "Highly Significant & Consistent", # Dark Red
         
         # Both individual padj are significant, and ES have opposite signs
-        combined_padj_status == "Significant" & padj_UP_sig & padj_DN_sig & sign(ES_UP) != sign(ES_DN) ~ "Highly Significant & Bidirectional", # Dark Green
+        combined_padj_status == "Significant" & padj_UP_sig & padj_DN_sig & sign(NES_UP) != sign(NES_DN) ~ "Highly Significant & Bidirectional", # Dark Green
         
         # Combined significant, but one individual padj is NOT significant (or NA) and ES have same sign (or one is zero)
-        combined_padj_status == "Significant" & ((!padj_UP_sig & !is.na(padj_UP)) | (!padj_DN_sig & !is.na(padj_DN))) & (sign(ES_UP) == sign(ES_DN) | ES_UP == 0 | ES_DN == 0) ~ "Significant (Weak Individual P)", # Light Red
+        combined_padj_status == "Significant" & ((!padj_UP_sig & !is.na(padj_UP)) | (!padj_DN_sig & !is.na(padj_DN))) & (sign(NES_UP) == sign(NES_DN) | NES_UP == 0 | NES_DN == 0) ~ "Significant (Weak Individual P)", # Light Red
         
-        # Any other significant case not covered above (e.g. one-sided padj_UP_sig but ES_DN=0)
+        # Any other significant case not covered above (e.g. one-sided padj_UP_sig but NES_DN=0)
         combined_padj_status == "Significant" ~ "Significant (Other Cases)", # Purple
         
         TRUE ~ "Not Significant" # Default for non-significant combined_padj (Grey)
@@ -1797,6 +1812,145 @@ plot_cross_analysis_scatterplots <- function(age_combined_df, perturb_combined_d
 
 
 
+#' Performs Fisher's exact test to check for enrichment of essential genes in
+#' geroadvancer or geroprotector categories.
+#'
+#' @param combined_fgsea_df A data frame of combined fgsea results from calculate_combined_scores.
+#' @param essential_gene_list Character vector of essential genes.
+#' @param analysis_name A string for logging/message purposes.
+#' @param nr_all_depmap_genes Numeric, total unique genes present in the full DepMap summary file.
+#' @param nr_ess_depmap_genes Numeric, count of common essential genes from DepMap.
+#' @return A list of lists, containing results for geroadvancers and geroprotectors.
+perform_essential_gene_enrichment_test <- function(combined_fgsea_df, essential_gene_list, analysis_name, nr_all_depmap_genes, nr_ess_depmap_genes) {
+  message(paste0("\n--- Performing Essential Gene Enrichment Test for '", analysis_name, "' ---"))
+  message(paste0("  DepMap Reference: Total unique genes in DepMap summary: ", nr_all_depmap_genes, "; Common essential genes: ", nr_ess_depmap_genes, "."))
+  
+  if (is.null(combined_fgsea_df) || nrow(combined_fgsea_df) == 0) {
+    message(paste("No combined fgsea results for essential gene enrichment in", analysis_name, ". Skipping."))
+    return(NULL)
+  }
+  
+  if (is.null(essential_gene_list) || length(essential_gene_list) == 0) {
+    message("Essential gene list is empty. Skipping essential gene enrichment test.")
+    return(NULL)
+  }
+  
+  # Extract all unique perturbation gene symbols from the pathways present in the combined_fgsea_df.
+  # This serves as the universe of perturbation genes considered in this specific analysis run.
+  all_perturb_gene_symbols_in_analysis <- unique(gsub("^(.*?)\\s+Knockdown Signature - .*", "\\1", combined_fgsea_df$pathway))
+  
+  if (length(all_perturb_gene_symbols_in_analysis) == 0) {
+    message("No perturbation gene symbols could be extracted from pathways. Skipping essential gene enrichment test.")
+    return(NULL)
+  }
+  
+  total_genes_in_universe <- length(all_perturb_gene_symbols_in_analysis)
+  essential_in_universe <- sum(all_perturb_gene_symbols_in_analysis %in% essential_gene_list)
+  non_essential_in_universe <- total_genes_in_universe - essential_in_universe
+  
+  message(paste0("  Analysis Universe: Total unique perturbation genes in current combined results: ", total_genes_in_universe, "."))
+  message(paste0("  Analysis Universe: Essential genes in this universe: ", essential_in_universe, " (", round(essential_in_universe/total_genes_in_universe*100, 2), "%)", "; Non-essential: ", non_essential_in_universe, "."))
+  
+  if (essential_in_universe == 0 || non_essential_in_universe == 0) {
+    message(paste0("  Warning: Only essential (", essential_in_universe, ") or only non-essential (", non_essential_in_universe, ") genes in the analysis universe. Fisher's exact test might be trivial or fail if categories are also zero. Proceeding anyway."))
+  }
+  
+  results <- list()
+  
+  # --- Gero-advancers (Positive combined_NES, significant combined_padj) ---
+  sig_geroadvancers <- combined_fgsea_df %>%
+    dplyr::filter(combined_padj < 0.05, combined_NES > 0)
+  
+  if (nrow(sig_geroadvancers) > 0) {
+    geroadvancer_genes <- unique(gsub("^(.*?)\\s+Knockdown Signature - .*", "\\1", sig_geroadvancers$pathway))
+    
+    in_category_essential <- sum(geroadvancer_genes %in% essential_gene_list)
+    in_category_non_essential <- length(geroadvancer_genes) - in_category_essential
+    
+    # These counts are for genes in the *total analysis universe* but *not* in the current category
+    not_in_category_essential <- essential_in_universe - in_category_essential
+    not_in_category_non_essential <- non_essential_in_universe - in_category_non_essential
+    
+    # Ensure no negative counts in case of small sample sizes or edge cases
+    not_in_category_essential <- max(0, not_in_category_essential)
+    not_in_category_non_essential <- max(0, not_in_category_non_essential)
+    
+    contingency_table_advancer <- matrix(c(in_category_essential, not_in_category_essential,
+                                           in_category_non_essential, not_in_category_non_essential),
+                                         nrow = 2, byrow = TRUE,
+                                         dimnames = list(Essentiality = c("Essential", "Non-Essential"),
+                                                         Category = c("Gero-advancer", "Not Gero-advancer")))
+    
+    message(paste0("\n  Gero-advancers (Positive Combined NES) in ", analysis_name, ":"))
+    message("    Contingency Table:")
+    print(contingency_table_advancer)
+    
+    # Check if the table is valid for Fisher's Exact Test (no zero margin sums)
+    if (min(rowSums(contingency_table_advancer)) > 0 && min(colSums(contingency_table_advancer)) > 0) {
+      fisher_res_advancer <- fisher.test(contingency_table_advancer)
+      message(paste0("    Fisher's Exact Test p-value: ", format(fisher_res_advancer$p.value, digits = 3)))
+      message(paste0("    Odds Ratio (Essential in Gero-advancer vs. Not Gero-advancer): ", format(fisher_res_advancer$estimate, digits = 3)))
+      results$geroadvancers <- list(table = contingency_table_advancer, test = fisher_res_advancer)
+    } else {
+      message("    Fisher's Exact Test skipped due to insufficient data (zero margin sums in contingency table).")
+      results$geroadvancers <- list(table = contingency_table_advancer, test = "Skipped (Insufficient data)")
+    }
+  } else {
+    message(paste0("\n  No significant Gero-advancer genes found for '", analysis_name, "' (combined_padj < 0.05, combined_NES > 0)."))
+    results$geroadvancers <- NULL
+  }
+  
+  # --- Gero-protectors (Negative combined_NES, significant combined_padj) ---
+  sig_geroprotectors <- combined_fgsea_df %>%
+    dplyr::filter(combined_padj < 0.05, combined_NES < 0)
+  
+  if (nrow(sig_geroprotectors) > 0) {
+    geroprotector_genes <- unique(gsub("^(.*?)\\s+Knockdown Signature - .*", "\\1", sig_geroprotectors$pathway))
+    
+    in_category_essential <- sum(geroprotector_genes %in% essential_gene_list)
+    in_category_non_essential <- length(geroprotector_genes) - in_category_essential
+    
+    not_in_category_essential <- essential_in_universe - in_category_essential
+    not_in_category_non_essential <- non_essential_in_universe - in_category_non_essential
+    
+    # Ensure no negative counts
+    not_in_category_essential <- max(0, not_in_category_essential)
+    not_in_category_non_essential <- max(0, not_in_category_non_essential)
+    
+    contingency_table_protector <- matrix(c(in_category_essential, not_in_category_essential,
+                                            in_category_non_essential, not_in_category_non_essential),
+                                          nrow = 2, byrow = TRUE,
+                                          dimnames = list(Essentiality = c("Essential", "Non-Essential"),
+                                                          Category = c("Gero-protector", "Not Gero-protector")))
+    
+    message(paste0("\n  Gero-protectors (Negative Combined NES) in ", analysis_name, ":"))
+    message("    Contingency Table:")
+    print(contingency_table_protector)
+    
+    # Check if the table is valid for Fisher's Exact Test (no zero margin sums)
+    if (min(rowSums(contingency_table_protector)) > 0 && min(colSums(contingency_table_protector)) > 0) {
+      fisher_res_protector <- fisher.test(contingency_table_protector)
+      message(paste0("    Fisher's Exact Test p-value: ", format(fisher_res_protector$p.value, digits = 3)))
+      message(paste0("    Odds Ratio (Essential in Gero-protector vs. Not Gero-protector): ", format(fisher_res_protector$estimate, digits = 3)))
+      results$geroprotectors <- list(table = contingency_table_protector, test = fisher_res_protector)
+    } else {
+      message("    Fisher's Exact Test skipped due to insufficient data (zero margin sums in contingency table).")
+      results$geroprotectors <- list(table = contingency_table_protector, test = "Skipped (Insufficient data)")
+    }
+  } else {
+    message(paste0("\n  No significant Gero-protector genes found for '", analysis_name, "' (combined_padj < 0.05, combined_NES < 0)."))
+    results$geroprotectors <- NULL
+  }
+  
+  message(paste0("\n--- Essential Gene Enrichment Test for '", analysis_name, "' Complete ---"))
+  return(results)
+}
+
+
+
+
+
+
 # --- Main Script Execution ---
 
 # 1. Load OmicSignature Collections
@@ -1872,18 +2026,18 @@ if (!is.null(fgsea_res_age_centered)) {
     
     # Store heatmap clustering results to pass to the p-value heatmap
     nes_heatmap_clusters_age <- plot_combined_heatmap(
-      combined_fgsea_df = fgsea_res_age_centered_combined, 
-      analysis_title_prefix = "Age-Centered Analysis", 
-      output_dir = output_dir, 
+      combined_fgsea_df = fgsea_res_age_centered_combined,
+      analysis_title_prefix = "Age-Centered Analysis",
+      output_dir = output_dir,
       essential_gene_list = essential_gene_list,
       ranked_source_name = "Aging" # Specify that ranked lists are from Aging, so perturbation genes are in rows
     )
-    
+
     # Pass clustering results to the signed p-value heatmap
     plot_combined_heatmap_signed_pvalue_NES(
-      combined_fgsea_df = fgsea_res_age_centered_combined, 
-      analysis_title_prefix = "Age-Centered Analysis", 
-      output_dir = output_dir, 
+      combined_fgsea_df = fgsea_res_age_centered_combined,
+      analysis_title_prefix = "Age-Centered Analysis",
+      output_dir = output_dir,
       essential_gene_list = essential_gene_list,
       ranked_source_name = "Aging", # Specify that ranked lists are from Aging, so perturbation genes are in rows
       row_dend = nes_heatmap_clusters_age$row_dend,
@@ -1899,6 +2053,37 @@ if (!is.null(fgsea_res_age_centered)) {
     # Exploratory plots for combined scores
     plot_pval_vs_es(fgsea_res_age_centered_combined, "Age-Centered Analysis (Combined NES)", output_dir, es_col = "combined_NES", pval_col = "combined_padj")
     plot_geneset_size_vs_es(fgsea_res_age_centered_combined, "Age-Centered Analysis (Combined NES)", output_dir, es_col = "combined_NES")
+    
+    # Essential gene enrichment test for Age-Centered Analysis
+    essential_enrichment_age <- perform_essential_gene_enrichment_test(
+      combined_fgsea_df = fgsea_res_age_centered_combined,
+      essential_gene_list = essential_gene_list,
+      analysis_name = "Age-Centered Analysis",
+      nr_all_depmap_genes = nr_all_depmap_genes,
+      nr_ess_depmap_genes = nr_ess_depmap_genes
+    )
+    
+    # Heatmaps filtered for non-essential genes in Age-Centered Analysis
+    message("\n--- Generating Age-Centered Heatmaps (Only Non-Essential Perturbation Genes) ---")
+    nes_heatmap_clusters_age_filtered <- plot_combined_heatmap(
+      combined_fgsea_df = fgsea_res_age_centered_combined,
+      analysis_title_prefix = "Age-Centered Analysis only non-essential genes",
+      output_dir = output_dir,
+      essential_gene_list = essential_gene_list,
+      filter = TRUE,
+      ranked_source_name = "Aging" # Perturbation genes are in rows for Age-Centered
+    )
+    plot_combined_heatmap_signed_pvalue_NES(
+      combined_fgsea_df = fgsea_res_age_centered_combined,
+      analysis_title_prefix = "Age-Centered Analysis only non-essential genes",
+      output_dir = output_dir,
+      essential_gene_list = essential_gene_list,
+      filter = TRUE,
+      ranked_source_name = "Aging", # Perturbation genes are in rows for Age-Centered
+      row_dend = nes_heatmap_clusters_age_filtered$row_dend,
+      col_dend = nes_heatmap_clusters_age_filtered$col_dend
+    )
+    
   } else {
     message("Skipping new Age-Centered visualizations due to no combined results.")
   }
@@ -1961,18 +2146,18 @@ if (!is.null(fgsea_res_perturb_centered)) {
     
     # Store heatmap clustering results to pass to the p-value heatmap
     nes_heatmap_clusters_perturb <- plot_combined_heatmap(
-      combined_fgsea_df = fgsea_res_perturb_centered_combined, 
-      analysis_title_prefix = "Perturbation-Centered Analysis", 
-      output_dir = output_dir, 
+      combined_fgsea_df = fgsea_res_perturb_centered_combined,
+      analysis_title_prefix = "Perturbation-Centered Analysis",
+      output_dir = output_dir,
       essential_gene_list = essential_gene_list,
       ranked_source_name = "Perturbation" # Specify that ranked lists are from Perturbation, so perturbation genes are in columns
     )
-    
+
     # Pass clustering results to the signed p-value heatmap
     plot_combined_heatmap_signed_pvalue_NES(
-      combined_fgsea_df = fgsea_res_perturb_centered_combined, 
-      analysis_title_prefix = "Perturbation-Centered Analysis", 
-      output_dir = output_dir, 
+      combined_fgsea_df = fgsea_res_perturb_centered_combined,
+      analysis_title_prefix = "Perturbation-Centered Analysis",
+      output_dir = output_dir,
       essential_gene_list = essential_gene_list,
       ranked_source_name = "Perturbation", # Specify that ranked lists are from Perturbation, so perturbation genes are in columns
       row_dend = nes_heatmap_clusters_perturb$row_dend,
@@ -1989,25 +2174,37 @@ if (!is.null(fgsea_res_perturb_centered)) {
     plot_pval_vs_es(fgsea_res_perturb_centered_combined, "Perturbation-Centered Analysis (Combined NES)", output_dir, es_col = "combined_NES", pval_col = "combined_padj")
     plot_geneset_size_vs_es(fgsea_res_perturb_centered_combined, "Perturbation-Centered Analysis (Combined NES)", output_dir, es_col = "combined_NES")
     
+    # Essential gene enrichment test for Perturbation-Centered Analysis
+    essential_enrichment_perturb <- perform_essential_gene_enrichment_test(
+      combined_fgsea_df = fgsea_res_perturb_centered_combined,
+      essential_gene_list = essential_gene_list,
+      analysis_name = "Perturbation-Centered Analysis",
+      nr_all_depmap_genes = nr_all_depmap_genes,
+      nr_ess_depmap_genes = nr_ess_depmap_genes
+    )
+    
     # filtered for non-essential genes - also pass clustering
+    message("\n--- Generating Perturbation-Centered Heatmaps (Only Non-Essential Perturbation Genes) ---")
     nes_heatmap_clusters_perturb_filtered <- plot_combined_heatmap(
-      combined_fgsea_df = fgsea_res_perturb_centered_combined, 
-      analysis_title_prefix = "Perturbation-Centered Analysis only non-essential genes", 
-      output_dir = output_dir, 
-      essential_gene_list = essential_gene_list, 
+      combined_fgsea_df = fgsea_res_perturb_centered_combined,
+      analysis_title_prefix = "Perturbation-Centered Analysis only non-essential genes",
+      output_dir = output_dir,
+      essential_gene_list = essential_gene_list,
       filter = TRUE,
       ranked_source_name = "Perturbation" # Specify that ranked lists are from Perturbation, so perturbation genes are in columns
     )
     plot_combined_heatmap_signed_pvalue_NES(
-      combined_fgsea_df = fgsea_res_perturb_centered_combined, 
-      analysis_title_prefix = "Perturbation-Centered Analysis only non-essential genes", 
-      output_dir = output_dir, 
-      essential_gene_list = essential_gene_list, 
+      combined_fgsea_df = fgsea_res_perturb_centered_combined,
+      analysis_title_prefix = "Perturbation-Centered Analysis only non-essential genes",
+      output_dir = output_dir,
+      essential_gene_list = essential_gene_list,
       filter = TRUE,
       ranked_source_name = "Perturbation", # Specify that ranked lists are from Perturbation, so perturbation genes are in columns
       row_dend = nes_heatmap_clusters_perturb_filtered$row_dend,
       col_dend = nes_heatmap_clusters_perturb_filtered$col_dend
     )
+    
+    
   } else {
     message("Skipping new Perturbation-Centered visualizations due to no combined results.")
   }
