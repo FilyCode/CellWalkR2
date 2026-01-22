@@ -750,7 +750,7 @@ plot_clustered_heatmap <- function(fgsea_df, analysis_title_prefix, geneset_sour
 #' @param fgsea_df A data frame of combined fgsea results (containing 'pathway', 'ranked_list_name', 'geneset_direction', 'ES', 'padj').
 #' @param analysis_name A string for logging/message purposes.
 #' @return A data frame with combined NES, combined ES, combined p-values, and original metadata.
-calculate_combined_scores <- function(fgsea_df, analysis_name) {
+calculate_combined_scores <- function(fgsea_df, analysis_name, indiv_padj_thresh = 0.05) {
   if (is.null(fgsea_df) || nrow(fgsea_df) == 0) {
     message(paste("No fgsea results to calculate combined scores for", analysis_name))
     return(NULL)
@@ -839,13 +839,6 @@ calculate_combined_scores <- function(fgsea_df, analysis_name) {
         }
         })
       ) %>%
-    # Select final desired columns
-    dplyr::select(
-      pathway, ranked_list_name, geneset_source_name, ranked_source_name,
-      NES_UP, padj_UP, NES_DN, padj_DN,
-      #ES_UP, ES_DN,combined_ES,
-      combined_NES, combined_padj, size, classification
-    ) %>%
     # Filter out rows where combined_padj could not be calculated (e.g., if both padj_UP and padj_DN were NA and didn't meet criteria)
     dplyr::filter(!is.na(combined_padj)) %>%
     # Annotate pathways based on combined p-value
@@ -856,7 +849,36 @@ calculate_combined_scores <- function(fgsea_df, analysis_name) {
         TRUE ~ "Not Significant"
       ),
       # Factor the status for consistent ordering in plots
-      combined_padj_status = factor(combined_padj_status, levels = c("Significant", "p=0", "Not Significant"))
+      combined_padj_status = factor(combined_padj_status, levels = c("Significant", "p=0", "Not Significant")),
+      
+      # Determine significance for individual UP/DN padj (handling NAs)
+      padj_UP_sig = !is.na(padj_UP) & (padj_UP < indiv_padj_thresh),
+      padj_DN_sig = !is.na(padj_DN) & (padj_DN < indiv_padj_thresh),
+      
+      # Define coloring_category with more interpretable labels
+      coloring_category = case_when(
+        combined_padj_status == "Significant" & padj_UP_sig & padj_DN_sig & (sign(NES_UP) == sign(NES_DN) | NES_UP == 0 | NES_DN == 0) ~ "Highly Significant & Consistent",
+        combined_padj_status == "Significant" & padj_UP_sig & padj_DN_sig & sign(NES_UP) != sign(NES_DN) ~ "Highly Significant & Bidirectional",
+        combined_padj_status == "Significant" & ((!padj_UP_sig & !is.na(padj_UP)) | (!padj_DN_sig & !is.na(padj_DN))) & (sign(NES_UP) == sign(NES_DN) | NES_UP == 0 | NES_DN == 0) ~ "Significant (Weak Individual P)",
+        combined_padj_status == "Significant" ~ "Significant (Other Cases)",
+        TRUE ~ "Not Significant"
+      ),
+      # Ensure factor order for legend consistency
+      coloring_category = factor(coloring_category, levels = c(
+        "Highly Significant & Consistent",
+        "Highly Significant & Bidirectional",
+        "Significant (Weak Individual P)",
+        "Significant (Other Cases)",
+        "Not Significant"
+      ))
+    ) %>%
+    # Select final desired columns
+    dplyr::select(
+      pathway, ranked_list_name, geneset_source_name, ranked_source_name,
+      NES_UP, padj_UP, NES_DN, padj_DN,
+      ES_UP, ES_DN,
+      combined_NES, combined_padj, size,
+      combined_padj_status, coloring_category # NEW: Add coloring_category here
     )
   
   message(paste0("Combined scores calculated and annotated for '", analysis_name, "'. Total combined results: ", nrow(combined_df), " rows."))
@@ -1644,7 +1666,7 @@ plot_cross_analysis_scatterplots <- function(age_combined_df, perturb_combined_d
       }
     } %>%
     dplyr::rename(
-      combined_ES_age = combined_ES,
+      #combined_ES_age = combined_ES,
       combined_NES_age = combined_NES,
       combined_padj_age = combined_padj,
       size_age = size
@@ -1659,7 +1681,7 @@ plot_cross_analysis_scatterplots <- function(age_combined_df, perturb_combined_d
       }
     } %>%
     dplyr::rename(
-      combined_ES_perturb = combined_ES,
+      #combined_ES_perturb = combined_ES,
       combined_NES_perturb = combined_NES,
       combined_padj_perturb = combined_padj,
       size_perturb = size
@@ -1706,7 +1728,7 @@ plot_cross_analysis_scatterplots <- function(age_combined_df, perturb_combined_d
       # Create a consistent identifier string for joining
       identifier = paste0(perturb_base_signature, "__", aging_tissue, "__", direction)
     ) %>%
-    dplyr::select(identifier, combined_ES_age, combined_NES_age, combined_padj_age, size_age)
+    dplyr::select(identifier, combined_NES_age, combined_padj_age, size_age)
   
   perturb_filt_for_join <- perturb_filt %>%
     dplyr::mutate(
@@ -1721,7 +1743,7 @@ plot_cross_analysis_scatterplots <- function(age_combined_df, perturb_combined_d
       # Create a consistent identifier string for joining
       identifier = paste0(perturb_base_signature, "__", aging_tissue, "__", direction)
     ) %>%
-    dplyr::select(identifier, combined_ES_perturb, combined_NES_perturb, combined_padj_perturb, size_perturb)
+    dplyr::select(identifier, combined_NES_perturb, combined_padj_perturb, size_perturb)
   
   merged_data <- dplyr::inner_join(
     age_filt_for_join,
@@ -1821,9 +1843,9 @@ plot_cross_analysis_scatterplots <- function(age_combined_df, perturb_combined_d
 #' @param nr_all_depmap_genes Numeric, total unique genes present in the full DepMap summary file.
 #' @param nr_ess_depmap_genes Numeric, count of common essential genes from DepMap.
 #' @return A list of lists, containing results for geroadvancers and geroprotectors.
-perform_essential_gene_enrichment_test <- function(combined_fgsea_df, essential_gene_list, analysis_name, nr_all_depmap_genes, nr_ess_depmap_genes) {
+perform_essential_gene_enrichment_test <- function(combined_fgsea_df, essential_gene_list, analysis_name, nr_all_depmap_genes, nr_ess_depmap_genes, gene_col = "pathway") {
   message(paste0("\n--- Performing Essential Gene Enrichment Test for '", analysis_name, "' ---"))
-  message(paste0("  DepMap Reference: Total unique genes in DepMap summary: ", nr_all_depmap_genes, "; Common essential genes: ", nr_ess_depmap_genes, "."))
+  message(paste0("  DepMap Reference: Total unique genes in DepMap summary: ", nr_all_depmap_genes, "; Common essential genes: ", nr_ess_depmap_genes, " (", round(nr_ess_depmap_genes/nr_all_depmap_genes*100, 2), "%)", "."))
   
   if (is.null(combined_fgsea_df) || nrow(combined_fgsea_df) == 0) {
     message(paste("No combined fgsea results for essential gene enrichment in", analysis_name, ". Skipping."))
@@ -1837,7 +1859,7 @@ perform_essential_gene_enrichment_test <- function(combined_fgsea_df, essential_
   
   # Extract all unique perturbation gene symbols from the pathways present in the combined_fgsea_df.
   # This serves as the universe of perturbation genes considered in this specific analysis run.
-  all_perturb_gene_symbols_in_analysis <- unique(gsub("^(.*?)\\s+Knockdown Signature - .*", "\\1", combined_fgsea_df$pathway))
+  all_perturb_gene_symbols_in_analysis <- unique(gsub("^(.*?)\\s+Knockdown Signature - .*", "\\1", combined_fgsea_df[[gene_col]]))
   
   if (length(all_perturb_gene_symbols_in_analysis) == 0) {
     message("No perturbation gene symbols could be extracted from pathways. Skipping essential gene enrichment test.")
@@ -1947,6 +1969,187 @@ perform_essential_gene_enrichment_test <- function(combined_fgsea_df, essential_
 }
 
 
+#' Generates and prints an overview table of top gero-advancer and gero-protector genes.
+#' These are filtered by robust significance categories and aggregated by perturbation gene symbol.
+#' It also generates boxplots visualizing the distribution of combined NES across tissues for the top genes.
+#'
+#' @param combined_fgsea_df A data frame of combined fgsea results (from calculate_combined_scores, now with coloring_category).
+#' @param analysis_title_prefix A string for the analysis title, e.g., "Age-Centered Analysis".
+#' @param output_dir Path to save the tables as CSV files.
+#' @param top_n_to_show Numeric, number of top entries to print per table (sorted by number of tissues) and to plot in boxplots.
+#' @param perturb_col Character string, the name of the column containing perturbation pathway information (default: "pathway").
+#' @param tissue_col Character string, the name of the column containing ranked list/tissue names (default: "ranked_list_name").
+#' @return A list containing two data frames: 'gero_advancers_table' and 'gero_protectors_table'.
+generate_gero_overview_tables <- function(combined_fgsea_df, analysis_title_prefix, output_dir, top_n_to_show = 10, min_tissue = 10, perturb_col = "pathway", tissue_col = "ranked_list_name") {
+  message(paste0("\n--- Generating Gero-Advancer/Protector Overview Tables for '", analysis_title_prefix, "' ---"))
+  
+  if (is.null(combined_fgsea_df) || nrow(combined_fgsea_df) == 0) {
+    message(paste("No combined fgsea results for overview tables in", analysis_title_prefix, ". Skipping."))
+    return(list(gero_advancers_table = data.frame(), gero_protectors_table = data.frame()))
+  }
+  
+  # 1. Filter data for the specified coloring_categories (Highly Significant signals)
+  #    and parse the Perturbation Gene Symbol.
+  filtered_and_parsed_data <- combined_fgsea_df %>%
+    dplyr::filter(coloring_category %in% c("Highly Significant & Consistent", "Highly Significant & Bidirectional")) %>%
+    dplyr::mutate(
+      # Extract gene symbol (e.g., "AAMP" from "AAMP Knockdown Signature - K562")
+      perturb_gene_symbol = gsub("^(.*?)\\s+Knockdown Signature - .*", "\\1", !!sym(perturb_col))
+    ) %>%
+    # Remove rows where perturb_gene_symbol couldn't be parsed or is empty
+    dplyr::filter(!is.na(perturb_gene_symbol) & perturb_gene_symbol != "")
+  
+  # Check if any data remains after filtering and parsing
+  if (nrow(filtered_and_parsed_data) == 0) {
+    message("No significant pathways found or gene parsing failed for selected categories. Cannot create tables.")
+    return(list(gero_advancers_table = data.frame(), gero_protectors_table = data.frame()))
+  } else {
+    message(paste0("  Found ", nrow(filtered_and_parsed_data), " highly significant entries across ", n_distinct(filtered_and_parsed_data$perturb_gene_symbol), " perturbation genes."))
+    
+    # 2. Separate into Gero-Advancers (positive NES) and Gero-Protectors (negative NES)
+    gero_advancers_data <- filtered_and_parsed_data %>%
+      dplyr::filter(combined_NES > 0)
+    
+    gero_protectors_data <- filtered_and_parsed_data %>%
+      dplyr::filter(combined_NES < 0)
+    
+    # 3. Aggregate for Gero-Advancers Table
+    gero_advancers_table <- gero_advancers_data %>%
+      dplyr::group_by(perturb_gene_symbol) %>%
+      dplyr::summarise(
+        Tissues_Affected = paste(sort(unique(!!sym(tissue_col))), collapse = ", "),
+        Pathways_Targeted = paste(sort(unique(!!sym(perturb_col))), collapse = "; "),
+        Number_of_Tissues = n_distinct(!!sym(tissue_col)),
+        Min_Combined_Padj = min(combined_padj, na.rm = TRUE),
+        Median_Combined_Padj = median(combined_padj, na.rm = TRUE),
+        Median_Combined_NES = median(combined_NES, na.rm = TRUE),
+        Sum_Combined_NES = sum(combined_NES, na.rm = TRUE),
+        Max_Combined_NES = max(combined_NES, na.rm = TRUE)
+      ) %>%
+      dplyr::filter(Number_of_Tissues >= min_tissue) %>%
+      dplyr::arrange(desc(`Median_Combined_NES`), perturb_gene_symbol) %>% # Rank by median NES, then alphabetically by perturbation
+      dplyr::select(Perturbation_Gene = perturb_gene_symbol, Tissues_Affected, Number_of_Tissues, Median_Combined_NES, Sum_Combined_NES, Max_Combined_NES, Median_Combined_Padj, Min_Combined_Padj, Pathways_Targeted)
+    
+    # 4. Aggregate for Gero-Protectors Table
+    gero_protectors_table <- gero_protectors_data %>%
+      dplyr::group_by(perturb_gene_symbol) %>%
+      dplyr::summarise(
+        Tissues_Affected = paste(sort(unique(!!sym(tissue_col))), collapse = ", "),
+        Pathways_Targeted = paste(sort(unique(!!sym(perturb_col))), collapse = "; "),
+        Number_of_Tissues = n_distinct(!!sym(tissue_col)),
+        Min_Combined_Padj = min(combined_padj, na.rm = TRUE),
+        Median_Combined_Padj = median(combined_padj, na.rm = TRUE),
+        Median_Combined_NES = median(combined_NES, na.rm = TRUE),
+        Sum_Combined_NES = sum(combined_NES, na.rm = TRUE),
+        Max_Combined_NES = max(combined_NES, na.rm = TRUE)
+      ) %>%
+      dplyr::filter(Number_of_Tissues >= min_tissue) %>%
+      dplyr::arrange(`Median_Combined_NES`, perturb_gene_symbol) %>% # Rank by median NES, then alphabetically by perturbation
+      dplyr::select(Perturbation_Gene = perturb_gene_symbol, Tissues_Affected, Number_of_Tissues, Median_Combined_NES, Sum_Combined_NES, Max_Combined_NES, Median_Combined_Padj, Min_Combined_Padj, Pathways_Targeted)
+  }
+  
+  # --- Print and Save the Tables ---
+  message(paste0("\n--- Top Gero-Advancers for '", analysis_title_prefix, "' (ranked by Median_Combined_NES) ---"))
+  if (nrow(gero_advancers_table) > 0) {
+    print(head(gero_advancers_table, top_n_to_show), row.names = FALSE)
+    adv_filename <- file.path(output_dir, paste0(gsub(" ", "_", analysis_title_prefix), "_top_geroadvancers_overview.csv"))
+    data.table::fwrite(gero_advancers_table, adv_filename)
+    message("  Full Gero-Advancers table saved to: ", adv_filename)
+  } else {
+    message("  No Gero-Advancers found matching criteria for '", analysis_title_prefix, "'.")
+  }
+  
+  message(paste0("\n--- Top Gero-Protectors for '", analysis_title_prefix, "' (ranked by total Median_Combined_NES) ---"))
+  if (nrow(gero_protectors_table) > 0) {
+    print(head(gero_protectors_table, top_n_to_show), row.names = FALSE)
+    prot_filename <- file.path(output_dir, paste0(gsub(" ", "_", analysis_title_prefix), "_top_geroprotectors_overview.csv"))
+    data.table::fwrite(gero_protectors_table, prot_filename)
+    message("  Full Gero-Protectors table saved to: ", prot_filename)
+  } else {
+    message("  No Gero-Protectors found matching criteria for '", analysis_title_prefix, "'.")
+  }
+  
+  # --- Generate Boxplots for Top N Gero-Advancers ---
+  if (nrow(gero_advancers_table) > 0) {
+    top_advancer_genes <- head(gero_advancers_table$Perturbation_Gene, top_n_to_show)
+    boxplot_advancers_data <- gero_advancers_data %>%
+      dplyr::filter(perturb_gene_symbol %in% top_advancer_genes) %>%
+      dplyr::mutate(
+        # Order genes by their mean combined_NES for the plot
+        perturb_gene_symbol = factor(perturb_gene_symbol, levels = gero_advancers_table$Perturbation_Gene[gero_advancers_table$Perturbation_Gene %in% top_advancer_genes])
+      )
+    
+    if (nrow(boxplot_advancers_data) > 0) {
+      plot_advancers_boxplot <- ggplot(boxplot_advancers_data, aes(x = perturb_gene_symbol, y = combined_NES, fill = perturb_gene_symbol)) +
+        geom_boxplot(outlier.shape = NA) + # Hide outliers to prevent clutter
+        geom_jitter(width = 0.2, alpha = 0.6, size = 1, color = "darkgrey") + # Add jittered points for individual tissues
+        labs(
+          title = paste0("Top ", top_n_to_show, " Gero-Advancers by Combined NES (", analysis_title_prefix, ")"),
+          x = "Perturbation Gene Symbol",
+          y = "Combined NES Across Tissues"
+        ) +
+        theme_minimal() +
+        theme(
+          plot.title = element_text(hjust = 0.5, face = "bold"),
+          axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
+          legend.position = "none" # Hide legend if fill is just for unique genes
+        )
+      
+      boxplot_adv_filename_png <- file.path(output_dir, paste0(gsub(" ", "_", analysis_title_prefix), "_top_geroadvancers_boxplot.png"))
+      ggsave(boxplot_adv_filename_png, plot_advancers_boxplot, width = 10, height = 7)
+      boxplot_adv_filename_svg <- file.path(output_dir, paste0(gsub(" ", "_", analysis_title_prefix), "_top_geroadvancers_boxplot.svg"))
+      ggsave(boxplot_adv_filename_svg, plot_advancers_boxplot, width = 10, height = 7)
+      message("  Top Gero-Advancers boxplot generated and saved to: ", boxplot_adv_filename_png)
+    } else {
+      message("  No data available for top Gero-Advancers boxplot.")
+    }
+  } else {
+    message("  No Gero-Advancers table data to generate boxplot.")
+  }
+  
+  # --- Generate Boxplots for Top N Gero-Protectors ---
+  if (nrow(gero_protectors_table) > 0) {
+    top_protector_genes <- head(gero_protectors_table$Perturbation_Gene, top_n_to_show)
+    boxplot_protectors_data <- gero_protectors_data %>%
+      dplyr::filter(perturb_gene_symbol %in% top_protector_genes) %>%
+      dplyr::mutate(
+        # Order genes by their mean combined_NES for the plot
+        perturb_gene_symbol = factor(perturb_gene_symbol, levels = gero_protectors_table$Perturbation_Gene[gero_protectors_table$Perturbation_Gene %in% top_protector_genes])
+      )
+    
+    if (nrow(boxplot_protectors_data) > 0) {
+      plot_protectors_boxplot <- ggplot(boxplot_protectors_data, aes(x = perturb_gene_symbol, y = combined_NES, fill = perturb_gene_symbol)) +
+        geom_boxplot(outlier.shape = NA) + # Hide outliers to prevent clutter
+        geom_jitter(width = 0.2, alpha = 0.6, size = 1, color = "darkgrey") + # Add jittered points for individual tissues
+        labs(
+          title = paste0("Top ", top_n_to_show, " Gero-Protectors by Combined NES (", analysis_title_prefix, ")"),
+          x = "Perturbation Gene Symbol",
+          y = "Combined NES Across Tissues"
+        ) +
+        theme_minimal() +
+        theme(
+          plot.title = element_text(hjust = 0.5, face = "bold"),
+          axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
+          legend.position = "none"
+        )
+      
+      boxplot_prot_filename_png <- file.path(output_dir, paste0(gsub(" ", "_", analysis_title_prefix), "_top_geroprotectors_boxplot.png"))
+      ggsave(boxplot_prot_filename_png, plot_protectors_boxplot, width = 10, height = 7)
+      boxplot_prot_filename_svg <- file.path(output_dir, paste0(gsub(" ", "_", analysis_title_prefix), "_top_geroprotectors_boxplot.svg"))
+      ggsave(boxplot_prot_filename_svg, plot_protectors_boxplot, width = 10, height = 7)
+      message("  Top Gero-Protectors boxplot generated and saved to: ", boxplot_prot_filename_png)
+    } else {
+      message("  No data available for top Gero-Protectors boxplot.")
+    }
+  } else {
+    message("  No Gero-Protectors table data to generate boxplot.")
+  }
+  
+  
+  message(paste0("\n--- Gero-Advancer/Protector Overview Tables and Boxplots for '", analysis_title_prefix, "' Complete ---"))
+  
+  return(list(gero_advancers_table = gero_advancers_table, gero_protectors_table = gero_protectors_table))
+}
 
 
 
@@ -2061,6 +2264,15 @@ if (!is.null(fgsea_res_age_centered)) {
       analysis_name = "Age-Centered Analysis",
       nr_all_depmap_genes = nr_all_depmap_genes,
       nr_ess_depmap_genes = nr_ess_depmap_genes
+    )
+    
+    # Generate and save overview tables for Age-Centered Analysis
+    gero_overview_age_results <- generate_gero_overview_tables(
+      combined_fgsea_df = fgsea_res_age_centered_combined,
+      analysis_title_prefix = "Age-Centered Analysis",
+      output_dir = output_dir,
+      top_n_to_show = 20, 
+      min_tissue = 10
     )
     
     # Heatmaps filtered for non-essential genes in Age-Centered Analysis
@@ -2180,7 +2392,19 @@ if (!is.null(fgsea_res_perturb_centered)) {
       essential_gene_list = essential_gene_list,
       analysis_name = "Perturbation-Centered Analysis",
       nr_all_depmap_genes = nr_all_depmap_genes,
-      nr_ess_depmap_genes = nr_ess_depmap_genes
+      nr_ess_depmap_genes = nr_ess_depmap_genes,
+      gene_col = "ranked_list_name"
+    )
+    
+    # Generate and save overview tables for Age-Centered Analysis
+    gero_overview_age_results <- generate_gero_overview_tables(
+      combined_fgsea_df = fgsea_res_perturb_centered_combined,
+      analysis_title_prefix = "Perturbation-Centered Analysis",
+      output_dir = output_dir,
+      top_n_to_show = 20, 
+      min_tissue = 1, 
+      perturb_col = "ranked_list_name", 
+      tissue_col = "pathway"
     )
     
     # filtered for non-essential genes - also pass clustering
