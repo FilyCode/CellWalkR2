@@ -21,6 +21,7 @@ library(ggplot2)
 library(data.table)
 library(GenomicRanges)
 library(FNN)
+library(irlba)
 library(cowplot) # For plot_grid
 library(dplyr)   # For %>% and filter
 set.seed(123) # For reproducibility
@@ -264,32 +265,30 @@ readAnnDataATAC <- function(atac_h5ad_path, x_col = "xcor", y_col = "ycor", geno
 
   sce <- readH5AD(atac_h5ad_path)
   
-  counts_atac <- as(assay(sce, "X"), "dgCMatrix") 
-  
-  # CellWalker2 expects counts_matrix to be cells x peaks. Transpose if necessary.
-  if (nrow(counts_atac) == nrow(sce) && ncol(counts_atac) == ncol(sce)) {
-    counts_atac <- t(counts_atac)
-    message("ATAC counts matrix transposed from peak-by-cell to cell-by-peak (", dim(counts_atac)[1], " cells x ", dim(counts_atac)[2], " peaks).")
-  } else if (nrow(counts_atac) == ncol(sce) && ncol(counts_atac) == nrow(sce)) {
-    message("ATAC counts matrix is already in cell-by-peak format (", dim(counts_atac)[1], " cells x ", dim(counts_atac)[2], " peaks).")
-  } else {
-    warning("Unexpected dimensions for ATAC counts matrix after reading. Assuming it's already cell-by-peak. Please verify `assay(sce, 'X')` orientation.")
-  }
+  # SingleCellExperiment assays are always FEATURES x CELLS.
+  # CellWalker2 expects count matrices to be CELLS x FEATURES.
+  # Therefore, we MUST transpose the assay matrix.
+  counts_atac_feature_by_cell <- as(assay(sce, "X"), "dgCMatrix") 
+  counts_atac <- t(counts_atac_feature_by_cell) # THIS IS THE NECESSARY TRANSPOSE
+  message("ATAC counts matrix transposed from feature-by-cell to cell-by-feature (", dim(counts_atac)[1], " cells x ", dim(counts_atac)[2], " features/peaks).")
 
-  # Parse peak names into GRanges object
+  # Parse peak names into GRanges object (rowData refers to features)
   peaks_gr <- tryCatch({
-    if (!is.null(rowData(sce)) && "chrom" %in% colnames(rowData(sce)) && "start" %in% colnames(rowData(sce)) && "end" %in% colnames(rowData(sce))) {
-      GRanges(seqnames = rowData(sce)$chrom,
-              ranges = IRanges(start = as.integer(rowData(sce)$start), end = as.integer(rowData(sce)$end)),
+    # Check if rowData contains 'chrom', 'start', 'end' explicitly
+    rd_df <- as.data.frame(rowData(sce)) # Convert DataFrame to data.frame for easier column access
+    if (!is.null(rd_df) && "chrom" %in% colnames(rd_df) && "start" %in% colnames(rd_df) && "end" %in% colnames(rd_df)) {
+      GRanges(seqnames = rd_df$chrom,
+              ranges = IRanges(start = as.integer(rd_df$start), end = as.integer(rd_df$end)),
               seqinfo = Seqinfo(genome = genome))
     } else {
+      # Fallback to parsing SCE rownames (which are feature names)
       Signac::StringToGRanges(rownames(sce), sep = c(":", "-"))
     }
   }, error = function(e) {
     stop(paste("Could not parse peak genomic ranges. Ensure rowData contains 'chrom', 'start', 'end' or original SCE rownames are in 'chr:start-end' format.", e$message))
   })
 
-  # Extract spatial coordinates from `colData(sce)`
+  # Extract spatial coordinates from `colData(sce)` (cell metadata)
   if (!all(c(x_col, y_col) %in% colnames(colData(sce)))) {
     stop(paste0("Spatial coordinate columns '", x_col, "' and '", y_col, "' not found in AnnData colData. Available columns: ", paste(colnames(colData(sce)), collapse = ", ")))
   }
@@ -297,32 +296,24 @@ readAnnDataATAC <- function(atac_h5ad_path, x_col = "xcor", y_col = "ycor", geno
   colnames(spatial_coords) <- c("x", "y") # Standardize column names
   rownames(spatial_coords) <- colnames(sce) # Original cell names from SCE
   
-  # Ensure all data aligns by cell names
+  # Ensure all data aligns by cell names (rownames of counts_atac are cells, rownames of spatial_coords are cells)
   common_cells_final <- intersect(rownames(counts_atac), rownames(spatial_coords))
   if (length(common_cells_final) == 0) {
-    # If initial alignment fails (e.g., if counts_atac wasn't transposed correctly
-    # and its rownames are peaks), try transposing and re-aligning.
-    warning("Initial alignment of ATAC counts and spatial coords failed. Attempting re-alignment by transposing counts_atac.")
-    counts_atac_transposed <- t(counts_atac)
-    common_cells_final <- intersect(rownames(counts_atac_transposed), rownames(spatial_coords))
-    if (length(common_cells_final) > 0) {
-      counts_atac <- counts_atac_transposed
-      message("Re-aligned ATAC counts and spatial coords after transposing counts_atac. Found ", length(common_cells_final), " common cells.")
-    } else {
-      stop("No common cells found between ATAC counts and spatial coordinates even after attempting transposition. Check data integrity and orientation.")
-    }
+      stop("No common cells found between ATAC counts and spatial coordinates. Check data integrity and cell ID consistency.")
   }
+  
   counts_atac <- counts_atac[common_cells_final, , drop = FALSE]
   spatial_coords <- spatial_coords[common_cells_final, , drop = FALSE]
   
   message("AnnData ATAC-seq data loaded. Final dimensions (cells x peaks): ", paste(dim(counts_atac), collapse = "x"), ".")
   return(list(
-    counts_matrix = counts_atac,
+    counts_matrix = counts_atac, # Now correctly cells x peaks
     peaks_gr = peaks_gr,
     spatial_coords = spatial_coords,
     cell_names = rownames(counts_atac) 
   ))
 }
+
 
 #' Mirror Spatial Coordinates
 #'
@@ -588,19 +579,32 @@ imputeATACtoRNAbySpatial <- function(rna_spatial_coords, atac_spatial_coords, at
     k = k_impute_spatial
   )
   
-  imputed_atac_matrix <- Matrix::Matrix(0, nrow = nrow(rna_spatial_coords), ncol = ncol(atac_gene_activity_matrix), sparse = TRUE)
-  rownames(imputed_atac_matrix) <- rownames(rna_spatial_coords)
-  colnames(imputed_atac_matrix) <- colnames(atac_gene_activity_matrix)
-
-  for (i in 1:nrow(rna_spatial_coords)) {
-    neighbor_indices <- nn_result$nn.idx[i, ]
-    if (k_impute_spatial == 1) { 
-      imputed_profile <- atac_gene_activity_matrix[neighbor_indices, ]
-    } else { 
-      imputed_profile <- Matrix::colMeans(atac_gene_activity_matrix[neighbor_indices, , drop = FALSE])
-    }
-    imputed_atac_matrix[i, ] <- imputed_profile
-  }
+  # Vectorized imputation using sparse matrix multiplication ---
+  # Construct a sparse weight matrix 'W'
+  # W has dimensions (N_rna x N_atac)
+  # W[i, j] = 1/k_impute_spatial if ATAC cell 'j' is one of the k-neighbors of RNA cell 'i'
+  # Otherwise W[i, j] = 0
+  
+  # 'i' indices for rows of W (corresponding to RNA cells)
+  row_indices_W <- rep(1:nrow(rna_spatial_coords), each = k_impute_spatial)
+  
+  # 'j' indices for columns of W (corresponding to ATAC cells)
+  col_indices_W <- as.vector(nn_result$nn.idx)
+  
+  # 'x' values for W (each neighbor contributes 1/k_impute_spatial for averaging)
+  weight_values <- rep(1 / k_impute_spatial, length(row_indices_W))
+  
+  # Create the sparse weight matrix
+  W <- Matrix::sparseMatrix(
+    i = row_indices_W,
+    j = col_indices_W,
+    x = weight_values,
+    dims = c(nrow(rna_spatial_coords), nrow(atac_spatial_coords)),
+    dimnames = list(rownames(rna_spatial_coords), rownames(atac_spatial_coords)) # Assign cell names
+  )
+  
+  # Perform the imputation via matrix multiplication: (N_rna x N_atac) %*% (N_atac x N_genes) = (N_rna x N_genes)
+  imputed_atac_matrix <- W %*% atac_gene_activity_matrix
 
   message("ATAC-seq gene activity data imputation complete. Imputed matrix dimensions: ", paste(dim(imputed_atac_matrix), collapse = "x"))
   return(imputed_atac_matrix)
@@ -756,7 +760,7 @@ preprocessSpatialMultiomics <- function(
 #'         if 0 or 1 cells remain after processing.
 #' @export
 createRNACellGraph <- function(seurat_obj, dims = 1:30, k_neighbors = 20) {
-    if (!is(seurat_obj, "Seurat")) {
+  if (!is(seurat_obj, "Seurat")) {
     stop("Input 'seurat_obj' must be a Seurat object.")
   }
   
@@ -849,18 +853,22 @@ createRNACellGraph <- function(seurat_obj, dims = 1:30, k_neighbors = 20) {
 #' Create ATAC-based Cell-to-Cell Similarity Graph from Gene Activity Matrix
 #'
 #' \code{createATACCellGraph()} computes a cell-to-cell similarity matrix based on
-#' ATAC-seq gene activity scores. It uses `CellWalkR::computeCellSim` to generate a sparse
-#' graph, representing cell-cell similarity for use in CellWalker.
+#' ATAC-seq gene activity scores. It performs sparse PCA on the gene activity matrix
+#' and then constructs a K-nearest neighbors (KNN) graph from the PCA embeddings.
+#' This approach is more scalable for large datasets than all-pairs similarity methods.
 #'
 #' @param atac_gene_activity_matrix Sparse matrix of ATAC-seq gene activity scores (cells x genes).
-#' @param method Character, method for ATAC feature similarity (e.g., "sparseJaccard", "spearman").
+#' @param atac_pca_dims Integer, number of principal components to use for ATAC graph construction.
+#' @param atac_k_neighbors Integer, the number of nearest neighbors to consider for each cell
+#'                         in the ATAC KNN graph.
 #' @return A sparseMatrix of cell-to-cell similarity, with values normalized
 #'         between 0 and 1, where 1 indicates perfect similarity. Rownames and
 #'         colnames are cell barcodes. Returns an empty (0x0) or 1x1 identity matrix
 #'         if 0 or 1 cells remain after processing.
+#' @importFrom irlba prcomp_irlba # Make sure irlba is loaded
 #' @export
-createATACCellGraph <- function(atac_gene_activity_matrix, method = "sparseJaccard") {
-  message("Computing ATAC-based cell-cell graph from gene activity matrix...")
+createATACCellGraph <- function(atac_gene_activity_matrix, atac_pca_dims = 30, atac_k_neighbors = 20) {
+  message("Computing ATAC-based cell-cell graph from gene activity matrix using PCA+KNN...")
 
   num_cells <- nrow(atac_gene_activity_matrix)
   cell_ids <- rownames(atac_gene_activity_matrix)
@@ -881,18 +889,66 @@ createATACCellGraph <- function(atac_gene_activity_matrix, method = "sparseJacca
     return(Matrix::Matrix(0, num_cells, num_cells, sparse = TRUE, dimnames = list(cell_ids, cell_ids)))
   }
   
-  # Compute similarity using CellWalkR's computeCellSim
-  atac_cell_graph <- CellWalkR::computeCellSim(atac_gene_activity_matrix[, non_zero_genes, drop = FALSE], method = method)
+  atac_mat_for_dimred <- atac_gene_activity_matrix[, non_zero_genes, drop = FALSE]
+
+  # Perform sparse PCA on ATAC gene activity matrix
+  message("  Performing sparse PCA on ATAC gene activity matrix...")
+  num_features_for_pca <- ncol(atac_mat_for_dimred)
   
-  # Ensure graph is aligned to original ATAC cell IDs and is symmetric with diagonal 1
-  # (computeCellSim should generally preserve names, but a safeguard is good)
-  if (!identical(rownames(atac_cell_graph), cell_ids) || !identical(colnames(atac_cell_graph), cell_ids)) {
-      warning("Cell names not preserved by computeCellSim for ATAC graph. Attempting re-alignment. This might be inefficient for large datasets if names are significantly mismatched.")
-      realigned_graph <- Matrix::Matrix(0, num_cells, num_cells, sparse = TRUE, dimnames = list(cell_ids, cell_ids))
-      common_cells <- intersect(cell_ids, rownames(atac_cell_graph))
-      realigned_graph[common_cells, common_cells] <- atac_cell_graph[common_cells, common_cells]
-      atac_cell_graph <- realigned_graph
+  if (num_features_for_pca < 2) {
+    warning("Too few features remaining (", num_features_for_pca, ") for ATAC dimensionality reduction. Returning empty matrix for ATAC graph.")
+    return(Matrix::Matrix(0, num_cells, num_cells, sparse = TRUE, dimnames = list(cell_ids, cell_ids)))
   }
+  
+  effective_atac_pca_dims <- min(atac_pca_dims, num_features_for_pca - 1) 
+  if (effective_atac_pca_dims < 2) {
+      warning("Not enough dimensions (", effective_atac_pca_dims, ") for ATAC PCA after adjustments. Returning empty matrix for ATAC graph.")
+      return(Matrix::Matrix(0, num_cells, num_cells, sparse = TRUE, dimnames = list(cell_ids, cell_ids)))
+  }
+  
+  # Using prcomp_irlba for efficient sparse PCA
+  atac_pca_res <- irlba::prcomp_irlba(atac_mat_for_dimred, n = effective_atac_pca_dims, center = TRUE, scale. = FALSE)
+  pca_embeddings_atac <- atac_pca_res$x
+  rownames(pca_embeddings_atac) <- cell_ids # Ensure cell IDs are set
+
+  # Ensure k_neighbors is valid
+  if (atac_k_neighbors >= num_cells) {
+    warning("'atac_k_neighbors' (", atac_k_neighbors, ") is greater than or equal to the number of cells (", num_cells, "). Setting k_neighbors to num_cells - 1.")
+    atac_k_neighbors <- num_cells - 1
+    if (atac_k_neighbors < 1) atac_k_neighbors <- 1
+  }
+  if (atac_k_neighbors < 1) {
+    stop("Error: 'atac_k_neighbors' must be at least 1 for KNN graph computation after adjustments.")
+  }
+
+  # Compute k-nearest neighbors using FNN::get.knn
+  message("  Computing k-nearest neighbors (k = ", atac_k_neighbors, ") on ATAC PCs...")
+  knn_result <- FNN::get.knn(pca_embeddings_atac, k = atac_k_neighbors)
+  
+  # Construct sparse matrix from KNN results
+  adj_list_i <- rep(1:num_cells, each = atac_k_neighbors)
+  adj_list_j <- as.vector(knn_result$index)
+  distances <- as.vector(knn_result$distance)
+  
+  max_dist_in_knn <- max(distances)
+  if (max_dist_in_knn == 0) { 
+    similarity <- rep(1, length(distances)) 
+  } else {
+    similarity <- 1 - (distances / max_dist_in_knn)
+  }
+  
+  valid_indices <- adj_list_j <= num_cells & adj_list_j >= 1
+  adj_list_i <- adj_list_i[valid_indices]
+  adj_list_j <- adj_list_j[valid_indices]
+  similarity <- similarity[valid_indices]
+
+  atac_cell_graph <- Matrix::sparseMatrix(
+    i = adj_list_i,
+    j = adj_list_j,
+    x = similarity,
+    dims = c(num_cells, num_cells),
+    dimnames = list(cell_ids, cell_ids)
+  )
   
   atac_cell_graph <- pmax(atac_cell_graph, t(atac_cell_graph)) # Ensure symmetry
   diag(atac_cell_graph) <- 1 # Ensure self-similarity is 1
@@ -994,9 +1050,8 @@ createATACCellGraph <- function(atac_gene_activity_matrix, method = "sparseJacca
 #'
 #' \code{generateSeparateModalGraphs()} creates independent cell-to-cell similarity graphs
 #' for spatial RNA-seq and spatial ATAC-seq data. The RNA graph is based on PCA embeddings,
-#' and the ATAC graph is based on gene activity scores derived from peak aggregation.
-#' This function does NOT combine the graphs but returns them individually for separate analysis
-#' or validation.
+#' and the ATAC graph is based on gene activity scores derived from peak aggregation,
+#' followed by sparse PCA and KNN graph construction.
 #'
 #' @param seurat_obj_rna_preprocessed Preprocessed Seurat object for spatial RNA-seq.
 #' @param atac_counts_matrix_filtered Sparse matrix of ATAC-seq peak counts (cells x peaks).
@@ -1004,7 +1059,9 @@ createATACCellGraph <- function(atac_gene_activity_matrix, method = "sparseJacca
 #' @param genome Genome build (e.g., "hg38") for ATAC gene activity.
 #' @param rna_feature_dims Integer vector of PCs for RNA feature graph (e.g., 1:30).
 #' @param rna_feature_k_neighbors Integer, k for RNA feature KNN graph.
-#' @param atac_feature_sim_method Character, method for ATAC feature similarity (e.g., "sparseJaccard").
+#' @param atac_pca_dims Integer, number of principal components to use for ATAC graph construction.
+#' @param atac_k_neighbors Integer, the number of nearest neighbors to consider for each cell
+#'                         in the ATAC KNN graph.
 #' @return A list containing:
 #'   \itemize{
 #'     \item `rna_graph`: Sparse matrix of RNA-based cell-to-cell similarity.
@@ -1019,29 +1076,32 @@ generateSeparateModalGraphs <- function(
     genome = "hg38",
     rna_feature_dims = 1:30,
     rna_feature_k_neighbors = 20,
-    atac_feature_sim_method = "sparseJaccard"
+    atac_pca_dims = 30,
+    atac_k_neighbors = 20
 ) {
   message("Starting `generateSeparateModalGraphs` pipeline...")
 
   # 1. Create RNA Feature Graph
   rna_graph <- createRNACellGraph(seurat_obj_rna_preprocessed, dims = rna_feature_dims, k_neighbors = rna_feature_k_neighbors)
-  # Ensure empty graph handling if creation failed
   rna_cell_ids <- colnames(seurat_obj_rna_preprocessed)
   if (is.null(rna_graph) || nrow(rna_graph) == 0) {
     warning("RNA Feature Graph could not be created meaningfully (empty or NULL). Returning a zero matrix for RNA graph.")
     rna_graph <- Matrix::Matrix(0, length(rna_cell_ids), length(rna_cell_ids), sparse = TRUE, dimnames = list(rna_cell_ids, rna_cell_ids))
   }
 
-  # 2. Create ATAC Gene Activity Matrix (using custom peak-based aggregation)
+  # 2. Create ATAC Gene Activity Matrix
   atac_gene_activity_matrix <- createPeakBasedGeneActivityMatrix(
     atac_counts_matrix = atac_counts_matrix_filtered,
     atac_peaks_gr = atac_peaks_gr_filtered,
     genome = genome
   )
 
-  # 3. Create ATAC Feature Graph
-  atac_graph <- createATACCellGraph(atac_gene_activity_matrix, method = atac_feature_sim_method)
-  # Ensure empty graph handling if creation failed
+  # 3. Create ATAC Feature Graph (using new PCA+KNN approach)
+  atac_graph <- createATACCellGraph(
+    atac_gene_activity_matrix, 
+    atac_pca_dims = atac_pca_dims,    
+    atac_k_neighbors = atac_k_neighbors 
+  )
   atac_cell_ids <- rownames(atac_gene_activity_matrix) # Use IDs from the gene activity matrix
   if (is.null(atac_graph) || nrow(atac_graph) == 0) {
       warning("ATAC Feature Graph could not be created meaningfully (empty or NULL). Returning a zero matrix for ATAC graph.")
@@ -1265,7 +1325,8 @@ print(p_filtered_spatial)
 graph_params <- list(
   rna_feature_dims = 1:30,
   rna_feature_k_neighbors = 20,
-  atac_feature_sim_method = "sparseJaccard" # Or "spearman" if more appropriate for data, need to check
+  atac_pca_dims = 30,       
+  atac_k_neighbors = 20
 )
 
 # Generate separate RNA and ATAC graphs
@@ -1276,7 +1337,8 @@ separate_graphs <- generateSeparateModalGraphs(
   genome = "hg38",
   rna_feature_dims = graph_params$rna_feature_dims,
   rna_feature_k_neighbors = graph_params$rna_feature_k_neighbors,
-  atac_feature_sim_method = graph_params$atac_feature_sim_method
+  atac_pca_dims = graph_params$atac_pca_dims,
+  atac_k_neighbors = graph_params$atac_k_neighbors
 )
 
 rna_graph <- separate_graphs$rna_graph
@@ -1289,10 +1351,10 @@ message("ATAC Graph dimensions: ", paste(dim(atac_graph), collapse = "x"))
 ```
 
 
-```{r Running CellWalker2::walkCells with Integrated Graph}
+```{r Running CellWalker2 with RNA Graph}
 # Find mock markers from the RNA data clusters
 if (is.null(seurat_obj_rna_preprocessed$seurat_clusters)) {
-  seurat_obj_rna_preprocessed <- FindNeighbors(seurat_obj_rna_preprocessed, dims = rn_atac_graph_params$rna_feature_dims)
+  seurat_obj_rna_preprocessed <- FindNeighbors(seurat_obj_rna_preprocessed, dims = graph_params$rna_feature_dims) # Use new graph_params
   seurat_obj_rna_preprocessed <- FindClusters(seurat_obj_rna_preprocessed, resolution = 0.5)
 }
 
@@ -1302,16 +1364,17 @@ mock_markers_rna <- FindAllMarkers(seurat_obj_rna_preprocessed, only.pos = TRUE,
 # Ensure mock_markers_rna is not empty
 if (nrow(mock_markers_rna) == 0) {
   warning("No markers found for RNA clusters. Generating dummy markers for demonstration.")
-  # Create dummy markers if none are found, to avoid crashing computeTypeEdges
-  dummy_genes <- rownames(seurat_obj_rna_preprocessed)[1:10] # Take first 10 genes
+  dummy_genes <- rownames(seurat_obj_rna_preprocessed)[1:min(10, nrow(seurat_obj_rna_preprocessed))] # Take first 10 genes, or fewer if not enough
   dummy_clusters <- unique(seurat_obj_rna_preprocessed$seurat_clusters)[1] # Take first cluster
   mock_markers_rna_df <- data.frame(
-    gene = dummy_genes, 
-    cluster = rep(dummy_clusters, length(dummy_genes)), 
+    gene = dummy_genes,
+    cluster = rep(dummy_clusters, length(dummy_genes)),
     avg_log2FC = runif(length(dummy_genes), 0.5, 1.5)
   )
 } else {
-  mock_markers_rna_df <- data.frame(gene = mock_markers_rna$gene, cluster = mock_markers_rna$cluster, avg_log2FC = mock_markers_rna$avg_log2FC)
+  # FindAllMarkers returns a data.frame, but explicit conversion adds robustness.
+  mock_markers_rna_df <- as.data.frame(mock_markers_rna)
+  mock_markers_rna_df <- mock_markers_rna_df[, c("gene", "cluster", "avg_log2FC")]
 }
 
 
@@ -1323,36 +1386,48 @@ genes_in_markers <- unique(mock_markers_rna_df$gene)
 rna_label_expr_norm_filtered <- rna_label_expr_norm[intersect(genes_in_markers, rownames(rna_label_expr_norm)), , drop = FALSE]
 
 if (nrow(rna_label_expr_norm_filtered) == 0) {
-  stop("No common genes between RNA expression data and mock markers. Cannot compute label edges.")
+  stop("No common genes between RNA expression data and mock markers. Cannot compute label edges for CellWalker.")
 }
 
-rna_label_edges <- computeTypeEdges(rna_label_expr_norm_filtered, mock_markers_rna_df)
+rna_label_edges <- CellWalkR::computeTypeEdges(rna_label_expr_norm_filtered, mock_markers_rna_df)
 message("Dimensions of RNA label edges: ", paste(dim(rna_label_edges), collapse = "x"))
 
 label_edges_list_walk <- list(rna_label_edges)
-label_edge_weights_walk <- c(1000) # This would typically be tuned
+label_edge_weights_walk <- c(1000) # This could be tuned, check later
 
-message("Running walkCells with the combined RNA+ImputedATAC graph and RNA-derived label edges...")
-cell_walk_results_integrated <- walkCells(
-  cellEdges = combined_rna_atac_graph,
+message("Running walkCells with the RNA graph and RNA-derived label edges...")
+cell_walk_results_rna <- CellWalkR::walkCells( 
+  cellEdges = rna_graph,
   labelEdgesList = label_edges_list_walk,
   labelEdgeWeights = label_edge_weights_walk,
-  sampleDepth = min(2000, nrow(combined_rna_atac_graph)) 
+  sampleDepth = min(2000, nrow(rna_graph)) 
 )
 
-message("CellWalker results obtained with integrated RNA+ImputedATAC multi-omics:")
-print(head(cell_walk_results_integrated$cellLabels))
+message("CellWalker results obtained with RNA multi-omics:")
+print(head(cell_walk_results_rna$cellLabels))
+
 ```
 
 
-```{r Spatial Validation of the Graph}
-p_spatial_coherence <- plotSpatialGraphCoherence(
-  combined_rna_atac_graph,
+```{r Spatial Validation of Separate Graphs}
+message("--- Spatial Validation for RNA Graph Coherence ---")
+p_spatial_coherence_rna <- plotSpatialGraphCoherence(
+  rna_graph,
   rna_spatial_coords_filtered,
   n_query_cells = 3, # Plot 3 random query cells
   k_neighbors_to_show = 10 # Show 10 graph and 10 spatial neighbors
 )
-print(p_spatial_coherence)
+print(p_spatial_coherence_rna)
+
+message("--- Spatial Validation for ATAC Graph Coherence ---")
+p_spatial_coherence_atac <- plotSpatialGraphCoherence(
+  atac_graph,
+  atac_spatial_coords_filtered,
+  n_query_cells = 3, # Plot 3 random query cells
+  k_neighbors_to_show = 10 # Show 10 graph and 10 spatial neighbors
+)
+print(p_spatial_coherence_atac)
+
 ```
 
 ```{r }
