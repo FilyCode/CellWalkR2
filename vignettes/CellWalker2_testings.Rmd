@@ -34,6 +34,11 @@ XENIUM_CELLS_CSV_PATH <- "/projectnb/paxlab/DATA/DriesSpatial/Xenium/output-XETG
 
 # Spatial ATAC-seq AnnData (.h5ad)
 ATAC_H5AD_PATH <- "/projectnb/paxlab/DATA/DriesSpatial/Atlasxomics/D1942_deepseq/ultima1942optimize/set1_vf25000-cr1-0-vi1-nc30/combined.h5ad"
+
+output_dir <- "/projectnb/paxlab/phitro/processed_data"
+if (!dir.exists(output_dir)) {
+  dir.create(output_dir, recursive = TRUE)
+}
 ```
 
 
@@ -739,13 +744,13 @@ preprocessSpatialMultiomics <- function(
   ))
 }
 
+
 #' Create RNA-based Cell-to-Cell Similarity Graph from Seurat Object
 #'
 #' \code{createRNACellGraph()} computes a cell-to-cell similarity matrix based on
 #' PCA embeddings from a preprocessed Seurat object. This function extracts the
 #' PCA coordinates and directly computes a sparse K-nearest neighbors (KNN) graph
-#' representing cell-cell similarity for use in CellWalker. This approach is
-#' more memory-efficient and scalable for large datasets compared to dense distance matrices.
+#' representing cell-cell similarity for use in CellWalker, using `FNN::get.knn`.
 #'
 #' @param seurat_obj A Seurat object that has already undergone `NormalizeData`,
 #'                   `FindVariableFeatures`, `ScaleData`, and `RunPCA`.
@@ -815,36 +820,105 @@ createRNACellGraph <- function(seurat_obj, dims = 1:30, k_neighbors = 20) {
     stop("Error: 'k_neighbors' must be at least 1 for KNN graph computation after adjustments.")
   }
 
-  message("Computing k-nearest neighbors (k = ", k_neighbors, ") using FNN::get.knn...")
+  message("  Computing k-nearest neighbors (k = ", k_neighbors, ") using FNN::get.knn...")
+  
   knn_result <- FNN::get.knn(pca_embeddings, k = k_neighbors)
   
-  adj_list_i <- rep(1:num_cells, each = k_neighbors)
-  adj_list_j <- as.vector(knn_result$index)
-  distances <- as.vector(knn_result$distance)
+  if (is.null(knn_result) || is.null(knn_result$nn.index) || is.null(knn_result$nn.dist)) {
+    stop("FNN::get.knn returned NULL or empty results (nn.index/nn.dist) for RNA graph.")
+  }
   
-  max_dist_in_knn <- max(distances)
-  if (max_dist_in_knn == 0) { 
+  adj_list_j_raw <- as.vector(knn_result$nn.index)
+  distances_raw <- as.vector(knn_result$nn.dist)
+  
+  adj_list_i_all <- rep(1:num_cells, each = k_neighbors)
+
+  initial_valid_entries <- !is.na(adj_list_j_raw) & adj_list_j_raw > 0 & adj_list_j_raw <= num_cells & 
+                           is.finite(distances_raw) & distances_raw >= 0 
+                           
+  adj_list_i <- adj_list_i_all[initial_valid_entries]
+  adj_list_j <- adj_list_j_raw[initial_valid_entries]
+  distances <- distances_raw[initial_valid_entries]
+
+  if (length(adj_list_i) == 0) {
+      message("  WARNING RNA: No valid neighbors found after initial filtering FNN results. Returning an empty sparse matrix.")
+      return(Matrix::Matrix(0, num_cells, num_cells, sparse = TRUE, dimnames = list(rownames(pca_embeddings), rownames(pca_embeddings))))
+  }
+  
+  max_dist_in_knn <- max(distances, na.rm=TRUE) 
+
+  if (max_dist_in_knn <= 0 || !is.finite(max_dist_in_knn)) { 
     similarity <- rep(1, length(distances)) 
+    message("  DEBUG RNA: max_dist_in_knn was problematic (<=0 or non-finite), setting all similarities to 1.")
   } else {
     similarity <- 1 - (distances / max_dist_in_knn)
   }
   
-  valid_indices <- adj_list_j <= num_cells & adj_list_j >= 1
-  adj_list_i <- adj_list_i[valid_indices]
-  adj_list_j <- adj_list_j[valid_indices]
-  similarity <- similarity[valid_indices]
+  similarity[similarity < 0] <- 0
+  similarity[similarity > 1] <- 1
+  
+  final_similarity_valid_idx <- which(is.finite(similarity) & similarity > 0)
+  
+  if (length(final_similarity_valid_idx) == 0) {
+      message("  WARNING RNA: No positive similarities after final filtering. Returning an empty sparse matrix.")
+      return(Matrix::Matrix(0, num_cells, num_cells, sparse = TRUE, dimnames = list(rownames(pca_embeddings), rownames(pca_embeddings))))
+  }
 
-  rna_cell_graph <- Matrix::sparseMatrix(
+  adj_list_i <- adj_list_i[final_similarity_valid_idx]
+  adj_list_j <- adj_list_j[final_similarity_valid_idx]
+  similarity <- similarity[final_similarity_valid_idx]
+  
+  if (!is.integer(adj_list_i)) adj_list_i <- as.integer(adj_list_i)
+  if (!is.integer(adj_list_j)) adj_list_j <- as.integer(adj_list_j)
+
+  if(any(is.na(adj_list_i)) || any(adj_list_i < 1) || any(adj_list_i > num_cells)) {
+       stop("CRITICAL RNA: Invalid row indices (NA/out-of-bounds) detected right before sparseMatrix construction!")
+  }
+  if(any(is.na(adj_list_j)) || any(adj_list_j < 1) || any(adj_list_j > num_cells)) {
+       stop("CRITICAL RNA: Invalid col indices (NA/out-of-bounds) detected right before sparseMatrix construction!")
+  }
+  if(any(is.na(similarity)) || any(!is.finite(similarity)) || any(similarity <= 0) || any(similarity > 1)) {
+       stop("CRITICAL RNA: Invalid similarity values (NA/non-finite/out-of-range) detected right before sparseMatrix construction!")
+  }
+
+  rna_cell_graph_init <- Matrix::sparseMatrix(
     i = adj_list_i,
     j = adj_list_j,
     x = similarity,
     dims = c(num_cells, num_cells),
-    dimnames = list(rownames(pca_embeddings), rownames(pca_embeddings))
+    dimnames = list(rownames(pca_embeddings), rownames(pca_embeddings)),
+    giveCsparse = TRUE 
   )
   
-  rna_cell_graph <- pmax(rna_cell_graph, t(rna_cell_graph))
-  diag(rna_cell_graph) <- 1
+  # Ensure diagonal is 1
+  diag(rna_cell_graph_init) <- 1
 
+  # Robust Symmetrization using triplets
+  rna_triplets <- summary(rna_cell_graph_init)
+
+  combined_triplets_df <- data.frame(
+    i = c(rna_triplets$i, rna_triplets$j),
+    j = c(rna_triplets$j, rna_triplets$i),
+    x = c(rna_triplets$x, rna_triplets$x)
+  )
+
+  if (!requireNamespace("data.table", quietly = TRUE)) {
+    message("  WARNING: Package 'data.table' is recommended for performance but not installed. Using base R 'aggregate' for symmetrization (slower).")
+    symmetric_edges <- aggregate(x ~ i + j, data = combined_triplets_df, FUN = max)
+  } else {
+    data.table::setDT(combined_triplets_df)
+    symmetric_edges <- combined_triplets_df[, .(x = max(x)), by = .(i, j)]
+  }
+
+  rna_cell_graph <- Matrix::sparseMatrix(
+    i = symmetric_edges$i,
+    j = symmetric_edges$j,
+    x = symmetric_edges$x,
+    dims = dim(rna_cell_graph_init),
+    dimnames = dimnames(rna_cell_graph_init),
+    giveCsparse = TRUE 
+  )
+  
   message("RNA-based KNN cell graph created using ", length(effective_dims), " PCs. Graph dimensions: ", paste(dim(rna_cell_graph), collapse = "x"))
   return(rna_cell_graph)
 }
@@ -854,8 +928,8 @@ createRNACellGraph <- function(seurat_obj, dims = 1:30, k_neighbors = 20) {
 #'
 #' \code{createATACCellGraph()} computes a cell-to-cell similarity matrix based on
 #' ATAC-seq gene activity scores. It performs sparse PCA on the gene activity matrix
-#' and then constructs a K-nearest neighbors (KNN) graph from the PCA embeddings.
-#' This approach is more scalable for large datasets than all-pairs similarity methods.
+#' and then constructs a K-nearest neighbors (KNN) graph from the PCA embeddings,
+#' using `FNN::get.knn`.
 #'
 #' @param atac_gene_activity_matrix Sparse matrix of ATAC-seq gene activity scores (cells x genes).
 #' @param atac_pca_dims Integer, number of principal components to use for ATAC graph construction.
@@ -865,7 +939,7 @@ createRNACellGraph <- function(seurat_obj, dims = 1:30, k_neighbors = 20) {
 #'         between 0 and 1, where 1 indicates perfect similarity. Rownames and
 #'         colnames are cell barcodes. Returns an empty (0x0) or 1x1 identity matrix
 #'         if 0 or 1 cells remain after processing.
-#' @importFrom irlba prcomp_irlba # Make sure irlba is loaded
+#' @importFrom irlba prcomp_irlba
 #' @export
 createATACCellGraph <- function(atac_gene_activity_matrix, atac_pca_dims = 30, atac_k_neighbors = 20) {
   message("Computing ATAC-based cell-cell graph from gene activity matrix using PCA+KNN...")
@@ -882,7 +956,6 @@ createATACCellGraph <- function(atac_gene_activity_matrix, atac_pca_dims = 30, a
     }
   }
 
-  # Filter out genes that are all zeros, as they don't contribute to similarity
   non_zero_genes <- Matrix::colSums(atac_gene_activity_matrix) > 0
   if (sum(non_zero_genes) == 0) {
     warning("ATAC gene activity matrix contains no active genes. Cannot create ATAC feature graph. Returning empty matrix.")
@@ -891,7 +964,6 @@ createATACCellGraph <- function(atac_gene_activity_matrix, atac_pca_dims = 30, a
   
   atac_mat_for_dimred <- atac_gene_activity_matrix[, non_zero_genes, drop = FALSE]
 
-  # Perform sparse PCA on ATAC gene activity matrix
   message("  Performing sparse PCA on ATAC gene activity matrix...")
   num_features_for_pca <- ncol(atac_mat_for_dimred)
   
@@ -906,12 +978,10 @@ createATACCellGraph <- function(atac_gene_activity_matrix, atac_pca_dims = 30, a
       return(Matrix::Matrix(0, num_cells, num_cells, sparse = TRUE, dimnames = list(cell_ids, cell_ids)))
   }
   
-  # Using prcomp_irlba for efficient sparse PCA
   atac_pca_res <- irlba::prcomp_irlba(atac_mat_for_dimred, n = effective_atac_pca_dims, center = TRUE, scale. = FALSE)
   pca_embeddings_atac <- atac_pca_res$x
-  rownames(pca_embeddings_atac) <- cell_ids # Ensure cell IDs are set
+  rownames(pca_embeddings_atac) <- cell_ids 
 
-  # Ensure k_neighbors is valid
   if (atac_k_neighbors >= num_cells) {
     warning("'atac_k_neighbors' (", atac_k_neighbors, ") is greater than or equal to the number of cells (", num_cells, "). Setting k_neighbors to num_cells - 1.")
     atac_k_neighbors <- num_cells - 1
@@ -921,38 +991,103 @@ createATACCellGraph <- function(atac_gene_activity_matrix, atac_pca_dims = 30, a
     stop("Error: 'atac_k_neighbors' must be at least 1 for KNN graph computation after adjustments.")
   }
 
-  # Compute k-nearest neighbors using FNN::get.knn
-  message("  Computing k-nearest neighbors (k = ", atac_k_neighbors, ") on ATAC PCs...")
+  message("  Computing k-nearest neighbors (k = ", atac_k_neighbors, ") on ATAC PCs using FNN::get.knn...")
+  
   knn_result <- FNN::get.knn(pca_embeddings_atac, k = atac_k_neighbors)
   
-  # Construct sparse matrix from KNN results
-  adj_list_i <- rep(1:num_cells, each = atac_k_neighbors)
-  adj_list_j <- as.vector(knn_result$index)
-  distances <- as.vector(knn_result$distance)
+  if (is.null(knn_result) || is.null(knn_result$nn.index) || is.null(knn_result$nn.dist)) {
+    stop("FNN::get.knn returned NULL or empty results (nn.index/nn.dist) for ATAC graph.")
+  }
   
-  max_dist_in_knn <- max(distances)
-  if (max_dist_in_knn == 0) { 
+  adj_list_j_raw <- as.vector(knn_result$nn.index)
+  distances_raw <- as.vector(knn_result$nn.dist)
+  
+  adj_list_i_all <- rep(1:num_cells, each = atac_k_neighbors)
+
+  initial_valid_entries <- !is.na(adj_list_j_raw) & adj_list_j_raw > 0 & adj_list_j_raw <= num_cells & 
+                           is.finite(distances_raw) & distances_raw >= 0
+  
+  adj_list_i <- adj_list_i_all[initial_valid_entries]
+  adj_list_j <- adj_list_j_raw[initial_valid_entries]
+  distances <- distances_raw[initial_valid_entries]
+
+  if (length(adj_list_i) == 0) {
+      message("  WARNING ATAC: No valid neighbors found after initial filtering FNN results. Returning an empty sparse matrix.")
+      return(Matrix::Matrix(0, num_cells, num_cells, sparse = TRUE, dimnames = list(rownames(pca_embeddings_atac), rownames(pca_embeddings_atac))))
+  }
+  
+  max_dist_in_knn <- max(distances, na.rm=TRUE)
+  
+  if (max_dist_in_knn <= 0 || !is.finite(max_dist_in_knn)) { 
     similarity <- rep(1, length(distances)) 
+    message("  DEBUG ATAC: max_dist_in_knn was problematic (<=0 or non-finite), setting all similarities to 1.")
   } else {
     similarity <- 1 - (distances / max_dist_in_knn)
   }
   
-  valid_indices <- adj_list_j <= num_cells & adj_list_j >= 1
-  adj_list_i <- adj_list_i[valid_indices]
-  adj_list_j <- adj_list_j[valid_indices]
-  similarity <- similarity[valid_indices]
+  similarity[similarity < 0] <- 0
+  similarity[similarity > 1] <- 1
+  
+  final_similarity_valid_idx <- which(is.finite(similarity) & similarity > 0)
+  
+  if (length(final_similarity_valid_idx) == 0) {
+      message("  WARNING ATAC: No positive similarities after final filtering. Returning an empty sparse matrix.")
+      return(Matrix::Matrix(0, num_cells, num_cells, sparse = TRUE, dimnames = list(rownames(pca_embeddings_atac), rownames(pca_embeddings_atac))))
+  }
 
-  atac_cell_graph <- Matrix::sparseMatrix(
+  adj_list_i <- adj_list_i[final_similarity_valid_idx]
+  adj_list_j <- adj_list_j[final_similarity_valid_idx]
+  similarity <- similarity[final_similarity_valid_idx]
+  
+  if (!is.integer(adj_list_i)) adj_list_i <- as.integer(adj_list_i)
+  if (!is.integer(adj_list_j)) adj_list_j <- as.integer(adj_list_j)
+
+  if(any(is.na(adj_list_i)) || any(adj_list_i < 1) || any(adj_list_i > num_cells)) {
+       stop("CRITICAL ATAC: Invalid row indices (NA/out-of-bounds) detected right before sparseMatrix construction!")
+  }
+  if(any(is.na(adj_list_j)) || any(adj_list_j < 1) || any(adj_list_j > num_cells)) {
+       stop("CRITICAL ATAC: Invalid col indices (NA/out-of-bounds) detected right before sparseMatrix construction!")
+  }
+  if(any(is.na(similarity)) || any(!is.finite(similarity)) || any(similarity <= 0) || any(similarity > 1)) {
+       stop("CRITICAL ATAC: Invalid similarity values (NA/non-finite/out-of-range) detected right before sparseMatrix construction!")
+  }
+
+  atac_cell_graph_init <- Matrix::sparseMatrix(
     i = adj_list_i,
     j = adj_list_j,
     x = similarity,
     dims = c(num_cells, num_cells),
-    dimnames = list(cell_ids, cell_ids)
+    dimnames = list(rownames(pca_embeddings_atac), rownames(pca_embeddings_atac)),
+    giveCsparse = TRUE 
   )
   
-  atac_cell_graph <- pmax(atac_cell_graph, t(atac_cell_graph)) # Ensure symmetry
-  diag(atac_cell_graph) <- 1 # Ensure self-similarity is 1
+  diag(atac_cell_graph_init) <- 1
 
+  atac_triplets <- summary(atac_cell_graph_init)
+
+  combined_triplets_df <- data.frame(
+    i = c(atac_triplets$i, atac_triplets$j),
+    j = c(atac_triplets$j, atac_triplets$i),
+    x = c(atac_triplets$x, atac_triplets$x)
+  )
+
+  if (!requireNamespace("data.table", quietly = TRUE)) {
+    message("  WARNING: Package 'data.table' is recommended for performance but not installed. Using base R 'aggregate' for symmetrization (slower).")
+    symmetric_edges <- aggregate(x ~ i + j, data = combined_triplets_df, FUN = max)
+  } else {
+    data.table::setDT(combined_triplets_df)
+    symmetric_edges <- combined_triplets_df[, .(x = max(x)), by = .(i, j)]
+  }
+
+  atac_cell_graph <- Matrix::sparseMatrix(
+    i = symmetric_edges$i,
+    j = symmetric_edges$j,
+    x = symmetric_edges$x,
+    dims = dim(atac_cell_graph_init),
+    dimnames = dimnames(atac_cell_graph_init),
+    giveCsparse = TRUE 
+  )
+  
   message("ATAC-based cell graph created. Graph dimensions: ", paste(dim(atac_cell_graph), collapse = "x"))
   return(atac_cell_graph)
 }
@@ -1117,6 +1252,128 @@ generateSeparateModalGraphs <- function(
 }
 
 
+#' Compute Label Edges
+#'
+#' \code{computeTypeEdges} generates a matrix of edges from each cell type label to each cell from gene expression.
+#' The edge weight is normalized gene expression of markers weighted by the log2FC.
+#'
+#' @param exprMat_norm a gene by cell data.frame or matrix, rownames are genes, colnames are cell barcodes
+#' @param markers marker genes for each cell type, columns are gene, cluster, p_val_adj (optional) and avg_log2FC (optional).
+#' @param pval.cutoff select markers with adjust pvalue (\code{p_val_adj}) < pval.cutoff. Default: 0.05
+#' @param log2FC.cutoff select markers with abs(log2FC.cutoff)> 0.5 if only.pos = F or log2FC.cutoff>0.5 if only.pos = T. Default: 0.5
+#' @param only.pos only include positive markers
+#' @param force if true (default), this function will use marker genes that matched the name in exprMat_norm to compute edge weight;
+#'              if false, this function will raise an error if some marker genes are not in exprMat_norm.
+#' @return a matrix of edges from each cell type label to each cell
+#' @export
+#' @import data.table
+changedCellWalkercomputeTypeEdges <- function(exprMat_norm, markers, pval.cutoff = 0.05, log2FC.cutoff = 0.5, only.pos = FALSE, force = TRUE)
+{
+  if(!requireNamespace("data.table", quietly = TRUE)){
+    stop("Must install data.table")
+  }
+  if(missing(exprMat_norm) || (!is(exprMat_norm, "data.frame") & !is(exprMat_norm, "matrix")  & !is(exprMat_norm, "Matrix"))){
+    stop("Must provide a dataframe or matrix of RNA data")
+  }
+  if(is.null(colnames(exprMat_norm)) | is.null(rownames(exprMat_norm)))
+  {
+    stop('exprMat_norm must have column and row names')
+  }
+  if(missing(markers) || !is(markers, "data.frame")){
+    stop("Must provide a dataframe of markers")
+  }
+  if(is.null(markers$gene) || is.null(markers$cluster)){
+    stop("markers must have 'gene' and 'cluster' columns")
+  }
+
+
+  if(is.null(markers$avg_log2FC)) {
+    warning('avg_log2FC is not present in the columns of markers, so markers will not be filtered by avg_log2FC')
+    markers$avg_log2FC = log2FC.cutoff # Assign a default, but note it's not a true value
+  }
+  if(is.null(markers$p_val_adj)) {
+    warning('p_val_adj is not present in the columns of markers, so markers will not be filtered by p_val_adj')
+    markers$p_val_adj =  pval.cutoff # Assign a default, but note it's not a true value
+  }
+
+  markers = data.table(markers)
+  if(only.pos)
+  {
+    markers = markers[avg_log2FC >= log2FC.cutoff & p_val_adj <= pval.cutoff]
+  }else{
+    markers = markers[abs(avg_log2FC) >= log2FC.cutoff & p_val_adj <= pval.cutoff]
+  }
+
+  if(force == FALSE)
+  {
+    stopifnot(all(markers$gene %in% rownames(exprMat_norm)))
+  }
+  
+  # Filter markers to only include those present in the expression matrix
+  markers_inter <- markers[markers$gene %in% rownames(exprMat_norm)]
+
+  if(length(unique(markers_inter$cluster)) < length(unique(markers$cluster)))
+  {
+    # This check needs to be more careful if any cluster completely loses all its markers
+    # It might be better to check each unique cluster from the original markers.
+    original_clusters <- unique(markers$cluster)
+    clusters_with_markers_after_filter <- unique(markers_inter$cluster)
+    missing_clusters <- setdiff(original_clusters, clusters_with_markers_after_filter)
+    if (length(missing_clusters) > 0) {
+      stop(paste("The following clusters lost all their markers after filtering and intersection with expression matrix:",
+                 paste(missing_clusters, collapse = ", "),
+                 ". Need to lower the pval/logFC thresholds or check if expression matrix contains the markers."))
+    }
+  }
+  
+  # Ensure genes in exprMat_norm are ordered consistently with markers_inter for the calculation
+  # This might not be strictly necessary if .SD[['gene']] is always correctly indexed,
+  # but it's a good practice to be aware of potential indexing mismatches with sparse matrices.
+  
+  # --- CRITICAL FIX HERE: Use drop = FALSE to ensure subsetting always returns a matrix-like object ---
+  labelEdges = markers_inter[, {
+    # Extract genes for the current cluster
+    current_genes <- .SD[['gene']]
+    
+    # Subset exprMat_norm, ensuring it remains a matrix even for single genes
+    subset_expr_mat <- exprMat_norm[current_genes, , drop = FALSE]
+    
+    # Extract log2FC values, ensuring they align with the subset_expr_mat rows
+    # This step is crucial if current_genes is not guaranteed to be in the same order as rownames(subset_expr_mat)
+    # However, since we filter markers_inter by exprMat_norm rownames, and .SD[['gene']] comes from markers_inter,
+    # the order should be preserved for the multiplication.
+    # We explicitly match just to be extra safe, though for direct multiplication,
+    # the vector is recycled against the rows of the matrix, which usually works if lengths match.
+    # To be absolutely sure, it might be safer to ensure avg_log2FC is aligned.
+    
+    # A simpler approach, relying on vector recycling, is usually sufficient and less code:
+    gene_log2FC <- .SD[['avg_log2FC']]
+    
+    # Perform element-wise multiplication and then colSums
+    # The matrix subset_expr_mat will have genes as rows, cells as columns
+    # gene_log2FC will be a vector of length = number of genes in current_genes
+    # R will recycle gene_log2FC down the columns of subset_expr_mat for multiplication
+    weighted_expr <- subset_expr_mat * gene_log2FC
+    
+    # Check for zero sum of absolute log2FC to avoid division by zero
+    sum_abs_log2FC <- sum(abs(gene_log2FC))
+    score_val <- if (sum_abs_log2FC > 0) {
+                   colSums(weighted_expr) / sum_abs_log2FC
+                 } else {
+                   rep(0, ncol(exprMat_norm)) # If no valid log2FC, score is 0
+                 }
+                 
+    list("score" = score_val, "cell" = colnames(exprMat_norm))
+  }, by = cluster]
+  # --- END CRITICAL FIX ---
+  
+  labelEdges = reshape2::acast(labelEdges, cell~cluster, value.var = 'score')
+  labelEdges[labelEdges <0] = 0
+
+  labelEdges
+}
+
+
 # --- Plotting functions for quick visualization and validation ---
 
 # (User provided this, including here for completeness of testing)
@@ -1172,6 +1429,7 @@ plot_spatial_rna_atac <- function(rna_spatial_coords_df, atac_spatial_coords_df,
   }
 }
 
+
 #' Plot Spatial and Graph Coherence for Validation
 #'
 #' \code{plotSpatialGraphCoherence()} visualizes the relationship between graph-based
@@ -1182,9 +1440,14 @@ plot_spatial_rna_atac <- function(rna_spatial_coords_df, atac_spatial_coords_df,
 #' @param rna_spatial_coords_df Data.frame of RNA spatial coordinates (cell_id, x, y).
 #' @param n_query_cells Integer, number of random query cells to pick for plotting.
 #' @param k_neighbors_to_show Integer, number of graph/spatial neighbors to highlight for each query cell.
+#' @param background_alpha Numeric, alpha value for 'Other' cells (0 to 1). Lower means more transparent.
+#' @param neighbor_pt_size Numeric, point size for neighbor cells.
+#' @param query_pt_size Numeric, point size for query cells.
 #' @return A ggplot object visualizing query cells, their graph neighbors, and their spatial neighbors.
 #' @export
-plotSpatialGraphCoherence <- function(combined_rna_atac_graph, rna_spatial_coords_df, n_query_cells = 5, k_neighbors_to_show = 10) {
+plotSpatialGraphCoherence <- function(combined_rna_atac_graph, rna_spatial_coords_df, 
+                                      n_query_cells = 5, k_neighbors_to_show = 10,
+                                      background_alpha = 0.05, neighbor_pt_size = 1.8, query_pt_size = 3.5) {
   if (!requireNamespace("RANN", quietly = TRUE)) {
     stop("Package 'RANN' is required for spatial coherence plotting. Please install it with install.packages('RANN')")
   }
@@ -1196,78 +1459,312 @@ plotSpatialGraphCoherence <- function(combined_rna_atac_graph, rna_spatial_coord
   num_cells <- nrow(rna_spatial_coords_df)
   cell_ids <- rownames(rna_spatial_coords_df)
 
-  if (num_cells <= k_neighbors_to_show) {
-    warning("Number of cells is too low (<= k_neighbors_to_show) for meaningful neighbor selection. Adjusting k_neighbors_to_show.")
+  if (k_neighbors_to_show >= num_cells) {
+    warning("k_neighbors_to_show (", k_neighbors_to_show, ") is greater than or equal to the number of cells (", num_cells, "). Adjusting k_neighbors_to_show to num_cells - 1.")
     k_neighbors_to_show <- max(1, num_cells - 1)
   }
   if (k_neighbors_to_show == 0) {
-    message("No neighbors to show for spatial graph coherence plot.")
-    return(ggplot() + annotate("text", x = 0.5, y = 0.5, label = "Too few cells for neighbors") + theme_void())
+    message("No neighbors can be shown (k_neighbors_to_show is 0). Only query cells will be plotted with 'Other' cells in background.")
   }
 
-  # 1. Select random query cells
   query_cells <- sample(cell_ids, min(n_query_cells, num_cells))
   
-  plot_data <- rna_spatial_coords_df
-  plot_data$type <- "Other"
-  plot_data$query_id <- NA
-
-  all_graph_neighbors <- c()
-  all_spatial_neighbors <- c()
-
   message("Analyzing graph and spatial coherence for ", length(query_cells), " query cells...")
+  
+  cells_to_plot_per_query <- list()
+
   for (q_id in query_cells) {
     # Get graph neighbors
-    # For sparse matrix, `combined_rna_atac_graph[q_id, ]` gives a row vector of similarities
     graph_sims <- combined_rna_atac_graph[q_id, ]
-    # Exclude self-similarity and sort by decreasing similarity
-    graph_neighbors_indices <- order(graph_sims, decreasing = TRUE)[-1] 
-    graph_neighbors <- cell_ids[graph_neighbors_indices[1:k_neighbors_to_show]]
     
-    # Get spatial neighbors
+    graph_neighbors_indices_all <- order(graph_sims, decreasing = TRUE)
+    q_id_idx_in_graph <- match(q_id, cell_ids)
+    if (length(graph_neighbors_indices_all) > 0 && graph_neighbors_indices_all[1] == q_id_idx_in_graph) {
+      graph_neighbors_indices_all <- graph_neighbors_indices_all[-1] # Remove self
+    }
+    graph_neighbors <- cell_ids[graph_neighbors_indices_all[1:min(k_neighbors_to_show, length(graph_neighbors_indices_all))]]
+    
     spatial_coords_matrix <- as.matrix(rna_spatial_coords_df[, c("x", "y")])
-    # Find k+1 neighbors (k_neighbors_to_show + self)
     spatial_nn_result <- RANN::nn2(
       query = spatial_coords_matrix[q_id, , drop = FALSE],
       data = spatial_coords_matrix,
-      k = k_neighbors_to_show + 1
+      k = k_neighbors_to_show + 1 
     )
-    # Exclude self (first element)
-    spatial_neighbors <- cell_ids[spatial_nn_result$nn.idx[1, ][-1]] 
-    
-    # Update plot_data for this query cell
-    plot_data[q_id, "type"] <- "Query"
-    plot_data[q_id, "query_id"] <- q_id
+    spatial_neighbors_indices <- spatial_nn_result$nn.idx[1, ]
+    spatial_neighbors <- cell_ids[spatial_neighbors_indices[-1]] 
+    spatial_neighbors <- spatial_neighbors[spatial_neighbors %in% cell_ids]
+    spatial_neighbors <- spatial_neighbors[1:min(k_neighbors_to_show, length(spatial_neighbors))]
 
-    plot_data[graph_neighbors, "type"] <- "Graph Neighbor"
-    plot_data[graph_neighbors, "query_id"] <- q_id
+    current_query_cells <- data.frame(
+      cell = c(q_id, graph_neighbors, spatial_neighbors),
+      type = c("Query", rep("Graph Neighbor", length(graph_neighbors)), rep("Spatial Neighbor", length(spatial_neighbors))),
+      query_id = q_id,
+      stringsAsFactors = FALSE
+    )
     
-    plot_data[spatial_neighbors, "type"] <- "Spatial Neighbor"
-    plot_data[spatial_neighbors, "query_id"] <- q_id # Overwrite if already a graph neighbor
-    
-    # Handle overlap: if a cell is both graph and spatial neighbor, prioritize a combined label
     overlap_neighbors <- intersect(graph_neighbors, spatial_neighbors)
-    plot_data[overlap_neighbors, "type"] <- "Both Graph & Spatial"
+    current_query_cells$type[match(overlap_neighbors, current_query_cells$cell)] <- "Both Graph & Spatial"
+    
+    cells_to_plot_per_query[[q_id]] <- current_query_cells
+  }
+
+  if (length(query_cells) == 0) {
+      return(ggplot() + annotate("text", x = 0.5, y = 0.5, label = paste("No query cells were selected for plotting")) + theme_void())
   }
   
-  # Ensure factors for consistent coloring
-  plot_data$type <- factor(plot_data$type, levels = c("Query", "Both Graph & Spatial", "Graph Neighbor", "Spatial Neighbor", "Other"))
+  plot_data_list <- list()
+  for (q_id_facet in query_cells) { 
+    current_facet_data <- rna_spatial_coords_df
+    current_facet_data$type <- "Other"
+    current_facet_data$query_id <- q_id_facet 
+    current_facet_data$cell <- rownames(current_facet_data)
 
-  # Plot
-  p <- ggplot(plot_data, aes(x = x, y = y)) +
-    geom_point(data = filter(plot_data, type == "Other"), aes(color = type), size = 0.5, alpha = 0.2) + # Other cells in background
-    geom_point(data = filter(plot_data, type %in% c("Graph Neighbor", "Spatial Neighbor", "Both Graph & Spatial")), 
-               aes(color = type), size = 1.5, alpha = 0.7) + # Neighbors
-    geom_point(data = filter(plot_data, type == "Query"), aes(color = type), size = 3, shape = 8) + # Query cells
-    scale_color_manual(values = c("Query" = "red", "Both Graph & Spatial" = "purple", "Graph Neighbor" = "blue", "Spatial Neighbor" = "green", "Other" = "grey")) +
-    facet_wrap(~query_id, scales = "free") + # One plot per query cell, or single plot if n_query_cells=1
+    q_data_for_facet <- cells_to_plot_per_query[[q_id_facet]]
+    
+    if (nrow(q_data_for_facet) > 0) { 
+        for (i in 1:nrow(q_data_for_facet)) {
+            cell_id_to_update <- q_data_for_facet$cell[i]
+            match_row_idx <- match(cell_id_to_update, rownames(current_facet_data))
+            if (!is.na(match_row_idx)) {
+                current_facet_data[match_row_idx, "type"] <- q_data_for_facet$type[i]
+            }
+        }
+    }
+    plot_data_list[[q_id_facet]] <- current_facet_data
+  }
+  
+  final_plot_data <- do.call(rbind, plot_data_list)
+  
+  plot_type_levels <- c("Other", "Spatial Neighbor", "Graph Neighbor", "Both Graph & Spatial", "Query")
+  final_plot_data$type <- factor(final_plot_data$type, levels = plot_type_levels)
+  final_plot_data$query_id <- factor(final_plot_data$query_id, levels = unique(final_plot_data$query_id))
+
+  p <- ggplot(final_plot_data, aes(x = x, y = y)) +
+    geom_point(data = filter(final_plot_data, type == "Other"), aes(color = type), size = 0.5, alpha = background_alpha) +
+    geom_point(data = filter(final_plot_data, type == "Spatial Neighbor"), aes(color = type), size = neighbor_pt_size, shape = 11, alpha = 0.7) +
+    geom_point(data = filter(final_plot_data, type == "Graph Neighbor"), aes(color = type), size = neighbor_pt_size, alpha = 0.7) +
+    geom_point(data = filter(final_plot_data, type == "Both Graph & Spatial"), aes(color = type), size = neighbor_pt_size + 0.5, alpha = 0.9, shape = 1) +
+    geom_point(data = filter(final_plot_data, type == "Query"), aes(color = type), size = query_pt_size, shape = 8, stroke = 1.2) +
+    
+    scale_color_manual(values = c(
+      "Other" = "grey",
+      "Spatial Neighbor" = "#8c510a", 
+      "Graph Neighbor" = "#01665e",   
+      "Both Graph & Spatial" = "#542788", 
+      "Query" = "red"
+    )) +
+    facet_wrap(~query_id) +
     labs(title = "Graph and Spatial Neighborhood Coherence", color = "Cell Type") +
     theme_minimal() +
-    theme(plot.title = element_text(hjust = 0.5), legend.position = "bottom") +
-    coord_fixed()
+    theme(plot.title = element_text(hjust = 0.5), legend.position = "bottom",
+          panel.background = element_rect(fill = "white", color = NA),
+          plot.background = element_rect(fill = "white", color = NA)) +
+    coord_fixed() 
 
   message("Spatial graph coherence plot generated.")
   return(p)
+}
+
+
+#' Assess Overall Spatial-Graph Coherence
+#'
+#' \code{assessSpatialGraphCoherenceOverall()} quantifies and visualizes the global coherence
+#' between feature-based cell similarity graphs and spatial proximity for a given modality.
+#' For each cell, it calculates:
+#' 1. The median spatial distance to its `k` nearest neighbors in the feature-based graph.
+#' 2. The median feature-graph similarity (cosine similarity from the full feature matrix)
+#'    to its `k` nearest neighbors in spatial space.
+#'
+#' @param feature_graph A sparse matrix (cells x cells) representing feature-based
+#'   cell-to-cell similarities (e.g., RNA graph or ATAC graph). Rownames/Colnames must be cell IDs.
+#' @param feature_matrix_for_similarity A sparse matrix (features x cells) used for calculating
+#'   cosine similarity between cells for the "spatial neighbors" metric. Rownames are features,
+#'   colnames are cell IDs, and must match `feature_graph`.
+#' @param spatial_coords_df A data.frame (cells x 2) of spatial x, y coordinates.
+#'   Rownames must be cell IDs and match those in `feature_graph`.
+#' @param k_neighbors Integer, the number of nearest neighbors to consider for coherence assessment.
+#' @param modality_name Character string (e.g., "RNA", "ATAC") for labeling results and plots.
+#' @return A list containing:
+#'   \itemize{
+#'     \item `coherence_df`: A data.frame with metrics for each cell:
+#'       `cell_id`, `modality`, `median_spatial_dist_of_graph_neighbors`,
+#'       `median_graph_sim_of_spatial_neighbors`.
+#'     \item `plot_dist_spatial_for_graph_nn`: A ggplot object showing distribution
+#'       of median spatial distances for graph neighbors.
+#'     \item `plot_sim_graph_for_spatial_nn`: A ggplot object showing distribution
+#'       of median graph similarities for spatial neighbors.
+#'   }
+#' @export
+assessSpatialGraphCoherenceOverall <- function(feature_graph, feature_matrix_for_similarity, spatial_coords_df, k_neighbors = 10, modality_name = "Modality") {
+
+  # --- 1. Input Validation and Alignment ---
+  if (!is(feature_graph, "Matrix")) { stop("`feature_graph` must be a sparse matrix (e.g., dgCMatrix).") }
+  if (!is(feature_matrix_for_similarity, "Matrix")) { stop("`feature_matrix_for_similarity` must be a sparse matrix (e.g., dgCMatrix).") }
+  if (!is.data.frame(spatial_coords_df) || ncol(spatial_coords_df) < 2) { stop("`spatial_coords_df` must be a data.frame with at least two columns (x, y).") }
+  if (is.null(rownames(feature_graph)) || is.null(rownames(spatial_coords_df)) || is.null(colnames(feature_matrix_for_similarity))) {
+    stop("All input matrices/data.frames must have cell IDs (rownames for graphs/spatial, colnames for feature matrix).")
+  }
+  
+  graph_cell_ids <- rownames(feature_graph)
+  spatial_cell_ids <- rownames(spatial_coords_df)
+  feature_cell_ids <- colnames(feature_matrix_for_similarity)
+
+  common_cells <- Reduce(intersect, list(graph_cell_ids, spatial_cell_ids, feature_cell_ids))
+  
+  if (length(common_cells) == 0) {
+    stop("No common cell IDs found across `feature_graph`, `feature_matrix_for_similarity`, and `spatial_coords_df`. Check data integrity.")
+  }
+  if (length(common_cells) < nrow(feature_graph) || length(common_cells) < nrow(spatial_coords_df) || length(common_cells) < ncol(feature_matrix_for_similarity)) {
+    message("Warning: Some cells are not common across all inputs. Subsetting to ", length(common_cells), " common cells.")
+  }
+
+  feature_graph <- feature_graph[common_cells, common_cells, drop = FALSE]
+  spatial_coords_df <- spatial_coords_df[common_cells, , drop = FALSE]
+  feature_matrix_for_similarity <- feature_matrix_for_similarity[, common_cells, drop = FALSE]
+  
+  num_cells <- nrow(feature_graph)
+  cell_ids <- rownames(feature_graph) # Now aligned and consistent
+
+  if (num_cells <= 1) {
+    message("Too few cells (<= 1) to assess spatial-graph coherence for ", modality_name, ". Returning empty results.")
+    return(list(
+      coherence_df = data.frame(cell_id = character(0), modality = character(0),
+                                median_spatial_dist_of_graph_neighbors = numeric(0),
+                                median_graph_sim_of_spatial_neighbors = numeric(0)),
+      plot_dist_spatial_for_graph_nn = ggplot() + annotate("text", x = 0.5, y = 0.5, label = "No data") + theme_void(),
+      plot_sim_graph_for_spatial_nn = ggplot() + annotate("text", x = 0.5, y = 0.5, label = "No data") + theme_void()
+    ))
+  }
+
+  if (k_neighbors >= num_cells) {
+    warning("`k_neighbors` (", k_neighbors, ") is greater than or equal to the number of cells (", num_cells, "). Adjusting `k_neighbors` to num_cells - 1.")
+    k_neighbors <- max(1, num_cells - 1)
+  }
+  if (k_neighbors == 0) {
+      stop("`k_neighbors` must be at least 1 after adjustments for coherence assessment.")
+  }
+
+  message("Assessing overall spatial-graph coherence for ", modality_name, " with k = ", k_neighbors, "...")
+
+  # Pre-calculate spatial matrix for RANN and distance calculations
+  spatial_coords_mat <- as.matrix(spatial_coords_df[, c("x", "y")])
+
+  # Pre-calculate L2 norms for `feature_matrix_for_similarity` columns to optimize cosine similarity
+  feature_matrix_norms <- sqrt(Matrix::colSums(feature_matrix_for_similarity * feature_matrix_for_similarity))
+
+  # Initialize vectors to store results
+  median_spatial_dist_of_graph_neighbors_vec <- numeric(num_cells)
+  median_graph_sim_of_spatial_neighbors_vec <- numeric(num_cells)
+
+  message("  Calculating median spatial distances for graph neighbors (vectorized)...")
+  
+  # 1. Extract non-zero edges from the sparse graph
+  # `summary()` returns a data.frame with i (row index), j (column index), x (value)
+  graph_summary_dt <- as.data.table(Matrix::summary(feature_graph))
+  
+  # Map matrix indices to cell IDs for clarity (optional, but good for validation)
+  graph_summary_dt[, query_cell_idx := i] # Rename for clarity
+  graph_summary_dt[, neighbor_cell_idx := j]
+  
+  # Filter out self-loops (i.e., cell_id == neighbor_cell_id)
+  graph_summary_dt <- graph_summary_dt[query_cell_idx != neighbor_cell_idx]
+
+  if (nrow(graph_summary_dt) == 0) {
+      warning("No non-self-loop edges found in feature_graph. Cannot calculate spatial distances for graph neighbors.")
+      median_spatial_dist_of_graph_neighbors_vec[] <- NA
+  } else {
+      # 2. Calculate spatial distances for all edges in a vectorized way
+      # Extract coordinates for all query cells and their corresponding graph neighbors
+      x1 <- spatial_coords_mat[graph_summary_dt$query_cell_idx, 1]
+      y1 <- spatial_coords_mat[graph_summary_dt$query_cell_idx, 2]
+      x2 <- spatial_coords_mat[graph_summary_dt$neighbor_cell_idx, 1]
+      y2 <- spatial_coords_mat[graph_summary_dt$neighbor_cell_idx, 2]
+      
+      # Compute Euclidean distances
+      graph_summary_dt[, spatial_distance := sqrt((x1 - x2)^2 + (y1 - y2)^2)]
+      
+      # 3. Group by query_cell_idx and take the median of distances
+      # Also need to limit to k_neighbors per query cell before median.
+      # This is tricky with sparse graphs where `k` might not be strictly enforced.
+      # The most robust way is to re-rank within each query_cell_idx by similarity (x) and take top k
+      
+      # For each query_cell_idx, rank its neighbors by similarity (x) and select top k
+      graph_neighbors_ranked <- graph_summary_dt[, head(.SD[order(-x)], k_neighbors), by = query_cell_idx]
+      
+      # Now, compute the median spatial distance for these top k graph neighbors
+      median_spatial_results <- graph_neighbors_ranked[, .(median_dist = median(spatial_distance)), by = query_cell_idx]
+      
+      # Map results back to the original num_cells vector
+      median_spatial_dist_of_graph_neighbors_vec[median_spatial_results$query_cell_idx] <- median_spatial_results$median_dist
+      # Fill NAs for any cells that had no graph neighbors after filtering/ranking
+      median_spatial_dist_of_graph_neighbors_vec[setdiff(1:num_cells, median_spatial_results$query_cell_idx)] <- NA
+  }
+
+
+  message("  Calculating median graph similarities for spatial neighbors...")
+  
+  # 1. Get all spatial nearest neighbors for all cells at once
+  # RANN::nn2 returns k+1 neighbors including self, sorted by distance
+  all_spatial_nn_results <- RANN::nn2(data = spatial_coords_mat, k = k_neighbors + 1)
+  
+  # Loop through each cell to calculate median similarities (inner part is optimized)
+  for (i in 1:num_cells) {
+    current_cell_id <- cell_ids[i]
+    
+    # Extract indices of spatial neighbors for current cell, filter self and RANN padding (0s)
+    spatial_nn_indices <- all_spatial_nn_results$nn.idx[i, ]
+    spatial_nn_indices <- spatial_nn_indices[spatial_nn_indices != i & spatial_nn_indices > 0] 
+    spatial_nn_indices <- head(spatial_nn_indices, k_neighbors) # Cap to k_neighbors
+
+    if (length(spatial_nn_indices) > 0) {
+      vec1 <- feature_matrix_for_similarity[, current_cell_id, drop = FALSE] 
+      mat2 <- feature_matrix_for_similarity[, cell_ids[spatial_nn_indices], drop = FALSE] 
+      
+      dot_products <- as.vector(crossprod(vec1, mat2)) 
+      
+      current_cell_norm <- feature_matrix_norms[current_cell_id]
+      spatial_nn_norms <- feature_matrix_norms[cell_ids[spatial_nn_indices]]
+      
+      denominators <- current_cell_norm * spatial_nn_norms
+      graph_sim_to_spatial_nn <- ifelse(denominators == 0, 0, dot_products / denominators)
+      
+      median_graph_sim_of_spatial_neighbors_vec[i] <- median(graph_sim_to_spatial_nn)
+    } else {
+      median_graph_sim_of_spatial_neighbors_vec[i] <- NA 
+    }
+  }
+
+  # Assemble results into a data frame
+  coherence_df <- data.frame(
+    cell_id = cell_ids,
+    modality = modality_name,
+    median_spatial_dist_of_graph_neighbors = median_spatial_dist_of_graph_neighbors_vec,
+    median_graph_sim_of_spatial_neighbors = median_graph_sim_of_spatial_neighbors_vec
+  ) %>%
+    na.omit() # Remove cells that had no valid neighbors (e.g., isolated cells) for metric calculation
+
+  # --- Plotting Distributions ---
+  plot_dist_spatial_for_graph_nn <- ggplot(coherence_df, aes(x = median_spatial_dist_of_graph_neighbors)) +
+    geom_density(fill = "lightblue", alpha = 0.7) +
+    labs(title = paste0(modality_name, ": Spatial Distances of Graph Neighbors (k=", k_neighbors, ")"),
+         x = "Median Spatial Distance", y = "Density") +
+    theme_minimal() +
+    theme(plot.title = element_text(hjust = 0.5))
+
+  plot_sim_graph_for_spatial_nn <- ggplot(coherence_df, aes(x = median_graph_sim_of_spatial_neighbors)) +
+    geom_density(fill = "lightcoral", alpha = 0.7) +
+    labs(title = paste0(modality_name, ": Graph Similarities of Spatial Neighbors (k=", k_neighbors, ")"),
+         x = "Median Graph Similarity", y = "Density") +
+    theme_minimal() +
+    theme(plot.title = element_text(hjust = 0.5))
+
+  message("Overall spatial-graph coherence assessment complete for ", modality_name, ".")
+
+  return(list(
+    coherence_df = coherence_df,
+    plot_dist_spatial_for_graph_nn = plot_dist_spatial_for_graph_nn,
+    plot_sim_graph_for_spatial_nn = plot_sim_graph_for_spatial_nn
+  ))
 }
 ```
 
@@ -1350,50 +1847,87 @@ message("ATAC Graph dimensions: ", paste(dim(atac_graph), collapse = "x"))
 
 ```
 
+```{r Save and load graph}
+file_path <- file.path(output_dir, "separate_graphs.rds")
+
+# Save the 'separate_graphs' object
+message("Saving separate_graphs object to: ", file_path)
+saveRDS(separate_graphs, file = file_path)
+
+# loaded_graphs <- readRDS(file = file_path)
+```
+
 
 ```{r Running CellWalker2 with RNA Graph}
-# Find mock markers from the RNA data clusters
-if (is.null(seurat_obj_rna_preprocessed$seurat_clusters)) {
-  seurat_obj_rna_preprocessed <- FindNeighbors(seurat_obj_rna_preprocessed, dims = graph_params$rna_feature_dims) # Use new graph_params
-  seurat_obj_rna_preprocessed <- FindClusters(seurat_obj_rna_preprocessed, resolution = 0.5)
+# Ensure RNA data is clustered for mock markers
+message("Clustering RNA data to derive mock markers...")
+
+if (is.null(seurat_obj_rna_preprocessed@reductions$pca)) {
+  stop("PCA has not been run on the Seurat object. Please ensure `RunPCA` was successful in `preprocessSpatialMultiomics`.")
+}
+if (ncol(seurat_obj_rna_preprocessed@reductions$pca@cell.embeddings) < 2) {
+  stop(paste0("PCA yielded insufficient principal components (", ncol(seurat_obj_rna_preprocessed@reductions$pca@cell.embeddings), 
+              ") for `FindNeighbors`. Consider adjusting `rna_nfeatures` or `dims` parameters if you have very few cells/features."))
 }
 
-Idents(seurat_obj_rna_preprocessed) <- "seurat_clusters"
-mock_markers_rna <- FindAllMarkers(seurat_obj_rna_preprocessed, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+# Always run FindNeighbors and FindClusters here, as clustering is required for mock markers.
+seurat_obj_rna_preprocessed <- FindNeighbors(seurat_obj_rna_preprocessed, dims = graph_params$rna_feature_dims)
+seurat_obj_rna_preprocessed <- FindClusters(seurat_obj_rna_preprocessed, resolution = 0.5)
 
-# Ensure mock_markers_rna is not empty
-if (nrow(mock_markers_rna) == 0) {
-  warning("No markers found for RNA clusters. Generating dummy markers for demonstration.")
-  dummy_genes <- rownames(seurat_obj_rna_preprocessed)[1:min(10, nrow(seurat_obj_rna_preprocessed))] # Take first 10 genes, or fewer if not enough
-  dummy_clusters <- unique(seurat_obj_rna_preprocessed$seurat_clusters)[1] # Take first cluster
+# Verify that 'seurat_clusters' exists after FindClusters
+if (!("seurat_clusters" %in% names(seurat_obj_rna_preprocessed@meta.data))) {
+  warning("`FindClusters` did not create the 'seurat_clusters' metadata column. This might indicate an issue with clustering (e.g., too few cells, no variable features). Generating dummy markers.")
+  
+  # Fallback: Assign a dummy cluster to all cells to allow Idents to be set
+  dummy_cluster_name <- "dummy_cluster_0"
+  seurat_obj_rna_preprocessed$seurat_clusters <- factor(rep(dummy_cluster_name, ncol(seurat_obj_rna_preprocessed)))
+  
+  # Generate dummy markers from the first few genes if clustering failed
+  dummy_genes <- rownames(seurat_obj_rna_preprocessed)[1:min(10, nrow(seurat_obj_rna_preprocessed))]
   mock_markers_rna_df <- data.frame(
     gene = dummy_genes,
-    cluster = rep(dummy_clusters, length(dummy_genes)),
-    avg_log2FC = runif(length(dummy_genes), 0.5, 1.5)
+    cluster = rep(dummy_cluster_name, length(dummy_genes)),
+    avg_log2FC = runif(length(dummy_genes), 0.5, 1.5),
+    row.names = dummy_genes # Add row names for consistency
   )
 } else {
-  # FindAllMarkers returns a data.frame, but explicit conversion adds robustness.
-  mock_markers_rna_df <- as.data.frame(mock_markers_rna)
-  mock_markers_rna_df <- mock_markers_rna_df[, c("gene", "cluster", "avg_log2FC")]
+  # If seurat_clusters exists, proceed as normal
+  Idents(seurat_obj_rna_preprocessed) <- "seurat_clusters"
+  mock_markers_rna <- FindAllMarkers(seurat_obj_rna_preprocessed, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+
+  # Original check for empty markers is still valuable
+  if (nrow(mock_markers_rna) == 0) {
+    warning("No markers found for RNA clusters after `FindAllMarkers`. Generating dummy markers for demonstration.")
+    dummy_genes <- rownames(seurat_obj_rna_preprocessed)[1:min(10, nrow(seurat_obj_rna_preprocessed))]
+    dummy_clusters <- unique(seurat_obj_rna_preprocessed$seurat_clusters)[1] # Take first cluster found
+    mock_markers_rna_df <- data.frame(
+      gene = dummy_genes,
+      cluster = rep(dummy_clusters, length(dummy_genes)),
+      avg_log2FC = runif(length(dummy_genes), 0.5, 1.5),
+      row.names = dummy_genes
+    )
+  } else {
+    mock_markers_rna_df <- as.data.frame(mock_markers_rna)
+    mock_markers_rna_df <- mock_markers_rna_df[, c("gene", "cluster", "avg_log2FC")]
+  }
 }
 
-
 # Compute label edges from RNA data
-rna_label_expr_norm <- GetAssayData(seurat_obj_rna_preprocessed, assay = "RNA", slot = "data")
+rna_label_expr_norm <- GetAssayData(seurat_obj_rna_preprocessed, assay = "RNA", layer = "data")
 
 # Filter `rna_label_expr_norm` to only include genes present in `mock_markers_rna_df`
 genes_in_markers <- unique(mock_markers_rna_df$gene)
 rna_label_expr_norm_filtered <- rna_label_expr_norm[intersect(genes_in_markers, rownames(rna_label_expr_norm)), , drop = FALSE]
 
 if (nrow(rna_label_expr_norm_filtered) == 0) {
-  stop("No common genes between RNA expression data and mock markers. Cannot compute label edges for CellWalker.")
+  stop("No common genes between RNA expression data and mock markers after filtering. Cannot compute label edges for CellWalker.")
 }
 
-rna_label_edges <- CellWalkR::computeTypeEdges(rna_label_expr_norm_filtered, mock_markers_rna_df)
+rna_label_edges <- changedCellWalkercomputeTypeEdges(rna_label_expr_norm_filtered, mock_markers_rna_df)
 message("Dimensions of RNA label edges: ", paste(dim(rna_label_edges), collapse = "x"))
 
 label_edges_list_walk <- list(rna_label_edges)
-label_edge_weights_walk <- c(1000) # This could be tuned, check later
+label_edge_weights_walk <- c(1000) # This would typically be tuned
 
 message("Running walkCells with the RNA graph and RNA-derived label edges...")
 cell_walk_results_rna <- CellWalkR::walkCells( 
@@ -1404,7 +1938,7 @@ cell_walk_results_rna <- CellWalkR::walkCells(
 )
 
 message("CellWalker results obtained with RNA multi-omics:")
-print(head(cell_walk_results_rna$cellLabels))
+print(head(cell_walk_results_rna$cellLabels)) # Renamed result variable
 
 ```
 
@@ -1414,101 +1948,98 @@ message("--- Spatial Validation for RNA Graph Coherence ---")
 p_spatial_coherence_rna <- plotSpatialGraphCoherence(
   rna_graph,
   rna_spatial_coords_filtered,
-  n_query_cells = 3, # Plot 3 random query cells
+  n_query_cells = 4, # Plot 3 random query cells
   k_neighbors_to_show = 10 # Show 10 graph and 10 spatial neighbors
 )
 print(p_spatial_coherence_rna)
+ggsave("/projectnb/paxlab/phitro/CellWalkR2/R/figure/RNA_graph_to_spatial_overlay.png", plot = p_spatial_coherence_rna)
 
 message("--- Spatial Validation for ATAC Graph Coherence ---")
 p_spatial_coherence_atac <- plotSpatialGraphCoherence(
   atac_graph,
   atac_spatial_coords_filtered,
-  n_query_cells = 3, # Plot 3 random query cells
+  n_query_cells = 4, # Plot 3 random query cells
   k_neighbors_to_show = 10 # Show 10 graph and 10 spatial neighbors
 )
 print(p_spatial_coherence_atac)
+ggsave("/projectnb/paxlab/phitro/CellWalkR2/R/figure/ATAC_graph_to_spatial_overlay.png", plot = p_spatial_coherence_atac)
 
+
+
+
+# Define k for coherence assessment
+k_coherence_neighbors <- 10 
+
+# --- Prepare feature matrices for similarity calculation ---
+# For RNA: Use normalized data slot from Seurat. This should be 'genes x cells'.
+rna_feature_matrix_for_sim <- GetAssayData(seurat_obj_rna_preprocessed, assay = "RNA", layer = "data")
+
+# For ATAC: Use the atac_gene_activity_matrix_final.
+# It is typically 'cells x genes', so it needs to be transposed to 'genes x cells'
+# for cosine similarity calculation with sparse matrices.
+atac_feature_matrix_for_sim <- t(atac_gene_activity_matrix_final)
+
+
+# --- For RNA ---
+rna_coherence_results <- assessSpatialGraphCoherenceOverall(
+  feature_graph = rna_graph,
+  feature_matrix_for_similarity = rna_feature_matrix_for_sim, 
+  spatial_coords_df = rna_spatial_coords_filtered,
+  k_neighbors = k_coherence_neighbors,
+  modality_name = "RNA"
+)
+print(rna_coherence_results$plot_dist_spatial_for_graph_nn) # Plot 1 for RNA
+print(rna_coherence_results$plot_sim_graph_for_spatial_nn)  # Plot 2 for RNA (now should be non-zero)
+ggsave("/projectnb/paxlab/phitro/CellWalkR2/R/figure/RNA_plot_dist_spatial_for_graph_nn.png", plot = rna_coherence_results$plot_dist_spatial_for_graph_nn)
+ggsave("/projectnb/paxlab/phitro/CellWalkR2/R/figure/RNA_plot_sim_graph_for_spatial_nn.png", plot = rna_coherence_results$plot_sim_graph_for_spatial_nn)
+head(rna_coherence_results$coherence_df)
+
+# --- For ATAC ---
+atac_coherence_results <- assessSpatialGraphCoherenceOverall(
+  feature_graph = atac_graph,
+  feature_matrix_for_similarity = atac_feature_matrix_for_sim, 
+  spatial_coords_df = atac_spatial_coords_filtered,
+  k_neighbors = k_coherence_neighbors,
+  modality_name = "ATAC"
+)
+print(atac_coherence_results$plot_dist_spatial_for_graph_nn) # Plot 1 for ATAC
+print(atac_coherence_results$plot_sim_graph_for_spatial_nn)  # Plot 2 for ATAC (now should be non-zero)
+ggsave("/projectnb/paxlab/phitro/CellWalkR2/R/figure/ATAC_plot_dist_spatial_for_graph_nn.png", plot = atac_coherence_results$plot_dist_spatial_for_graph_nn)
+ggsave("/projectnb/paxlab/phitro/CellWalkR2/R/figure/ATAC_plot_sim_graph_for_spatial_nn.png", plot = atac_coherence_results$plot_sim_graph_for_spatial_nn)
+head(atac_coherence_results$coherence_df)
+
+# --- Combine results for joint plotting (recommended for comparison) ---
+combined_coherence_df <- rbind(rna_coherence_results$coherence_df, atac_coherence_results$coherence_df)
+
+# Joint Density Plot: Median Spatial Distance for Graph Neighbors (RNA vs ATAC)
+p_joint_spatial_dist <- ggplot(combined_coherence_df, aes(x = median_spatial_dist_of_graph_neighbors, fill = modality)) +
+  geom_density(alpha = 0.6, adjust = 1.5) + # `adjust` parameter controls smoothness of density plot
+  labs(title = paste0("Median Spatial Distance of Graph Neighbors (k=", k_coherence_neighbors, ")"),
+       x = "Median Spatial Distance (Lower = Better Coherence)", y = "Density", fill = "Modality") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+print(p_joint_spatial_dist)
+
+# Joint Density Plot: Median Graph Similarity for Spatial Neighbors (RNA vs ATAC)
+p_joint_graph_sim <- ggplot(combined_coherence_df, aes(x = median_graph_sim_of_spatial_neighbors, fill = modality)) +
+  geom_density(alpha = 0.6, adjust = 1.5) +
+  labs(title = paste0("Median Graph Similarity of Spatial Neighbors (k=", k_coherence_neighbors, ")"),
+       x = "Median Graph Similarity (Higher = Better Coherence)", y = "Density", fill = "Modality") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+print(p_joint_graph_sim)
+
+# Optional: Scatter plot comparing the two metrics per cell, colored by modality
+p_scatter_metrics <- ggplot(combined_coherence_df, aes(x = median_spatial_dist_of_graph_neighbors, y = median_graph_sim_of_spatial_neighbors, color = modality)) +
+  geom_point(alpha = 0.5) +
+  geom_smooth(method = "lm", se = FALSE, linetype = "dashed") + # Add a linear regression line
+  labs(title = paste0("Spatial-Graph Coherence per Cell (k=", k_coherence_neighbors, ")"),
+       x = "Median Spatial Distance of Graph Neighbors (Lower = Better)",
+       y = "Median Graph Similarity of Spatial Neighbors (Higher = Better)",
+       color = "Modality") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+print(p_scatter_metrics)
 ```
 
-```{r }
 
-```
-
-```{r plot spatials}
-library(ggplot2)
-library(cowplot)
-library(dplyr)
-
-# concise, professional spatial plot: RNA (x_centroid,y_centroid) above ATAC (xcor,ycor)
-plot_spatial_rna_atac <- function(seurat_rna, seurat_atac,
-                                  color_by = NULL,
-                                  pt_size = 0.6, pt_alpha = 0.8,
-                                  same_limits = FALSE,
-                                  rna_title = "RNA (spatial)",
-                                  atac_title = "ATAC (spatial)") {
-  # extract and rename coords
-  df_rna <- seurat_rna@meta.data %>%
-    transmute(x = as.numeric(x_centroid), y = as.numeric(y_centroid),
-              .col = if (!is.null(color_by)) .data[[color_by]] else NULL)
-  df_atac <- seurat_atac@meta.data %>%
-    transmute(x = as.numeric(xcor), y = as.numeric(ycor),
-              .col = if (!is.null(color_by)) .data[[color_by]] else NULL)
-  if (!is.null(color_by)) {
-    names(df_rna)[3] <- names(df_atac)[3] <- color_by
-  }
-
-  # common limits
-  if (same_limits) {
-    xlim <- range(c(df_rna$x, df_atac$x), na.rm = TRUE)
-    ylim <- range(c(df_rna$y, df_atac$y), na.rm = TRUE)
-  } else { xlim <- ylim <- NULL }
-
-  make_plot <- function(df, title) {
-    p <- ggplot(df, aes(x = x, y = -y)) +
-      coord_fixed() + ggtitle(title) + theme_minimal() +
-      theme(plot.title = element_text(hjust = 0.5))
-    if (!is.null(xlim)) p <- p + xlim(xlim) + ylim(ylim)
-    if (!is.null(color_by)) {
-      if (is.numeric(df[[color_by]])) {
-        p <- p + geom_point(aes_string(color = color_by), size = pt_size, alpha = pt_alpha) +
-          scale_color_viridis_c()
-      } else {
-        p <- p + geom_point(aes_string(color = color_by), size = pt_size, alpha = pt_alpha) +
-          scale_color_brewer(palette = "Set1", na.value = "grey70")
-      }
-    } else {
-      p <- p + geom_point(color = "#2c3e50", size = pt_size, alpha = pt_alpha)
-    }
-    p + xlab("x") + ylab("y")
-  }
-  
-  make_plot2 <- function(df, title) {
-    p <- ggplot(df, aes(x = x, y = y)) +
-      coord_fixed() + ggtitle(title) + theme_minimal() +
-      theme(plot.title = element_text(hjust = 0.5))
-    if (!is.null(xlim)) p <- p + xlim(xlim) + ylim(ylim)
-    if (!is.null(color_by)) {
-      if (is.numeric(df[[color_by]])) {
-        p <- p + geom_point(aes_string(color = color_by), size = pt_size, alpha = pt_alpha) +
-          scale_color_viridis_c()
-      } else {
-        p <- p + geom_point(aes_string(color = color_by), size = pt_size, alpha = pt_alpha) +
-          scale_color_brewer(palette = "Set1", na.value = "grey70")
-      }
-    } else {
-      p <- p + geom_point(color = "#2c3e50", size = pt_size, alpha = pt_alpha)
-    }
-    p + xlab("x") + ylab("y")
-  }
-
-  p_rna <- make_plot(df_rna, rna_title)
-  p_atac <- make_plot2(df_atac, atac_title)
-
-  plot_grid(p_rna, p_atac, ncol = 1, align = "v", rel_heights = c(1, 1))
-}
-
-
-p <- plot_spatial_rna_atac(seurat_rna_f, seurat_atac_f, color_by = NULL)
-ggsave("/projectnb/paxlab/phitro/figures/spatial_RNA-ATAC_filtered.png", p)
-
-```
