@@ -1570,10 +1570,14 @@ plotSpatialGraphCoherence <- function(combined_rna_atac_graph, rna_spatial_coord
 #'
 #' \code{assessSpatialGraphCoherenceOverall()} quantifies and visualizes the global coherence
 #' between feature-based cell similarity graphs and spatial proximity for a given modality.
-#' For each cell, it calculates:
-#' 1. The median spatial distance to its `k` nearest neighbors in the feature-based graph.
-#' 2. The median feature-graph similarity (cosine similarity from the full feature matrix)
-#'    to its `k` nearest neighbors in spatial space.
+#' For each cell, it calculates four key metrics:
+#' \itemize{
+#'   \item{\strong{Median Spatial Distance to Feature-Graph Neighbors (MSD-FGN):}} For each cell, this metric finds its `k` nearest neighbors based on feature similarity (from the `feature_graph`). It then calculates the median *Euclidean spatial distance* to these `k` feature-similar cells. A \strong{lower} median distance indicates that cells that are transcriptionally/epigenetically similar tend to be spatially close, suggesting good spatial preservation of feature similarity.
+#'   \item{\strong{Median Feature-Graph Similarity to Spatial Neighbors (MFS-SN):}} For each cell, this metric finds its `k` nearest neighbors based on *spatial proximity*. It then calculates the median *cosine similarity* (using `feature_matrix_for_similarity`) between the query cell and these `k` spatially close neighbors. A \strong{higher} median similarity indicates that spatially adjacent cells also tend to be transcriptionally/epigenetically similar, suggesting that spatial proximity reflects feature similarity in the raw data.
+#'   \item{\strong{Median Feature-Graph Similarity to Feature-Graph Neighbors (MFS-FGN):}} For each cell, this metric finds its `k` nearest neighbors based on *feature similarity* (from the `feature_graph`). It then calculates the median of the actual *feature similarity scores* (from the `feature_graph` itself) to these `k` feature-similar cells. This serves as a sanity check: a \strong{higher} median similarity indicates that the `feature_graph` is indeed connecting highly similar cells in feature space, validating the graph construction process itself.
+#'   \item{\strong{Median Feature-Graph Distance to Spatial Neighbors (MFD-SN):}} For each cell, this metric finds its `k` nearest neighbors based on *spatial proximity*. It then calculates the median *feature-graph distance* (derived as `1 - similarity` from the `feature_graph`) between the query cell and these `k` spatially close neighbors. A \strong{lower} median graph distance (meaning higher graph similarity) indicates that spatially adjacent cells are also strongly connected in the feature-based graph, reinforcing that spatial proximity corresponds to feature-based graph connectivity.
+#'   \item{\strong{Combined Coherence Score (CCS):}} This composite score combines the two primary distance-based metrics (MSD-FGN and MFD-SN) into a single value where a \strong{higher} score indicates better overall spatial-feature coherence. Each component metric is min-max normalized (0-1), then transformed so that higher values imply "better coherence" (e.g., `1 - normalized_distance`), and finally averaged.
+#' }
 #'
 #' @param feature_graph A sparse matrix (cells x cells) representing feature-based
 #'   cell-to-cell similarities (e.g., RNA graph or ATAC graph). Rownames/Colnames must be cell IDs.
@@ -1586,13 +1590,12 @@ plotSpatialGraphCoherence <- function(combined_rna_atac_graph, rna_spatial_coord
 #' @param modality_name Character string (e.g., "RNA", "ATAC") for labeling results and plots.
 #' @return A list containing:
 #'   \itemize{
-#'     \item `coherence_df`: A data.frame with metrics for each cell:
-#'       `cell_id`, `modality`, `median_spatial_dist_of_graph_neighbors`,
-#'       `median_graph_sim_of_spatial_neighbors`.
-#'     \item `plot_dist_spatial_for_graph_nn`: A ggplot object showing distribution
-#'       of median spatial distances for graph neighbors.
-#'     \item `plot_sim_graph_for_spatial_nn`: A ggplot object showing distribution
-#'       of median graph similarities for spatial neighbors.
+#'     \item `coherence_df`: A data.frame with metrics for each cell.
+#'     \item `plot_dist_spatial_for_graph_nn`: ggplot object for MSD-FGN density.
+#'     \item `plot_sim_graph_for_spatial_nn`: ggplot object for MFS-SN density.
+#'     \item `plot_sim_graph_for_graph_nn`: ggplot object for MFS-FGN density.
+#'     \item `plot_dist_graph_for_spatial_nn`: ggplot object for MFD-SN density.
+#'     \item `plot_spatial_coherence_metrics`: ggplot object with spatial subplots for all metrics.
 #'   }
 #' @export
 assessSpatialGraphCoherenceOverall <- function(feature_graph, feature_matrix_for_similarity, spatial_coords_df, k_neighbors = 10, modality_name = "Modality") {
@@ -1630,9 +1633,15 @@ assessSpatialGraphCoherenceOverall <- function(feature_graph, feature_matrix_for
     return(list(
       coherence_df = data.frame(cell_id = character(0), modality = character(0),
                                 median_spatial_dist_of_graph_neighbors = numeric(0),
-                                median_graph_sim_of_spatial_neighbors = numeric(0)),
+                                median_graph_sim_of_spatial_neighbors = numeric(0),
+                                median_graph_sim_of_graph_neighbors = numeric(0),
+                                median_graph_dist_of_spatial_neighbors = numeric(0),
+                                combined_coherence_score = numeric(0)), 
       plot_dist_spatial_for_graph_nn = ggplot() + annotate("text", x = 0.5, y = 0.5, label = "No data") + theme_void(),
-      plot_sim_graph_for_spatial_nn = ggplot() + annotate("text", x = 0.5, y = 0.5, label = "No data") + theme_void()
+      plot_sim_graph_for_spatial_nn = ggplot() + annotate("text", x = 0.5, y = 0.5, label = "No data") + theme_void(),
+      plot_sim_graph_for_graph_nn = ggplot() + annotate("text", x = 0.5, y = 0.5, label = "No data") + theme_void(),
+      plot_dist_graph_for_spatial_nn = ggplot() + annotate("text", x = 0.5, y = 0.5, label = "No data") + theme_void(),
+      plot_spatial_coherence_metrics = ggplot() + annotate("text", x = 0.5, y = 0.5, label = "No data") + theme_void()
     ))
   }
 
@@ -1652,71 +1661,53 @@ assessSpatialGraphCoherenceOverall <- function(feature_graph, feature_matrix_for
   # Pre-calculate L2 norms for `feature_matrix_for_similarity` columns to optimize cosine similarity
   feature_matrix_norms <- sqrt(Matrix::colSums(feature_matrix_for_similarity * feature_matrix_for_similarity))
 
-  # Initialize vectors to store results
-  median_spatial_dist_of_graph_neighbors_vec <- numeric(num_cells)
-  median_graph_sim_of_spatial_neighbors_vec <- numeric(num_cells)
+  # Initialize vectors to store results (ensure they are named correctly)
+  median_spatial_dist_of_graph_neighbors_vec <- rep(NA_real_, num_cells) # Use NA_real_ to ensure numeric type
+  median_graph_sim_of_spatial_neighbors_vec <- rep(NA_real_, num_cells)
+  median_graph_sim_of_graph_neighbors_vec <- rep(NA_real_, num_cells) 
+  median_graph_dist_of_spatial_neighbors_vec <- rep(NA_real_, num_cells) 
 
-  message("  Calculating median spatial distances for graph neighbors (vectorized)...")
+  message("  Calculating median spatial distances and graph similarities for graph neighbors (vectorized)...")
   
-  # 1. Extract non-zero edges from the sparse graph
-  # `summary()` returns a data.frame with i (row index), j (column index), x (value)
   graph_summary_dt <- as.data.table(Matrix::summary(feature_graph))
-  
-  # Map matrix indices to cell IDs for clarity (optional, but good for validation)
-  graph_summary_dt[, query_cell_idx := i] # Rename for clarity
-  graph_summary_dt[, neighbor_cell_idx := j]
-  
-  # Filter out self-loops (i.e., cell_id == neighbor_cell_id)
+  data.table::setnames(graph_summary_dt, old = c("i", "j"), new = c("query_cell_idx", "neighbor_cell_idx"))
   graph_summary_dt <- graph_summary_dt[query_cell_idx != neighbor_cell_idx]
 
   if (nrow(graph_summary_dt) == 0) {
-      warning("No non-self-loop edges found in feature_graph. Cannot calculate spatial distances for graph neighbors.")
-      median_spatial_dist_of_graph_neighbors_vec[] <- NA
+      warning("No non-self-loop edges found in feature_graph. Metrics for graph neighbors will be NA.")
   } else {
-      # 2. Calculate spatial distances for all edges in a vectorized way
-      # Extract coordinates for all query cells and their corresponding graph neighbors
       x1 <- spatial_coords_mat[graph_summary_dt$query_cell_idx, 1]
       y1 <- spatial_coords_mat[graph_summary_dt$query_cell_idx, 2]
       x2 <- spatial_coords_mat[graph_summary_dt$neighbor_cell_idx, 1]
       y2 <- spatial_coords_mat[graph_summary_dt$neighbor_cell_idx, 2]
       
-      # Compute Euclidean distances
       graph_summary_dt[, spatial_distance := sqrt((x1 - x2)^2 + (y1 - y2)^2)]
       
-      # 3. Group by query_cell_idx and take the median of distances
-      # Also need to limit to k_neighbors per query cell before median.
-      # This is tricky with sparse graphs where `k` might not be strictly enforced.
-      # The most robust way is to re-rank within each query_cell_idx by similarity (x) and take top k
-      
-      # For each query_cell_idx, rank its neighbors by similarity (x) and select top k
       graph_neighbors_ranked <- graph_summary_dt[, head(.SD[order(-x)], k_neighbors), by = query_cell_idx]
       
-      # Now, compute the median spatial distance for these top k graph neighbors
-      median_spatial_results <- graph_neighbors_ranked[, .(median_dist = median(spatial_distance)), by = query_cell_idx]
+      median_spatial_results <- graph_neighbors_ranked[, .(median_dist = median(spatial_distance, na.rm=TRUE)), by = query_cell_idx]
+      median_graph_sim_results_of_graph_nn <- graph_neighbors_ranked[, .(median_graph_sim = median(x, na.rm=TRUE)), by = query_cell_idx]
       
-      # Map results back to the original num_cells vector
+      # Map Metric 1 results back
       median_spatial_dist_of_graph_neighbors_vec[median_spatial_results$query_cell_idx] <- median_spatial_results$median_dist
-      # Fill NAs for any cells that had no graph neighbors after filtering/ranking
-      median_spatial_dist_of_graph_neighbors_vec[setdiff(1:num_cells, median_spatial_results$query_cell_idx)] <- NA
+      # Map Metric 3 results back
+      median_graph_sim_of_graph_neighbors_vec[median_graph_sim_results_of_graph_nn$query_cell_idx] <- median_graph_sim_results_of_graph_nn$median_graph_sim
   }
 
 
-  message("  Calculating median graph similarities for spatial neighbors...")
+  message("  Calculating median graph similarities and graph distances for spatial neighbors...")
   
-  # 1. Get all spatial nearest neighbors for all cells at once
-  # RANN::nn2 returns k+1 neighbors including self, sorted by distance
   all_spatial_nn_results <- RANN::nn2(data = spatial_coords_mat, k = k_neighbors + 1)
   
-  # Loop through each cell to calculate median similarities (inner part is optimized)
   for (i in 1:num_cells) {
     current_cell_id <- cell_ids[i]
     
-    # Extract indices of spatial neighbors for current cell, filter self and RANN padding (0s)
     spatial_nn_indices <- all_spatial_nn_results$nn.idx[i, ]
     spatial_nn_indices <- spatial_nn_indices[spatial_nn_indices != i & spatial_nn_indices > 0] 
-    spatial_nn_indices <- head(spatial_nn_indices, k_neighbors) # Cap to k_neighbors
+    spatial_nn_indices <- head(spatial_nn_indices, k_neighbors)
 
     if (length(spatial_nn_indices) > 0) {
+      # Metric 2: Cosine Similarity from full feature matrix
       vec1 <- feature_matrix_for_similarity[, current_cell_id, drop = FALSE] 
       mat2 <- feature_matrix_for_similarity[, cell_ids[spatial_nn_indices], drop = FALSE] 
       
@@ -1726,11 +1717,21 @@ assessSpatialGraphCoherenceOverall <- function(feature_graph, feature_matrix_for
       spatial_nn_norms <- feature_matrix_norms[cell_ids[spatial_nn_indices]]
       
       denominators <- current_cell_norm * spatial_nn_norms
-      graph_sim_to_spatial_nn <- ifelse(denominators == 0, 0, dot_products / denominators)
+      graph_sim_to_spatial_nn_cosine <- ifelse(denominators == 0, 0, dot_products / denominators)
       
-      median_graph_sim_of_spatial_neighbors_vec[i] <- median(graph_sim_to_spatial_nn)
+      median_graph_sim_of_spatial_neighbors_vec[i] <- median(graph_sim_to_spatial_nn_cosine, na.rm=TRUE)
+
+      # Metric 4: Graph Distance to Spatial Neighbors (using feature_graph similarity)
+      graph_sim_to_spatial_nn_from_graph <- feature_graph[current_cell_id, cell_ids[spatial_nn_indices]]
+      
+      graph_dist_to_spatial_nn <- 1 - graph_sim_to_spatial_nn_from_graph
+      graph_dist_to_spatial_nn[graph_dist_to_spatial_nn < 0] <- 0
+      graph_dist_to_spatial_nn[graph_dist_to_spatial_nn > 1] <- 1
+
+      median_graph_dist_of_spatial_neighbors_vec[i] <- median(graph_dist_to_spatial_nn, na.rm=TRUE)
+
     } else {
-      median_graph_sim_of_spatial_neighbors_vec[i] <- NA 
+      # These will remain NA_real_ as initialized
     }
   }
 
@@ -1739,31 +1740,181 @@ assessSpatialGraphCoherenceOverall <- function(feature_graph, feature_matrix_for
     cell_id = cell_ids,
     modality = modality_name,
     median_spatial_dist_of_graph_neighbors = median_spatial_dist_of_graph_neighbors_vec,
-    median_graph_sim_of_spatial_neighbors = median_graph_sim_of_spatial_neighbors_vec
-  ) %>%
-    na.omit() # Remove cells that had no valid neighbors (e.g., isolated cells) for metric calculation
+    median_graph_sim_of_spatial_neighbors = median_graph_sim_of_spatial_neighbors_vec,
+    median_graph_sim_of_graph_neighbors = median_graph_sim_of_graph_neighbors_vec,
+    median_graph_dist_of_spatial_neighbors = median_graph_dist_of_spatial_neighbors_vec
+  )
+  
+  data.table::setDT(coherence_df)
+  
+  message("  DEBUG: NA counts per metric before na.omit():")
+  print(coherence_df[, lapply(.SD, function(x) sum(is.na(x)))])
 
-  # --- Plotting Distributions ---
+  initial_nrow_coherence_df <- nrow(coherence_df)
+  coherence_df <- na.omit(coherence_df) # Remove any rows with NA in any metric
+  
+  if (nrow(coherence_df) < initial_nrow_coherence_df) {
+      message(paste0("Info: Removed ", initial_nrow_coherence_df - nrow(coherence_df), " cells with NA coherence metrics via na.omit()."))
+  }
+  
+  if (nrow(coherence_df) == 0) {
+      message("CRITICAL WARNING: coherence_df is empty after removing NAs. All plots will be empty.")
+      # Return empty plot objects, avoiding further processing that requires data
+      return(list(
+        coherence_df = data.data.frame(cell_id = character(0), modality = character(0),
+                                  median_spatial_dist_of_graph_neighbors = numeric(0),
+                                  median_graph_sim_of_spatial_neighbors = numeric(0),
+                                  median_graph_sim_of_graph_neighbors = numeric(0),
+                                  median_graph_dist_of_spatial_neighbors = numeric(0),
+                                  combined_coherence_score = numeric(0)), 
+        plot_dist_spatial_for_graph_nn = ggplot() + annotate("text", x = 0.5, y = 0.5, label = "No data") + theme_void(),
+        plot_sim_graph_for_spatial_nn = ggplot() + annotate("text", x = 0.5, y = 0.5, label = "No data") + theme_void(),
+        plot_sim_graph_for_graph_nn = ggplot() + annotate("text", x = 0.5, y = 0.5, label = "No data") + theme_void(),
+        plot_dist_graph_for_spatial_nn = ggplot() + annotate("text", x = 0.5, y = 0.5, label = "No data") + theme_void(),
+        plot_spatial_coherence_metrics = ggplot() + annotate("text", x = 0.5, y = 0.5, label = "No data") + theme_void()
+      ))
+  }
+
+
+  # --- Calculate Combined Coherence Score (Metric 5) ---
+  msd_fgn_vals <- coherence_df[["median_spatial_dist_of_graph_neighbors"]]
+  min_msd_fgn <- min(msd_fgn_vals, na.rm = TRUE)
+  max_msd_fgn <- max(msd_fgn_vals, na.rm = TRUE)
+  
+  norm_msd_fgn <- if (max_msd_fgn == min_msd_fgn) {
+      rep(0.5, length(msd_fgn_vals))
+  } else {
+      1 - (msd_fgn_vals - min_msd_fgn) / (max_msd_fgn - min_msd_fgn)
+  }
+
+  mfd_sn_vals <- coherence_df[["median_graph_dist_of_spatial_neighbors"]]
+  min_mfd_sn <- min(mfd_sn_vals, na.rm = TRUE)
+  max_mfd_sn <- max(mfd_sn_vals, na.rm = TRUE)
+  
+  norm_mfd_sn <- if (max_mfd_sn == min_mfd_sn) {
+      rep(0.5, length(mfd_sn_vals))
+  } else {
+      1 - (mfd_sn_vals - min_mfd_sn) / (max_mfd_sn - min_mfd_sn)
+  }
+  
+  coherence_df$combined_coherence_score <- (norm_msd_fgn + norm_mfd_sn) / 2
+
+
+  # --- Plotting Distributions (Density Plots) ---
   plot_dist_spatial_for_graph_nn <- ggplot(coherence_df, aes(x = median_spatial_dist_of_graph_neighbors)) +
     geom_density(fill = "lightblue", alpha = 0.7) +
-    labs(title = paste0(modality_name, ": Spatial Distances of Graph Neighbors (k=", k_neighbors, ")"),
+    labs(title = paste0(modality_name, ": Spatial Dist to Feature-Graph NN (k=", k_neighbors, ")"), # More descriptive
          x = "Median Spatial Distance", y = "Density") +
     theme_minimal() +
     theme(plot.title = element_text(hjust = 0.5))
 
   plot_sim_graph_for_spatial_nn <- ggplot(coherence_df, aes(x = median_graph_sim_of_spatial_neighbors)) +
     geom_density(fill = "lightcoral", alpha = 0.7) +
-    labs(title = paste0(modality_name, ": Graph Similarities of Spatial Neighbors (k=", k_neighbors, ")"),
-         x = "Median Graph Similarity", y = "Density") +
+    labs(title = paste0(modality_name, ": Feature Sim to Spatial NN (k=", k_neighbors, ")"), # More descriptive
+         x = "Median Feature Similarity", y = "Density") +
     theme_minimal() +
     theme(plot.title = element_text(hjust = 0.5))
+
+  plot_sim_graph_for_graph_nn <- ggplot(coherence_df, aes(x = median_graph_sim_of_graph_neighbors)) +
+    geom_density(fill = "lightgreen", alpha = 0.7) +
+    labs(title = paste0(modality_name, ": Feature Sim to Feature-Graph NN (k=", k_neighbors, ")"), # More descriptive
+         x = "Median Feature Similarity", y = "Density") +
+    theme_minimal() +
+    theme(plot.title = element_text(hjust = 0.5))
+
+  plot_dist_graph_for_spatial_nn <- ggplot(coherence_df, aes(x = median_graph_dist_of_spatial_neighbors)) +
+    geom_density(fill = "lightgoldenrod", alpha = 0.7) + 
+    labs(title = paste0(modality_name, ": Feature-Graph Dist to Spatial NN (k=", k_neighbors, ")"), # More descriptive
+         x = "Median Feature-Graph Distance", y = "Density") +
+    theme_minimal() +
+    theme(plot.title = element_text(hjust = 0.5))
+
+  # --- Spatial Plot with Color Gradients for all Metrics ---
+  message("  Generating spatial plot with coherence metric gradients...")
+
+  spatial_coords_df_for_merge <- as.data.frame(spatial_coords_df) 
+  if (!"cell_id" %in% colnames(spatial_coords_df_for_merge)) {
+    spatial_coords_df_for_merge$cell_id <- rownames(spatial_coords_df_for_merge)
+  }
+  
+  # Default empty plot if no data is available
+  p_spatial_metrics <- ggplot() + annotate("text", x = 0.5, y = 0.5, label = "No data for spatial plot") + theme_void() 
+  
+  # Only attempt to create the spatial plot if coherence_df has data
+  if (nrow(coherence_df) > 0) {
+      plot_data_spatial <- merge(spatial_coords_df_for_merge, coherence_df, by = "cell_id", all.x = TRUE)
+      
+      # It's possible for some original cells not to have been included in coherence_df if they had NAs.
+      # These will show as NA for metrics but should still be plotted as grey.
+      
+      plot_data_long <- plot_data_spatial %>%
+        tidyr::pivot_longer(
+          cols = c(median_spatial_dist_of_graph_neighbors, 
+                   median_graph_sim_of_spatial_neighbors, 
+                   median_graph_sim_of_graph_neighbors, 
+                   median_graph_dist_of_spatial_neighbors,
+                   combined_coherence_score),
+          names_to = "metric_type",
+          values_to = "metric_value"
+        )
+
+      metric_labels <- c(
+        median_spatial_dist_of_graph_neighbors = "Spatial Dist. to Feature-Graph NN",
+        median_graph_sim_of_spatial_neighbors = "Feature Sim. to Spatial NN",
+        median_graph_sim_of_graph_neighbors = "Feature Sim. to Feature-Graph NN",
+        median_graph_dist_of_spatial_neighbors = "Feature-Graph Dist. to Spatial NN",
+        combined_coherence_score = "Combined Coherence Score"
+      )
+      
+      plot_data_long$metric_type <- factor(plot_data_long$metric_type, levels = names(metric_labels), labels = metric_labels)
+
+      plot_data_long_normalized <- plot_data_long %>%
+        group_by(metric_type) %>%
+        mutate(
+          val_min = min(metric_value, na.rm = TRUE),
+          val_max = max(metric_value, na.rm = TRUE),
+          norm_val = case_when(
+              val_max == val_min ~ rep(0.5, n()),
+              TRUE ~ (metric_value - val_min) / (val_max - val_min)
+          ),
+          plot_color_value = case_when(
+            grepl("Dist", metric_type) ~ 1 - norm_val, 
+            TRUE ~ norm_val 
+          )
+        ) %>%
+        ungroup()
+      
+      # Final check before plotting the spatial facets
+      # If plot_data_long_normalized is empty or all plot_color_value are NA, it will remain the default empty plot
+      if (nrow(plot_data_long_normalized) > 0 && !all(is.na(plot_data_long_normalized$plot_color_value))) {
+          p_spatial_metrics <- ggplot(plot_data_long_normalized, aes(x = x, y = y, color = plot_color_value)) +
+            geom_point(size = 0.2, alpha = 0.6) +
+            facet_wrap(~metric_type, ncol = 3) +
+            scale_color_viridis_c(
+              option = "viridis",
+              direction = 1, # High plot_color_value (good coherence) will be bright yellow/green
+              na.value = "grey80", # Cells with NA metrics will be grey
+              name = "Coherence (Normalized)" 
+            ) +
+            labs(title = paste0(modality_name, ": Spatial Coherence Metrics (k=", k_neighbors, ")"),
+                 x = "Spatial X", y = "Spatial Y") +
+            coord_fixed() +
+            theme_minimal() +
+            theme(plot.title = element_text(hjust = 0.5), legend.position = "bottom")
+      } else {
+          message("Warning: Spatial plot data (after normalization/NA handling) is empty or all NA for coloring. Returning empty spatial plot for this modality.")
+      }
+  }
 
   message("Overall spatial-graph coherence assessment complete for ", modality_name, ".")
 
   return(list(
     coherence_df = coherence_df,
     plot_dist_spatial_for_graph_nn = plot_dist_spatial_for_graph_nn,
-    plot_sim_graph_for_spatial_nn = plot_sim_graph_for_spatial_nn
+    plot_sim_graph_for_spatial_nn = plot_sim_graph_for_spatial_nn,
+    plot_sim_graph_for_graph_nn = plot_sim_graph_for_graph_nn,
+    plot_dist_graph_for_spatial_nn = plot_dist_graph_for_spatial_nn,
+    plot_spatial_coherence_metrics = p_spatial_metrics 
   ))
 }
 ```
@@ -1854,7 +2005,7 @@ file_path <- file.path(output_dir, "separate_graphs.rds")
 message("Saving separate_graphs object to: ", file_path)
 saveRDS(separate_graphs, file = file_path)
 
-# loaded_graphs <- readRDS(file = file_path)
+# separate_graphs <- readRDS(file = file_path)
 ```
 
 
@@ -1988,10 +2139,16 @@ rna_coherence_results <- assessSpatialGraphCoherenceOverall(
   k_neighbors = k_coherence_neighbors,
   modality_name = "RNA"
 )
-print(rna_coherence_results$plot_dist_spatial_for_graph_nn) # Plot 1 for RNA
-print(rna_coherence_results$plot_sim_graph_for_spatial_nn)  # Plot 2 for RNA (now should be non-zero)
+print(rna_coherence_results$plot_dist_spatial_for_graph_nn)
+print(rna_coherence_results$plot_sim_graph_for_spatial_nn)
+print(rna_coherence_results$plot_sim_graph_for_graph_nn)
+print(rna_coherence_results$plot_dist_graph_for_spatial_nn)
+print(rna_coherence_results$plot_spatial_coherence_metrics)
 ggsave("/projectnb/paxlab/phitro/CellWalkR2/R/figure/RNA_plot_dist_spatial_for_graph_nn.png", plot = rna_coherence_results$plot_dist_spatial_for_graph_nn)
 ggsave("/projectnb/paxlab/phitro/CellWalkR2/R/figure/RNA_plot_sim_graph_for_spatial_nn.png", plot = rna_coherence_results$plot_sim_graph_for_spatial_nn)
+ggsave("/projectnb/paxlab/phitro/CellWalkR2/R/figure/RNA_plot_sim_graph_for_graph_nn.png", plot = rna_coherence_results$plot_sim_graph_for_graph_nn)
+ggsave("/projectnb/paxlab/phitro/CellWalkR2/R/figure/RNA_plot_dist_graph_for_spatial_nn.png", plot = rna_coherence_results$plot_dist_graph_for_spatial_nn)
+ggsave("/projectnb/paxlab/phitro/CellWalkR2/R/figure/RNA_plot_spatial_coherence_metrics.png", plot = rna_coherence_results$plot_spatial_coherence_metrics)
 head(rna_coherence_results$coherence_df)
 
 # --- For ATAC ---
@@ -2002,10 +2159,16 @@ atac_coherence_results <- assessSpatialGraphCoherenceOverall(
   k_neighbors = k_coherence_neighbors,
   modality_name = "ATAC"
 )
-print(atac_coherence_results$plot_dist_spatial_for_graph_nn) # Plot 1 for ATAC
-print(atac_coherence_results$plot_sim_graph_for_spatial_nn)  # Plot 2 for ATAC (now should be non-zero)
+print(atac_coherence_results$plot_dist_spatial_for_graph_nn)
+print(atac_coherence_results$plot_sim_graph_for_spatial_nn)
+print(atac_coherence_results$plot_sim_graph_for_graph_nn)
+print(atac_coherence_results$plot_dist_graph_for_spatial_nn)
+print(atac_coherence_results$plot_spatial_coherence_metrics)
 ggsave("/projectnb/paxlab/phitro/CellWalkR2/R/figure/ATAC_plot_dist_spatial_for_graph_nn.png", plot = atac_coherence_results$plot_dist_spatial_for_graph_nn)
 ggsave("/projectnb/paxlab/phitro/CellWalkR2/R/figure/ATAC_plot_sim_graph_for_spatial_nn.png", plot = atac_coherence_results$plot_sim_graph_for_spatial_nn)
+ggsave("/projectnb/paxlab/phitro/CellWalkR2/R/figure/ATAC_plot_sim_graph_for_graph_nn.png", plot = atac_coherence_results$plot_sim_graph_for_graph_nn)
+ggsave("/projectnb/paxlab/phitro/CellWalkR2/R/figure/ATAC_plot_dist_graph_for_spatial_nn.png", plot = atac_coherence_results$plot_dist_graph_for_spatial_nn)
+ggsave("/projectnb/paxlab/phitro/CellWalkR2/R/figure/ATAC_plot_spatial_coherence_metrics.png", plot = atac_coherence_results$plot_spatial_coherence_metrics)
 head(atac_coherence_results$coherence_df)
 
 # --- Combine results for joint plotting (recommended for comparison) ---
@@ -2019,6 +2182,7 @@ p_joint_spatial_dist <- ggplot(combined_coherence_df, aes(x = median_spatial_dis
   theme_minimal() +
   theme(plot.title = element_text(hjust = 0.5))
 print(p_joint_spatial_dist)
+ggsave("/projectnb/paxlab/phitro/CellWalkR2/R/figure/p_joint_spatial_dist.png", plot = p_joint_spatial_dist)
 
 # Joint Density Plot: Median Graph Similarity for Spatial Neighbors (RNA vs ATAC)
 p_joint_graph_sim <- ggplot(combined_coherence_df, aes(x = median_graph_sim_of_spatial_neighbors, fill = modality)) +
@@ -2028,6 +2192,7 @@ p_joint_graph_sim <- ggplot(combined_coherence_df, aes(x = median_graph_sim_of_s
   theme_minimal() +
   theme(plot.title = element_text(hjust = 0.5))
 print(p_joint_graph_sim)
+ggsave("/projectnb/paxlab/phitro/CellWalkR2/R/figure/p_joint_graph_sim.png", plot = p_joint_graph_sim)
 
 # Optional: Scatter plot comparing the two metrics per cell, colored by modality
 p_scatter_metrics <- ggplot(combined_coherence_df, aes(x = median_spatial_dist_of_graph_neighbors, y = median_graph_sim_of_spatial_neighbors, color = modality)) +
@@ -2040,6 +2205,8 @@ p_scatter_metrics <- ggplot(combined_coherence_df, aes(x = median_spatial_dist_o
   theme_minimal() +
   theme(plot.title = element_text(hjust = 0.5))
 print(p_scatter_metrics)
+ggsave("/projectnb/paxlab/phitro/CellWalkR2/R/figure/p_scatter_metrics.png", plot = p_scatter_metrics)
+
 ```
 
 
