@@ -22,6 +22,7 @@ library(data.table)
 library(GenomicRanges)
 library(FNN)
 library(irlba)
+library(igraph)
 library(cowplot) # For plot_grid
 library(dplyr)   # For %>% and filter
 set.seed(123) # For reproducibility
@@ -749,8 +750,9 @@ preprocessSpatialMultiomics <- function(
 #'
 #' \code{createRNACellGraph()} computes a cell-to-cell similarity matrix based on
 #' PCA embeddings from a preprocessed Seurat object. This function extracts the
-#' PCA coordinates and directly computes a sparse K-nearest neighbors (KNN) graph
-#' representing cell-cell similarity for use in CellWalker, using `FNN::get.knn`.
+#' PCA coordinates and computes a sparse K-nearest neighbors (KNN) graph. 
+#' Similarity scores are calculated using a robust Gaussian kernel based on 
+#' the median neighbor distance.
 #'
 #' @param seurat_obj A Seurat object that has already undergone `NormalizeData`,
 #'                   `FindVariableFeatures`, `ScaleData`, and `RunPCA`.
@@ -765,11 +767,12 @@ preprocessSpatialMultiomics <- function(
 #'         if 0 or 1 cells remain after processing.
 #' @export
 createRNACellGraph <- function(seurat_obj, dims = 1:30, k_neighbors = 20) {
+  # --- 1. Initial Validation ---
   if (!is(seurat_obj, "Seurat")) {
     stop("Input 'seurat_obj' must be a Seurat object.")
   }
   
-  message("Computing RNA-based cell-cell KNN graph from Seurat object PCA embeddings...")
+  message("Computing RNA-based cell-cell KNN graph using Gaussian Kernel...")
 
   if (is.null(seurat_obj@reductions$pca)) {
     stop("Error: PCA has not been run on the provided Seurat object. Please ensure RunPCA is called.")
@@ -782,109 +785,80 @@ createRNACellGraph <- function(seurat_obj, dims = 1:30, k_neighbors = 20) {
     stop("Error: No principal components found in the Seurat object. Check PCA computation or if variable features were found.")
   }
 
+  # --- 2. Dimensionality Handling ---
   effective_dims <- dims[dims <= max_pcs_available]
 
   if (length(effective_dims) < 2) {
-    warning("Insufficient principal components (less than 2) available or selected for computing cell-cell similarity. Returning NULL graph.")
+    warning("Insufficient principal components (less than 2) available or selected. Returning NULL graph.")
     return(NULL) 
   }
   
   pca_embeddings <- pca_embeddings_full[, effective_dims, drop = FALSE]
 
+  # Failsafe: Check for non-finite values (NA, NaN, Inf)
   if (any(!is.finite(pca_embeddings))) {
-    warning("Non-finite values (NA, NaN, Inf) detected in PCA embeddings. This might be due to issues in ScaleData or RunPCA. Removing affected cells.")
+    warning("Non-finite values detected in PCA embeddings. Removing affected cells.")
     initial_nrow <- nrow(pca_embeddings)
     pca_embeddings <- na.omit(pca_embeddings)
     if (nrow(pca_embeddings) < initial_nrow) {
-      message("Removed ", initial_nrow - nrow(pca_embeddings), " cells with non-finite PCA embeddings. Remaining cells: ", nrow(pca_embeddings))
+      message("Removed ", initial_nrow - nrow(pca_embeddings), " cells. Remaining: ", nrow(pca_embeddings))
     }
+  }
+
+  # Failsafe: Check for zero variance in PCA (collapsed data)
+  pca_var <- apply(pca_embeddings, 2, var)
+  if (all(pca_var == 0)) {
+    stop("CRITICAL: PCA embeddings have zero variance. Check ScaleData/RunPCA steps.")
   }
 
   num_cells <- nrow(pca_embeddings)
   
+  # --- 3. Handle Small Datasets ---
   if (num_cells <= 1) {
-    message("Warning: Too few cells (<= 1) remaining for RNA-based cell graph computation. Returning empty or identity matrix.")
+    message("Warning: Too few cells (<= 1) for graph computation.")
     if (num_cells == 0) {
       return(Matrix::Matrix(0, 0, 0, sparse = TRUE, dimnames = list(NULL, NULL)))
-    } else { # num_cells == 1
+    } else { 
       return(Matrix::Matrix(1, 1, 1, sparse = TRUE, dimnames = list(rownames(pca_embeddings), rownames(pca_embeddings))))
     }
   }
 
+  # Adjust k_neighbors if it exceeds cell count
   if (k_neighbors >= num_cells) {
-    warning("'k_neighbors' (", k_neighbors, ") is greater than or equal to the number of cells (", num_cells, "). Setting k_neighbors to num_cells - 1.")
-    k_neighbors <- num_cells - 1
-    if (k_neighbors < 1) k_neighbors <- 1 
-  }
-  if (k_neighbors < 1) {
-    stop("Error: 'k_neighbors' must be at least 1 for KNN graph computation after adjustments.")
+    warning("'k_neighbors' (", k_neighbors, ") >= number of cells. Setting to num_cells - 1.")
+    k_neighbors <- max(1, num_cells - 1)
   }
 
+  # --- 4. KNN Computation ---
   message("  Computing k-nearest neighbors (k = ", k_neighbors, ") using FNN::get.knn...")
-  
   knn_result <- FNN::get.knn(pca_embeddings, k = k_neighbors)
   
   if (is.null(knn_result) || is.null(knn_result$nn.index) || is.null(knn_result$nn.dist)) {
-    stop("FNN::get.knn returned NULL or empty results (nn.index/nn.dist) for RNA graph.")
+    stop("FNN::get.knn returned NULL or empty results.")
   }
-  
-  adj_list_j_raw <- as.vector(knn_result$nn.index)
-  distances_raw <- as.vector(knn_result$nn.dist)
   
   adj_list_i_all <- rep(1:num_cells, each = k_neighbors)
+  adj_list_j_raw <- as.vector(knn_result$nn.index)
+  distances_raw <- as.vector(knn_result$nn.dist)
 
-  initial_valid_entries <- !is.na(adj_list_j_raw) & adj_list_j_raw > 0 & adj_list_j_raw <= num_cells & 
-                           is.finite(distances_raw) & distances_raw >= 0 
-                           
-  adj_list_i <- adj_list_i_all[initial_valid_entries]
-  adj_list_j <- adj_list_j_raw[initial_valid_entries]
-  distances <- distances_raw[initial_valid_entries]
-
-  if (length(adj_list_i) == 0) {
-      message("  WARNING RNA: No valid neighbors found after initial filtering FNN results. Returning an empty sparse matrix.")
-      return(Matrix::Matrix(0, num_cells, num_cells, sparse = TRUE, dimnames = list(rownames(pca_embeddings), rownames(pca_embeddings))))
-  }
+  # --- 5. Robust Similarity Logic (Gaussian Kernel) ---
+  # We use the median distance as our bandwidth (sigma). 
+  # This adapts the similarity decay to the local density of the data.
+  sigma <- median(distances_raw, na.rm = TRUE)
+  if (sigma <= 0) sigma <- max(distances_raw, na.rm = TRUE) # Fallback for low-variance data
+  if (sigma <= 0) sigma <- 1 # Final absolute fallback to prevent division by zero
   
-  max_dist_in_knn <- max(distances, na.rm=TRUE) 
+  # Formula: exp(-d^2 / (2 * sigma^2))
+  similarity <- exp(- (distances_raw^2) / (2 * sigma^2))
 
-  if (max_dist_in_knn <= 0 || !is.finite(max_dist_in_knn)) { 
-    similarity <- rep(1, length(distances)) 
-    message("  DEBUG RNA: max_dist_in_knn was problematic (<=0 or non-finite), setting all similarities to 1.")
-  } else {
-    similarity <- 1 - (distances / max_dist_in_knn)
-  }
+  # --- 6. Sparse Matrix Construction ---
+  # Only keep valid indices and similarities
+  valid_entries <- !is.na(adj_list_j_raw) & adj_list_j_raw > 0 & is.finite(similarity)
   
-  similarity[similarity < 0] <- 0
-  similarity[similarity > 1] <- 1
-  
-  final_similarity_valid_idx <- which(is.finite(similarity) & similarity > 0)
-  
-  if (length(final_similarity_valid_idx) == 0) {
-      message("  WARNING RNA: No positive similarities after final filtering. Returning an empty sparse matrix.")
-      return(Matrix::Matrix(0, num_cells, num_cells, sparse = TRUE, dimnames = list(rownames(pca_embeddings), rownames(pca_embeddings))))
-  }
-
-  adj_list_i <- adj_list_i[final_similarity_valid_idx]
-  adj_list_j <- adj_list_j[final_similarity_valid_idx]
-  similarity <- similarity[final_similarity_valid_idx]
-  
-  if (!is.integer(adj_list_i)) adj_list_i <- as.integer(adj_list_i)
-  if (!is.integer(adj_list_j)) adj_list_j <- as.integer(adj_list_j)
-
-  if(any(is.na(adj_list_i)) || any(adj_list_i < 1) || any(adj_list_i > num_cells)) {
-       stop("CRITICAL RNA: Invalid row indices (NA/out-of-bounds) detected right before sparseMatrix construction!")
-  }
-  if(any(is.na(adj_list_j)) || any(adj_list_j < 1) || any(adj_list_j > num_cells)) {
-       stop("CRITICAL RNA: Invalid col indices (NA/out-of-bounds) detected right before sparseMatrix construction!")
-  }
-  if(any(is.na(similarity)) || any(!is.finite(similarity)) || any(similarity <= 0) || any(similarity > 1)) {
-       stop("CRITICAL RNA: Invalid similarity values (NA/non-finite/out-of-range) detected right before sparseMatrix construction!")
-  }
-
   rna_cell_graph_init <- Matrix::sparseMatrix(
-    i = adj_list_i,
-    j = adj_list_j,
-    x = similarity,
+    i = adj_list_i_all[valid_entries],
+    j = adj_list_j_raw[valid_entries],
+    x = similarity[valid_entries],
     dims = c(num_cells, num_cells),
     dimnames = list(rownames(pca_embeddings), rownames(pca_embeddings)),
     giveCsparse = TRUE 
@@ -893,7 +867,8 @@ createRNACellGraph <- function(seurat_obj, dims = 1:30, k_neighbors = 20) {
   # Ensure diagonal is 1
   diag(rna_cell_graph_init) <- 1
 
-  # Robust Symmetrization using triplets
+  # --- 7. Robust Symmetrization ---
+  message("  Symmetrizing graph using max rule...")
   rna_triplets <- summary(rna_cell_graph_init)
 
   combined_triplets_df <- data.frame(
@@ -903,7 +878,7 @@ createRNACellGraph <- function(seurat_obj, dims = 1:30, k_neighbors = 20) {
   )
 
   if (!requireNamespace("data.table", quietly = TRUE)) {
-    message("  WARNING: Package 'data.table' is recommended for performance but not installed. Using base R 'aggregate' for symmetrization (slower).")
+    message("  WARNING: Package 'data.table' not installed. Using base R (slower).")
     symmetric_edges <- aggregate(x ~ i + j, data = combined_triplets_df, FUN = max)
   } else {
     data.table::setDT(combined_triplets_df)
@@ -919,7 +894,7 @@ createRNACellGraph <- function(seurat_obj, dims = 1:30, k_neighbors = 20) {
     giveCsparse = TRUE 
   )
   
-  message("RNA-based KNN cell graph created using ", length(effective_dims), " PCs. Graph dimensions: ", paste(dim(rna_cell_graph), collapse = "x"))
+  message("RNA Graph created using Gaussian Kernel. Non-zero entries: ", Matrix::nnzero(rna_cell_graph))
   return(rna_cell_graph)
 }
 
@@ -1694,7 +1669,119 @@ assessSpatialGraphCoherenceOverall <- function(feature_graph, feature_matrix_for
       median_graph_sim_of_graph_neighbors_vec[median_graph_sim_results_of_graph_nn$query_cell_idx] <- median_graph_sim_results_of_graph_nn$median_graph_sim
   }
 
-
+  
+  # Create cached igraph object for (optional) weighted shortest paths
+  # Build igraph once; keep as weighted graph where weight = 1 / (similarity + eps)
+  # This makes larger similarity correspond to smaller path cost.
+  eps_for_weight <- 1e-8
+  # Copy feature_graph (sparse) and compute weights vector for edges
+  sg <- feature_graph
+  # Avoid altering original feature_graph
+  sg_nz <- Matrix::summary(sg)  # i, j, x
+  if (nrow(sg_nz) == 0) {
+    message("Warning: feature_graph has no edges; weighted shortest-paths will not be used.")
+    igraph_graph_cached <- NULL
+  } else {
+    # edge weights as cost = 1 / (sim + eps) so stronger sim => lower cost
+    edge_costs <- 1 / (sg_nz$x + eps_for_weight)
+    # create igraph from edge list (undirected)
+    igraph_graph_cached <- igraph::graph_from_data_frame(
+      d = data.frame(from = sg_nz$i, to = sg_nz$j, weight = edge_costs),
+      directed = FALSE,
+      vertices = data.frame(name = seq_len(num_cells))
+    )
+    # Remove self loops if any
+    igraph_graph_cached <- igraph::simplify(igraph_graph_cached, remove.multiple = TRUE, remove.loops = TRUE,
+                                           edge.attr.comb = list(weight = "min"))
+  }
+  # Note: igraph_graph_cached vertex ids correspond to integer indices 1..num_cells
+  
+  # ---- Extra igraph QC statistics (run once after igraph_graph_cached is built) ----
+  if (!is.null(igraph_graph_cached)) {
+    # Basic graph sizes
+    n_nodes_igraph <- igraph::vcount(igraph_graph_cached)
+    n_edges_igraph <- igraph::ecount(igraph_graph_cached)
+  
+    # Sparsity (edge density)
+    graph_density_val <- igraph::edge_density(igraph_graph_cached, loops = FALSE) # edges / possible edges
+  
+    # Degree statistics (use integer degree)
+    degs <- igraph::degree(igraph_graph_cached, mode = "all")
+    deg_summary <- quantile(degs, probs = c(0, 0.01, 0.05, 0.25, 0.5, 0.75, 0.95, 0.99, 1), na.rm = TRUE)
+    mean_deg <- mean(degs, na.rm = TRUE)
+    median_deg <- median(degs, na.rm = TRUE)
+    max_deg <- max(degs, na.rm = TRUE)
+  
+    # Proportion of isolated nodes (degree == 0)
+    prop_isolated <- sum(degs == 0, na.rm = TRUE) / length(degs)
+  
+    # Connected component summary (on undirected graph)
+    comps <- igraph::components(igraph_graph_cached, mode = "weak")
+    n_components <- comps$no
+    comp_sizes <- sort(comps$csize, decreasing = TRUE)
+    largest_comp_frac <- if (length(comp_sizes) > 0) comp_sizes[1] / n_nodes_igraph else NA_real_
+  
+    # Approximate average path length & diameter only on largest component (compute on subgraph)
+    # For large graphs, computing diameter/avg path length on entire graph is expensive. Do it on largest component only, with a cap.
+    avg_path_length_lg <- NA_real_
+    diameter_lg <- NA_real_
+    largest_comp_threshold <- 5000  # adjust if you can afford bigger
+    if (!is.na(largest_comp_frac) && comp_sizes[1] <= largest_comp_threshold) {
+      largest_vids <- which(comps$membership == which.max(comps$csize))
+      subg <- igraph::induced_subgraph(igraph_graph_cached, vids = largest_vids)
+      # average path length (use unweighted or weighted as desired); here use weighted if weights exist
+      if (!is.null(igraph::E(subg)$weight)) {
+        avg_path_length_lg <- suppressWarnings(igraph::average.path.length(subg, directed = FALSE, weights = igraph::E(subg)$weight))
+        diameter_lg <- suppressWarnings(igraph::diameter(subg, directed = FALSE, weights = igraph::E(subg)$weight))
+      } else {
+        avg_path_length_lg <- suppressWarnings(igraph::average.path.length(subg, directed = FALSE))
+        diameter_lg <- suppressWarnings(igraph::diameter(subg, directed = FALSE))
+      }
+    } else {
+      message("Skipping avg path length / diameter on largest component: size = ", ifelse(length(comp_sizes)>0, comp_sizes[1], NA), " > threshold (", largest_comp_threshold, ").")
+    }
+  
+    # Clustering coefficient (transitivity) global
+    transitivity_global <- suppressWarnings(igraph::transitivity(igraph_graph_cached, type = "global"))
+  
+    # Assortativity by degree
+    assort_deg <- tryCatch({
+      igraph::assortativity_degree(igraph_graph_cached, directed = FALSE)
+    }, error = function(e) NA_real_)
+  
+    # Save a compact diagnostics list in the environment for later use (or attach to return)
+    igraph_qc <- list(
+      n_nodes = n_nodes_igraph,
+      n_edges = n_edges_igraph,
+      density = graph_density_val,
+      mean_degree = mean_deg,
+      median_degree = median_deg,
+      max_degree = max_deg,
+      degree_quantiles = deg_summary,
+      prop_isolated = prop_isolated,
+      n_components = n_components,
+      largest_component_size = ifelse(length(comp_sizes)>0, comp_sizes[1], NA_integer_),
+      largest_component_fraction = largest_comp_frac,
+      avg_path_length_largest = avg_path_length_lg,
+      diameter_largest = diameter_lg,
+      transitivity = transitivity_global,
+      assortativity_degree = assort_deg
+    )
+  
+    # Print concise summary to console
+    message("igraph QC: nodes=", igraph_qc$n_nodes,
+            " edges=", igraph_qc$n_edges,
+            " density=", signif(igraph_qc$density, 3),
+            " mean_deg=", signif(igraph_qc$mean_degree, 3),
+            " median_deg=", igraph_qc$median_degree,
+            " prop_isolated=", signif(igraph_qc$prop_isolated, 3),
+            " n_components=", igraph_qc$n_components,
+            " largest_comp_frac=", signif(igraph_qc$largest_component_fraction, 3))
+  } else {
+    message("igraph_graph_cached is NULL; skipping igraph QC statistics.")
+  }
+  
+  
   message("  Calculating median graph similarities and graph distances for spatial neighbors...")
   
   all_spatial_nn_results <- RANN::nn2(data = spatial_coords_mat, k = k_neighbors + 1)
@@ -1721,15 +1808,112 @@ assessSpatialGraphCoherenceOverall <- function(feature_graph, feature_matrix_for
       
       median_graph_sim_of_spatial_neighbors_vec[i] <- median(graph_sim_to_spatial_nn_cosine, na.rm=TRUE)
 
-      # Metric 4: Graph Distance to Spatial Neighbors (using feature_graph similarity)
-      graph_sim_to_spatial_nn_from_graph <- feature_graph[current_cell_id, cell_ids[spatial_nn_indices]]
+      # # Metric 4: SAFE graph similarity -> graph distance
+      # # Try to extract the vector of similarities from the sparse matrix. Access by integer indices:
+      # # This returns a sparse 1 x k sparse matrix; coerce to numeric vector
+      # sim_vec <- tryCatch({
+      #   as.numeric(feature_graph[i, spatial_nn_indices, drop = TRUE])
+      # }, error = function(e) {
+      #   # fallback: extract via summary + lookup (slower but robust)
+      #   tmp <- Matrix::summary(feature_graph[i, , drop = TRUE])
+      #   # tmp$j gives neighbor column indices, tmp$x gives values
+      #   mapped <- rep(0, length(spatial_nn_indices))
+      #   if (nrow(tmp) > 0) {
+      #     idx_map <- setNames(tmp$x, tmp$j)
+      #     present <- intersect(as.character(spatial_nn_indices), names(idx_map))
+      #     if (length(present) > 0) {
+      #       mapped[match(as.integer(present), spatial_nn_indices)] <- as.numeric(idx_map[present])
+      #     }
+      #   }
+      #   mapped
+      # })
+      # 
+      # # Interpret missing/zero similarities as "no direct connection".
+      # # If you want direct similarity distance: dist = 1 - sim (clamped 0..1)
+      # graph_dist_to_spatial_nn <- 1 - sim_vec
+      # graph_dist_to_spatial_nn[is.na(graph_dist_to_spatial_nn)] <- 1      # missing => max distance
+      # graph_dist_to_spatial_nn[graph_dist_to_spatial_nn < 0] <- 0
+      # graph_dist_to_spatial_nn[graph_dist_to_spatial_nn > 1] <- 1
+      #
+      # median_graph_dist_of_spatial_neighbors_vec[i] <- median(graph_dist_to_spatial_nn, na.rm = TRUE)
+
+      # New Metric 4: weighted shortest-path to spatial neighbors (fall back to direct 1 - sim)
+      # Attempt weighted shortest-paths (Dijkstra) from node i to the small set of spatial_nn_indices.
+      # This is efficient because we only request distances to k targets (k small).
+      graph_dist_vals <- rep(NA_real_, length(spatial_nn_indices))
+
+      # First, try to compute shortest paths using igraph (weighted)
+      if (!is.null(igraph_graph_cached)) {
+        # igraph uses vertex sequence as numeric or names; our vertices are 1..num_cells
+        # Use igraph::distances with v = i and to = spatial_nn_indices, weights = E(igraph)$weight
+        # wrap in tryCatch to handle potential memory/time issues
+        sp_try <- tryCatch({
+          # distances returns 1 x length(targets) numeric matrix
+          spd <- igraph::distances(igraph_graph_cached, v = as.character(i), to = as.character(spatial_nn_indices), weights = igraph::E(igraph_graph_cached)$weight)
+          as.numeric(spd)
+        }, error = function(e) {
+          # fallback signal
+          NULL
+        }, warning = function(w) {
+          NULL
+        })
+
+        if (!is.null(sp_try)) {
+          # sp_try contains numeric distances; Inf for unreachable
+          # Map Inf -> NA for now
+          sp_try[is.infinite(sp_try)] <- NA_real_
+          # We normalized later; but to keep range comparable to direct (0..1), we convert weighted cost to a pseudo-distance in [0,1]
+          # Compute per-cell normalization: find finite spd and scale by (max finite spd) if >0
+          if (all(is.na(sp_try))) {
+            # all unreachable via weighted paths; leave as NA and fallback below
+            graph_dist_vals[] <- NA_real_
+          } else {
+            # normalize by max finite spd for this source; ensures 0..1
+            finite_max <- max(sp_try, na.rm = TRUE)
+            if (finite_max == 0) {
+              graph_dist_vals <- rep(0, length(sp_try))
+            } else {
+              graph_dist_vals <- sp_try / finite_max
+            }
+          }
+        }
+      }
+
+      # If igraph failed OR yielded only NA (unreachable), fallback to direct edge-based distance: 1 - similarity
+      if (all(is.na(graph_dist_vals))) {
+        # Fast direct extraction of similarities from sparse matrix (dgCMatrix supports integer indexing)
+        sim_vec <- tryCatch({
+          as.numeric(feature_graph[i, spatial_nn_indices, drop = TRUE])
+        }, error = function(e) {
+          # robust fallback via summary lookup for this row
+          tmp <- Matrix::summary(feature_graph[i, , drop = TRUE])
+          mapped <- rep(0, length(spatial_nn_indices))
+          if (nrow(tmp) > 0) {
+            idx_map <- setNames(tmp$x, tmp$j)
+            present <- intersect(as.character(spatial_nn_indices), names(idx_map))
+            if (length(present) > 0) {
+              mapped[match(as.integer(present), spatial_nn_indices)] <- as.numeric(idx_map[present])
+            }
+          }
+          mapped
+        })
+
+        # compute direct distance and clamp
+        direct_dist <- 1 - sim_vec
+        direct_dist[is.na(direct_dist)] <- 1   # treat missing/no-edge as max distance
+        direct_dist[direct_dist < 0] <- 0
+        direct_dist[direct_dist > 1] <- 1
+
+        graph_dist_vals <- direct_dist
+      }
+
+      # Final assignment: median graph distance for this cell (use na.rm; if all NA then set NA)
+      if (all(is.na(graph_dist_vals))) {
+        median_graph_dist_of_spatial_neighbors_vec[i] <- NA_real_
+      } else {
+        median_graph_dist_of_spatial_neighbors_vec[i] <- median(graph_dist_vals, na.rm = TRUE)
+      }
       
-      graph_dist_to_spatial_nn <- 1 - graph_sim_to_spatial_nn_from_graph
-      graph_dist_to_spatial_nn[graph_dist_to_spatial_nn < 0] <- 0
-      graph_dist_to_spatial_nn[graph_dist_to_spatial_nn > 1] <- 1
-
-      median_graph_dist_of_spatial_neighbors_vec[i] <- median(graph_dist_to_spatial_nn, na.rm=TRUE)
-
     } else {
       # These will remain NA_real_ as initialized
     }
@@ -1888,7 +2072,7 @@ assessSpatialGraphCoherenceOverall <- function(feature_graph, feature_matrix_for
       # If plot_data_long_normalized is empty or all plot_color_value are NA, it will remain the default empty plot
       if (nrow(plot_data_long_normalized) > 0 && !all(is.na(plot_data_long_normalized$plot_color_value))) {
           p_spatial_metrics <- ggplot(plot_data_long_normalized, aes(x = x, y = y, color = plot_color_value)) +
-            geom_point(size = 0.2, alpha = 0.6) +
+            geom_point(size = 0.1, alpha = 0.6) +
             facet_wrap(~metric_type, ncol = 3) +
             scale_color_viridis_c(
               option = "viridis",
@@ -1908,14 +2092,22 @@ assessSpatialGraphCoherenceOverall <- function(feature_graph, feature_matrix_for
 
   message("Overall spatial-graph coherence assessment complete for ", modality_name, ".")
 
-  return(list(
+  out_list <- list(
     coherence_df = coherence_df,
     plot_dist_spatial_for_graph_nn = plot_dist_spatial_for_graph_nn,
     plot_sim_graph_for_spatial_nn = plot_sim_graph_for_spatial_nn,
     plot_sim_graph_for_graph_nn = plot_sim_graph_for_graph_nn,
     plot_dist_graph_for_spatial_nn = plot_dist_graph_for_spatial_nn,
-    plot_spatial_coherence_metrics = p_spatial_metrics 
-  ))
+    plot_spatial_coherence_metrics = p_spatial_metrics
+  )
+
+  if (exists("igraph_qc")) {
+    out_list$igraph_qc <- igraph_qc
+  } else {
+    out_list$igraph_qc <- NULL
+  }
+
+  return(out_list)
 }
 ```
 
