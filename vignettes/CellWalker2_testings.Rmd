@@ -25,6 +25,7 @@ library(irlba)
 library(igraph)
 library(cowplot) # For plot_grid
 library(dplyr)   # For %>% and filter
+library(future.apply)
 set.seed(123) # For reproducibility
 ```
 
@@ -1423,9 +1424,6 @@ plot_spatial_rna_atac <- function(rna_spatial_coords_df, atac_spatial_coords_df,
 plotSpatialGraphCoherence <- function(combined_rna_atac_graph, rna_spatial_coords_df, 
                                       n_query_cells = 5, k_neighbors_to_show = 10,
                                       background_alpha = 0.05, neighbor_pt_size = 1.8, query_pt_size = 3.5) {
-  if (!requireNamespace("RANN", quietly = TRUE)) {
-    stop("Package 'RANN' is required for spatial coherence plotting. Please install it with install.packages('RANN')")
-  }
   if (nrow(rna_spatial_coords_df) == 0 || nrow(combined_rna_atac_graph) == 0) {
     message("No cells available for plotting spatial graph coherence.")
     return(ggplot() + annotate("text", x = 0.5, y = 0.5, label = "No data to plot") + theme_void())
@@ -1541,18 +1539,19 @@ plotSpatialGraphCoherence <- function(combined_rna_atac_graph, rna_spatial_coord
 }
 
 
-#' Assess Overall Spatial-Graph Coherence
+#' Assess Overall Spatial-Graph Coherence (Revised)
 #'
 #' \code{assessSpatialGraphCoherenceOverall()} quantifies and visualizes the global coherence
 #' between feature-based cell similarity graphs and spatial proximity for a given modality.
-#' For each cell, it calculates four key metrics:
-#' \itemize{
-#'   \item{\strong{Median Spatial Distance to Feature-Graph Neighbors (MSD-FGN):}} For each cell, this metric finds its `k` nearest neighbors based on feature similarity (from the `feature_graph`). It then calculates the median *Euclidean spatial distance* to these `k` feature-similar cells. A \strong{lower} median distance indicates that cells that are transcriptionally/epigenetically similar tend to be spatially close, suggesting good spatial preservation of feature similarity.
-#'   \item{\strong{Median Feature-Graph Similarity to Spatial Neighbors (MFS-SN):}} For each cell, this metric finds its `k` nearest neighbors based on *spatial proximity*. It then calculates the median *cosine similarity* (using `feature_matrix_for_similarity`) between the query cell and these `k` spatially close neighbors. A \strong{higher} median similarity indicates that spatially adjacent cells also tend to be transcriptionally/epigenetically similar, suggesting that spatial proximity reflects feature similarity in the raw data.
-#'   \item{\strong{Median Feature-Graph Similarity to Feature-Graph Neighbors (MFS-FGN):}} For each cell, this metric finds its `k` nearest neighbors based on *feature similarity* (from the `feature_graph`). It then calculates the median of the actual *feature similarity scores* (from the `feature_graph` itself) to these `k` feature-similar cells. This serves as a sanity check: a \strong{higher} median similarity indicates that the `feature_graph` is indeed connecting highly similar cells in feature space, validating the graph construction process itself.
-#'   \item{\strong{Median Feature-Graph Distance to Spatial Neighbors (MFD-SN):}} For each cell, this metric finds its `k` nearest neighbors based on *spatial proximity*. It then calculates the median *feature-graph distance* (derived as `1 - similarity` from the `feature_graph`) between the query cell and these `k` spatially close neighbors. A \strong{lower} median graph distance (meaning higher graph similarity) indicates that spatially adjacent cells are also strongly connected in the feature-based graph, reinforcing that spatial proximity corresponds to feature-based graph connectivity.
-#'   \item{\strong{Combined Coherence Score (CCS):}} This composite score combines the two primary distance-based metrics (MSD-FGN and MFD-SN) into a single value where a \strong{higher} score indicates better overall spatial-feature coherence. Each component metric is min-max normalized (0-1), then transformed so that higher values imply "better coherence" (e.g., `1 - normalized_distance`), and finally averaged.
-#' }
+#' This version emphasizes speed and robustness for large sparse graphs (~50k cells) and:
+#' - Computes Median Spatial Distance to Feature-Graph Neighbors (MSD-FGN) using the top-k
+#'   neighbors from the provided feature_graph (symmetrized).
+#' - Computes Median Feature Similarity to Spatial Neighbors (MFS-SN) using cosine similarity
+#'   on the provided feature matrix (fast per-cell dot-products with precomputed norms).
+#' - Computes Median Feature Similarity to Feature-Graph Neighbors (MFS-FGN) as a sanity check.
+#' - Computes Median Feature-Graph Distance to Spatial Neighbors (MFD-SN) using direct similarity
+#'   from the feature_graph (reverted to simpler, known-working logic).
+#' - All per-cell heavy work runs in parallel batches via future.apply.
 #'
 #' @param feature_graph A sparse matrix (cells x cells) representing feature-based
 #'   cell-to-cell similarities (e.g., RNA graph or ATAC graph). Rownames/Colnames must be cell IDs.
@@ -1563,387 +1562,298 @@ plotSpatialGraphCoherence <- function(combined_rna_atac_graph, rna_spatial_coord
 #'   Rownames must be cell IDs and match those in `feature_graph`.
 #' @param k_neighbors Integer, the number of nearest neighbors to consider for coherence assessment.
 #' @param modality_name Character string (e.g., "RNA", "ATAC") for labeling results and plots.
+#' @param n_workers Integer, number of parallel workers. NULL defaults to detectCores() - 1.
+#' @param batch_size Integer, batch size for parallel processing.
+#' @param n_pca_embed Integer, number of PCA dimensions for embedding features. Set NA or 0 to skip.
 #' @return A list containing:
 #'   \itemize{
 #'     \item `coherence_df`: A data.frame with metrics for each cell.
 #'     \item `plot_dist_spatial_for_graph_nn`: ggplot object for MSD-FGN density.
 #'     \item `plot_sim_graph_for_spatial_nn`: ggplot object for MFS-SN density.
 #'     \item `plot_sim_graph_for_graph_nn`: ggplot object for MFS-FGN density.
-#'     \item `plot_dist_graph_for_spatial_nn`: ggplot object for MFD-SN density.
+#'     \item `plot_dist_graph_for_spatial_nn`: ggplot object for MFD-SN density (direct sim approx).
 #'     \item `plot_spatial_coherence_metrics`: ggplot object with spatial subplots for all metrics.
+#'     \item `diagnostics`: List containing computational diagnostics.
 #'   }
 #' @export
-assessSpatialGraphCoherenceOverall <- function(feature_graph, feature_matrix_for_similarity, spatial_coords_df, k_neighbors = 10, modality_name = "Modality") {
-
-  # --- 1. Input Validation and Alignment ---
-  if (!is(feature_graph, "Matrix")) { stop("`feature_graph` must be a sparse matrix (e.g., dgCMatrix).") }
-  if (!is(feature_matrix_for_similarity, "Matrix")) { stop("`feature_matrix_for_similarity` must be a sparse matrix (e.g., dgCMatrix).") }
-  if (!is.data.frame(spatial_coords_df) || ncol(spatial_coords_df) < 2) { stop("`spatial_coords_df` must be a data.frame with at least two columns (x, y).") }
+assessSpatialGraphCoherenceOverall <- function(
+  feature_graph,
+  feature_matrix_for_similarity,
+  spatial_coords_df,
+  k_neighbors = 10,
+  modality_name = "Modality",
+  n_workers = NULL,        # number of parallel workers; NULL -> auto (detectCores - 1)
+  batch_size = 1000L,      # batch size for parallel processing
+  n_pca_embed = 50L        # set NA to skip PCA embedding
+) {
+  
+  # --- Dependencies check ---
+  if (!requireNamespace("Matrix", quietly = TRUE)) stop("Install 'Matrix'.")
+  if (!requireNamespace("RANN", quietly = TRUE)) stop("Install 'RANN'.")
+  if (!requireNamespace("data.table", quietly = TRUE)) stop("Install 'data.table'.")
+  if (!requireNamespace("future.apply", quietly = TRUE)) stop("Install 'future.apply'.")
+  # irlba optional for PCA embedding
+  use_irlba <- requireNamespace("irlba", quietly = TRUE)
+  
+  # --- Input validation ---
+  if (!is(feature_graph, "Matrix")) stop("`feature_graph` must be a sparse Matrix (e.g., dgCMatrix).")
+  if (!is(feature_matrix_for_similarity, "Matrix")) stop("`feature_matrix_for_similarity` must be a sparse Matrix (e.g., dgCMatrix).")
+  if (!is.data.frame(spatial_coords_df) || ncol(spatial_coords_df) < 2) stop("`spatial_coords_df` must be a data.frame with at least two columns (x,y).")
   if (is.null(rownames(feature_graph)) || is.null(rownames(spatial_coords_df)) || is.null(colnames(feature_matrix_for_similarity))) {
-    stop("All input matrices/data.frames must have cell IDs (rownames for graphs/spatial, colnames for feature matrix).")
+    stop("All inputs must have matching cell IDs (rownames for graph/spatial, colnames for feature matrix).")
   }
   
+  # Align cell sets
   graph_cell_ids <- rownames(feature_graph)
   spatial_cell_ids <- rownames(spatial_coords_df)
   feature_cell_ids <- colnames(feature_matrix_for_similarity)
-
   common_cells <- Reduce(intersect, list(graph_cell_ids, spatial_cell_ids, feature_cell_ids))
-  
-  if (length(common_cells) == 0) {
-    stop("No common cell IDs found across `feature_graph`, `feature_matrix_for_similarity`, and `spatial_coords_df`. Check data integrity.")
-  }
+  if (length(common_cells) == 0) stop("No common cell IDs found across inputs.")
   if (length(common_cells) < nrow(feature_graph) || length(common_cells) < nrow(spatial_coords_df) || length(common_cells) < ncol(feature_matrix_for_similarity)) {
-    message("Warning: Some cells are not common across all inputs. Subsetting to ", length(common_cells), " common cells.")
+    message("Warning: Subsetting to ", length(common_cells), " common cells.")
   }
-
   feature_graph <- feature_graph[common_cells, common_cells, drop = FALSE]
   spatial_coords_df <- spatial_coords_df[common_cells, , drop = FALSE]
   feature_matrix_for_similarity <- feature_matrix_for_similarity[, common_cells, drop = FALSE]
-  
   num_cells <- nrow(feature_graph)
-  cell_ids <- rownames(feature_graph) # Now aligned and consistent
-
+  cell_ids <- rownames(feature_graph)
+  
   if (num_cells <= 1) {
-    message("Too few cells (<= 1) to assess spatial-graph coherence for ", modality_name, ". Returning empty results.")
+    message("Too few cells to compute coherence. Returning empty result.")
+    empty_plots <- function() ggplot2::ggplot() + ggplot2::annotate("text", x = 0.5, y = 0.5, label = "No data") + ggplot2::theme_void()
     return(list(
-      coherence_df = data.frame(cell_id = character(0), modality = character(0),
-                                median_spatial_dist_of_graph_neighbors = numeric(0),
-                                median_graph_sim_of_spatial_neighbors = numeric(0),
-                                median_graph_sim_of_graph_neighbors = numeric(0),
-                                median_graph_dist_of_spatial_neighbors = numeric(0),
-                                combined_coherence_score = numeric(0)), 
-      plot_dist_spatial_for_graph_nn = ggplot() + annotate("text", x = 0.5, y = 0.5, label = "No data") + theme_void(),
-      plot_sim_graph_for_spatial_nn = ggplot() + annotate("text", x = 0.5, y = 0.5, label = "No data") + theme_void(),
-      plot_sim_graph_for_graph_nn = ggplot() + annotate("text", x = 0.5, y = 0.5, label = "No data") + theme_void(),
-      plot_dist_graph_for_spatial_nn = ggplot() + annotate("text", x = 0.5, y = 0.5, label = "No data") + theme_void(),
-      plot_spatial_coherence_metrics = ggplot() + annotate("text", x = 0.5, y = 0.5, label = "No data") + theme_void()
+      coherence_df = data.frame(cell_id = character(0), modality = character(0)),
+      plot_dist_spatial_for_graph_nn = empty_plots(),
+      plot_sim_graph_for_spatial_nn = empty_plots(),
+      plot_sim_graph_for_graph_nn = empty_plots(),
+      plot_dist_graph_for_spatial_nn = empty_plots(),
+      plot_spatial_coherence_metrics = empty_plots(),
+      diagnostics = list(note = "Too few cells")
     ))
   }
-
+  
   if (k_neighbors >= num_cells) {
-    warning("`k_neighbors` (", k_neighbors, ") is greater than or equal to the number of cells (", num_cells, "). Adjusting `k_neighbors` to num_cells - 1.")
+    warning("k_neighbors >= num_cells; adjusting to num_cells - 1")
     k_neighbors <- max(1, num_cells - 1)
   }
   if (k_neighbors == 0) {
-      stop("`k_neighbors` must be at least 1 after adjustments for coherence assessment.")
+      stop("k_neighbors must be at least 1 after adjustments for coherence assessment.")
   }
-
-  message("Assessing overall spatial-graph coherence for ", modality_name, " with k = ", k_neighbors, "...")
-
-  # Pre-calculate spatial matrix for RANN and distance calculations
+  
+  # --- Parallel plan ---
+  if (is.null(n_workers)) {
+    n_workers <- max(1L, parallel::detectCores() - 1L)
+  } else {
+    n_workers <- as.integer(n_workers)
+    if (n_workers < 1L) n_workers <- 1L
+  }
+  old_plan <- future::plan()
+  options(future.globals.maxSize = +Inf)
+  future::plan(future::multisession, workers = n_workers)
+  on.exit(try(future::plan(old_plan), silent = TRUE), add = TRUE)
+  
+  message("Assessing spatial-graph coherence for ", modality_name, " (n_cells=", num_cells, ", k=", k_neighbors, ", workers=", n_workers, ")")
+  
+  # --- Prepare spatial matrix and precompute norms for cosine ---
   spatial_coords_mat <- as.matrix(spatial_coords_df[, c("x", "y")])
-
-  # Pre-calculate L2 norms for `feature_matrix_for_similarity` columns to optimize cosine similarity
+  # Precompute norms for feature matrix (columns are cells)
   feature_matrix_norms <- sqrt(Matrix::colSums(feature_matrix_for_similarity * feature_matrix_for_similarity))
-
-  # Initialize vectors to store results (ensure they are named correctly)
-  median_spatial_dist_of_graph_neighbors_vec <- rep(NA_real_, num_cells) # Use NA_real_ to ensure numeric type
-  median_graph_sim_of_spatial_neighbors_vec <- rep(NA_real_, num_cells)
-  median_graph_sim_of_graph_neighbors_vec <- rep(NA_real_, num_cells) 
-  median_graph_dist_of_spatial_neighbors_vec <- rep(NA_real_, num_cells) 
-
-  message("  Calculating median spatial distances and graph similarities for graph neighbors (vectorized)...")
   
-  graph_summary_dt <- as.data.table(Matrix::summary(feature_graph))
-  data.table::setnames(graph_summary_dt, old = c("i", "j"), new = c("query_cell_idx", "neighbor_cell_idx"))
-  graph_summary_dt <- graph_summary_dt[query_cell_idx != neighbor_cell_idx]
-
-  if (nrow(graph_summary_dt) == 0) {
-      warning("No non-self-loop edges found in feature_graph. Metrics for graph neighbors will be NA.")
-  } else {
-      x1 <- spatial_coords_mat[graph_summary_dt$query_cell_idx, 1]
-      y1 <- spatial_coords_mat[graph_summary_dt$query_cell_idx, 2]
-      x2 <- spatial_coords_mat[graph_summary_dt$neighbor_cell_idx, 1]
-      y2 <- spatial_coords_mat[graph_summary_dt$neighbor_cell_idx, 2]
-      
-      graph_summary_dt[, spatial_distance := sqrt((x1 - x2)^2 + (y1 - y2)^2)]
-      
-      graph_neighbors_ranked <- graph_summary_dt[, head(.SD[order(-x)], k_neighbors), by = query_cell_idx]
-      
-      median_spatial_results <- graph_neighbors_ranked[, .(median_dist = median(spatial_distance, na.rm=TRUE)), by = query_cell_idx]
-      median_graph_sim_results_of_graph_nn <- graph_neighbors_ranked[, .(median_graph_sim = median(x, na.rm=TRUE)), by = query_cell_idx]
-      
-      # Map Metric 1 results back
-      median_spatial_dist_of_graph_neighbors_vec[median_spatial_results$query_cell_idx] <- median_spatial_results$median_dist
-      # Map Metric 3 results back
-      median_graph_sim_of_graph_neighbors_vec[median_graph_sim_results_of_graph_nn$query_cell_idx] <- median_graph_sim_results_of_graph_nn$median_graph_sim
-  }
-
-  
-  # Create cached igraph object for (optional) weighted shortest paths
-  # Build igraph once; keep as weighted graph where weight = 1 / (similarity + eps)
-  # This makes larger similarity correspond to smaller path cost.
-  eps_for_weight <- 1e-8
-  # Copy feature_graph (sparse) and compute weights vector for edges
-  sg <- feature_graph
-  # Avoid altering original feature_graph
-  sg_nz <- Matrix::summary(sg)  # i, j, x
-  if (nrow(sg_nz) == 0) {
-    message("Warning: feature_graph has no edges; weighted shortest-paths will not be used.")
-    igraph_graph_cached <- NULL
-  } else {
-    # edge weights as cost = 1 / (sim + eps) so stronger sim => lower cost
-    edge_costs <- 1 / (sg_nz$x + eps_for_weight)
-    # create igraph from edge list (undirected)
-    igraph_graph_cached <- igraph::graph_from_data_frame(
-      d = data.frame(from = sg_nz$i, to = sg_nz$j, weight = edge_costs),
-      directed = FALSE,
-      vertices = data.frame(name = seq_len(num_cells))
-    )
-    # Remove self loops if any
-    igraph_graph_cached <- igraph::simplify(igraph_graph_cached, remove.multiple = TRUE, remove.loops = TRUE,
-                                           edge.attr.comb = list(weight = "min"))
-  }
-  # Note: igraph_graph_cached vertex ids correspond to integer indices 1..num_cells
-  
-  # ---- Extra igraph QC statistics (run once after igraph_graph_cached is built) ----
-  if (!is.null(igraph_graph_cached)) {
-    # Basic graph sizes
-    n_nodes_igraph <- igraph::vcount(igraph_graph_cached)
-    n_edges_igraph <- igraph::ecount(igraph_graph_cached)
-  
-    # Sparsity (edge density)
-    graph_density_val <- igraph::edge_density(igraph_graph_cached, loops = FALSE) # edges / possible edges
-  
-    # Degree statistics (use integer degree)
-    degs <- igraph::degree(igraph_graph_cached, mode = "all")
-    deg_summary <- quantile(degs, probs = c(0, 0.01, 0.05, 0.25, 0.5, 0.75, 0.95, 0.99, 1), na.rm = TRUE)
-    mean_deg <- mean(degs, na.rm = TRUE)
-    median_deg <- median(degs, na.rm = TRUE)
-    max_deg <- max(degs, na.rm = TRUE)
-  
-    # Proportion of isolated nodes (degree == 0)
-    prop_isolated <- sum(degs == 0, na.rm = TRUE) / length(degs)
-  
-    # Connected component summary (on undirected graph)
-    comps <- igraph::components(igraph_graph_cached, mode = "weak")
-    n_components <- comps$no
-    comp_sizes <- sort(comps$csize, decreasing = TRUE)
-    largest_comp_frac <- if (length(comp_sizes) > 0) comp_sizes[1] / n_nodes_igraph else NA_real_
-  
-    # Approximate average path length & diameter only on largest component (compute on subgraph)
-    # For large graphs, computing diameter/avg path length on entire graph is expensive. Do it on largest component only, with a cap.
-    avg_path_length_lg <- NA_real_
-    diameter_lg <- NA_real_
-    largest_comp_threshold <- 5000  # adjust if you can afford bigger
-    if (!is.na(largest_comp_frac) && comp_sizes[1] <= largest_comp_threshold) {
-      largest_vids <- which(comps$membership == which.max(comps$csize))
-      subg <- igraph::induced_subgraph(igraph_graph_cached, vids = largest_vids)
-      # average path length (use unweighted or weighted as desired); here use weighted if weights exist
-      if (!is.null(igraph::E(subg)$weight)) {
-        avg_path_length_lg <- suppressWarnings(igraph::average.path.length(subg, directed = FALSE, weights = igraph::E(subg)$weight))
-        diameter_lg <- suppressWarnings(igraph::diameter(subg, directed = FALSE, weights = igraph::E(subg)$weight))
-      } else {
-        avg_path_length_lg <- suppressWarnings(igraph::average.path.length(subg, directed = FALSE))
-        diameter_lg <- suppressWarnings(igraph::diameter(subg, directed = FALSE))
-      }
+  # --- Optional PCA embedding to speed up cosine similarity ---
+  use_pca_embedding <- !is.null(n_pca_embed) && !is.na(n_pca_embed) && n_pca_embed > 0 && use_irlba
+  feature_matrix_for_similarity_to_use <- feature_matrix_for_similarity
+  if (use_pca_embedding) {
+    message("Computing PCA embedding (n_pca_embed=", n_pca_embed, ") via irlba for faster cosine computations...")
+    # Convert to dense matrix for irlba; if too large, user can set n_pca_embed=NA to skip
+    dense_mat <- as.matrix(feature_matrix_for_similarity)
+    sv <- irlba::irlba(dense_mat, nv = n_pca_embed)
+    # cell embedding: columns -> cells; compute embedding as V %*% diag(d)
+    feature_matrix_embed <- t(sv$v %*% diag(sv$d))
+    # The matrix `feature_matrix_embed` is k x C, where columns represent cells.
+    # We need to assign cell IDs as column names so that subsetting with `cell_ids[raw_targets]` works.
+    # Check dimensions before assigning names.
+    if (ncol(feature_matrix_embed) == length(cell_ids)) {
+        colnames(feature_matrix_embed) <- cell_ids # Assign cell IDs as column names
+        rownames(feature_matrix_embed) <- paste0("PC", seq_len(n_pca_embed)) # Assign PC names for rows
+        feature_matrix_for_similarity_to_use <- feature_matrix_embed
+        # Recalculate norms for the embedded matrix (columns are cells)
+        feature_matrix_norms <- sqrt(Matrix::colSums(feature_matrix_for_similarity_to_use * feature_matrix_for_similarity_to_use))
+        rm(dense_mat, sv); gc() # Clean up intermediate objects
     } else {
-      message("Skipping avg path length / diameter on largest component: size = ", ifelse(length(comp_sizes)>0, comp_sizes[1], NA), " > threshold (", largest_comp_threshold, ").")
+        # If dimensions don't match, revert to using the original matrix and log a warning.
+        warning("Dimension mismatch during PCA embedding: Number of columns in embedded matrix (", ncol(feature_matrix_embed), ") does not match number of cells (", length(cell_ids), "). Using original feature matrix for similarity calculations.")
+        # feature_matrix_for_similarity_to_use remains the original matrix
+        # feature_matrix_norms will be recalculated later if this block doesn't complete successfully.
+        # This ensures norms are based on the matrix actually used for calculations.
+        rm(dense_mat, sv); gc()
     }
-  
-    # Clustering coefficient (transitivity) global
-    transitivity_global <- suppressWarnings(igraph::transitivity(igraph_graph_cached, type = "global"))
-  
-    # Assortativity by degree
-    assort_deg <- tryCatch({
-      igraph::assortativity_degree(igraph_graph_cached, directed = FALSE)
-    }, error = function(e) NA_real_)
-  
-    # Save a compact diagnostics list in the environment for later use (or attach to return)
-    igraph_qc <- list(
-      n_nodes = n_nodes_igraph,
-      n_edges = n_edges_igraph,
-      density = graph_density_val,
-      mean_degree = mean_deg,
-      median_degree = median_deg,
-      max_degree = max_deg,
-      degree_quantiles = deg_summary,
-      prop_isolated = prop_isolated,
-      n_components = n_components,
-      largest_component_size = ifelse(length(comp_sizes)>0, comp_sizes[1], NA_integer_),
-      largest_component_fraction = largest_comp_frac,
-      avg_path_length_largest = avg_path_length_lg,
-      diameter_largest = diameter_lg,
-      transitivity = transitivity_global,
-      assortativity_degree = assort_deg
-    )
-  
-    # Print concise summary to console
-    message("igraph QC: nodes=", igraph_qc$n_nodes,
-            " edges=", igraph_qc$n_edges,
-            " density=", signif(igraph_qc$density, 3),
-            " mean_deg=", signif(igraph_qc$mean_degree, 3),
-            " median_deg=", igraph_qc$median_degree,
-            " prop_isolated=", signif(igraph_qc$prop_isolated, 3),
-            " n_components=", igraph_qc$n_components,
-            " largest_comp_frac=", signif(igraph_qc$largest_component_fraction, 3))
-  } else {
-    message("igraph_graph_cached is NULL; skipping igraph QC statistics.")
   }
   
+  # --- Symmetrize the feature_graph using averaging ---
+  message("Symmetrizing feature_graph using averaging...")
+  # Ensure inputs are compatible for addition; Matrix handles this.
+  # Average of (i,j) and (j,i) gives undirected representation.
+  feature_graph_sym <- (feature_graph + Matrix::t(feature_graph)) / 2
+  # Remove self-loops
+  diag(feature_graph_sym) <- 0 
   
-  message("  Calculating median graph similarities and graph distances for spatial neighbors...")
+  # Debugging: Check number of edges after symmetrization
+  gs_check <- Matrix::summary(feature_graph_sym)
+  if (nrow(gs_check) == 0) {
+    warning("Symmetrized feature_graph contains no edges. Metrics 1 & 3 will be NA. Plots for MSD-FGN and MFS-FGN will likely be white.")
+  } else {
+    message("Symmetrized graph has ", nrow(gs_check), " edges (after removing self-loops).")
+  }
   
-  all_spatial_nn_results <- RANN::nn2(data = spatial_coords_mat, k = k_neighbors + 1)
+  # --- Prepare vector for Metric 1 & 3 (vectorized) ---
+  median_spatial_dist_of_graph_neighbors_vec <- rep(NA_real_, num_cells) # Metric 1
+  median_graph_sim_of_graph_neighbors_vec <- rep(NA_real_, num_cells)   # Metric 3
   
-  for (i in 1:num_cells) {
-    current_cell_id <- cell_ids[i]
+  gs <- data.table::as.data.table(Matrix::summary(feature_graph_sym))
+  data.table::setnames(gs, c("i","j","x"))
+  setnames(gs, c("i","j"), c("query_cell_idx", "neighbor_cell_idx"))
+  # Remove self-loops (should already be done, but as a safeguard)
+  gs <- gs[query_cell_idx != neighbor_cell_idx]
+  
+  if (nrow(gs) > 0) {
+    message("  Calculating Metric 1 (MSD-FGN) and Metric 3 (MFS-FGN)...")
+    # Calculate spatial distances for all edges
+    x1 <- spatial_coords_mat[gs$query_cell_idx, 1]
+    y1 <- spatial_coords_mat[gs$query_cell_idx, 2]
+    x2 <- spatial_coords_mat[gs$neighbor_cell_idx, 1]
+    y2 <- spatial_coords_mat[gs$neighbor_cell_idx, 2]
+    gs[, spatial_distance := sqrt((x1 - x2)^2 + (y1 - y2)^2)]
     
-    spatial_nn_indices <- all_spatial_nn_results$nn.idx[i, ]
-    spatial_nn_indices <- spatial_nn_indices[spatial_nn_indices != i & spatial_nn_indices > 0] 
-    spatial_nn_indices <- head(spatial_nn_indices, k_neighbors)
-
-    if (length(spatial_nn_indices) > 0) {
-      # Metric 2: Cosine Similarity from full feature matrix
-      vec1 <- feature_matrix_for_similarity[, current_cell_id, drop = FALSE] 
-      mat2 <- feature_matrix_for_similarity[, cell_ids[spatial_nn_indices], drop = FALSE] 
-      
-      dot_products <- as.vector(crossprod(vec1, mat2)) 
-      
-      current_cell_norm <- feature_matrix_norms[current_cell_id]
-      spatial_nn_norms <- feature_matrix_norms[cell_ids[spatial_nn_indices]]
-      
-      denominators <- current_cell_norm * spatial_nn_norms
-      graph_sim_to_spatial_nn_cosine <- ifelse(denominators == 0, 0, dot_products / denominators)
-      
-      median_graph_sim_of_spatial_neighbors_vec[i] <- median(graph_sim_to_spatial_nn_cosine, na.rm=TRUE)
-
-      # # Metric 4: SAFE graph similarity -> graph distance
-      # # Try to extract the vector of similarities from the sparse matrix. Access by integer indices:
-      # # This returns a sparse 1 x k sparse matrix; coerce to numeric vector
-      # sim_vec <- tryCatch({
-      #   as.numeric(feature_graph[i, spatial_nn_indices, drop = TRUE])
-      # }, error = function(e) {
-      #   # fallback: extract via summary + lookup (slower but robust)
-      #   tmp <- Matrix::summary(feature_graph[i, , drop = TRUE])
-      #   # tmp$j gives neighbor column indices, tmp$x gives values
-      #   mapped <- rep(0, length(spatial_nn_indices))
-      #   if (nrow(tmp) > 0) {
-      #     idx_map <- setNames(tmp$x, tmp$j)
-      #     present <- intersect(as.character(spatial_nn_indices), names(idx_map))
-      #     if (length(present) > 0) {
-      #       mapped[match(as.integer(present), spatial_nn_indices)] <- as.numeric(idx_map[present])
-      #     }
-      #   }
-      #   mapped
-      # })
-      # 
-      # # Interpret missing/zero similarities as "no direct connection".
-      # # If you want direct similarity distance: dist = 1 - sim (clamped 0..1)
-      # graph_dist_to_spatial_nn <- 1 - sim_vec
-      # graph_dist_to_spatial_nn[is.na(graph_dist_to_spatial_nn)] <- 1      # missing => max distance
-      # graph_dist_to_spatial_nn[graph_dist_to_spatial_nn < 0] <- 0
-      # graph_dist_to_spatial_nn[graph_dist_to_spatial_nn > 1] <- 1
-      #
-      # median_graph_dist_of_spatial_neighbors_vec[i] <- median(graph_dist_to_spatial_nn, na.rm = TRUE)
-
-      # New Metric 4: weighted shortest-path to spatial neighbors (fall back to direct 1 - sim)
-      # Attempt weighted shortest-paths (Dijkstra) from node i to the small set of spatial_nn_indices.
-      # This is efficient because we only request distances to k targets (k small).
-      graph_dist_vals <- rep(NA_real_, length(spatial_nn_indices))
-
-      # First, try to compute shortest paths using igraph (weighted)
-      if (!is.null(igraph_graph_cached)) {
-        # igraph uses vertex sequence as numeric or names; our vertices are 1..num_cells
-        # Use igraph::distances with v = i and to = spatial_nn_indices, weights = E(igraph)$weight
-        # wrap in tryCatch to handle potential memory/time issues
-        sp_try <- tryCatch({
-          # distances returns 1 x length(targets) numeric matrix
-          spd <- igraph::distances(igraph_graph_cached, v = as.character(i), to = as.character(spatial_nn_indices), weights = igraph::E(igraph_graph_cached)$weight)
-          as.numeric(spd)
-        }, error = function(e) {
-          # fallback signal
-          NULL
-        }, warning = function(w) {
-          NULL
-        })
-
-        if (!is.null(sp_try)) {
-          # sp_try contains numeric distances; Inf for unreachable
-          # Map Inf -> NA for now
-          sp_try[is.infinite(sp_try)] <- NA_real_
-          # We normalized later; but to keep range comparable to direct (0..1), we convert weighted cost to a pseudo-distance in [0,1]
-          # Compute per-cell normalization: find finite spd and scale by (max finite spd) if >0
-          if (all(is.na(sp_try))) {
-            # all unreachable via weighted paths; leave as NA and fallback below
-            graph_dist_vals[] <- NA_real_
-          } else {
-            # normalize by max finite spd for this source; ensures 0..1
-            finite_max <- max(sp_try, na.rm = TRUE)
-            if (finite_max == 0) {
-              graph_dist_vals <- rep(0, length(sp_try))
-            } else {
-              graph_dist_vals <- sp_try / finite_max
-            }
-          }
-        }
-      }
-
-      # If igraph failed OR yielded only NA (unreachable), fallback to direct edge-based distance: 1 - similarity
-      if (all(is.na(graph_dist_vals))) {
-        # Fast direct extraction of similarities from sparse matrix (dgCMatrix supports integer indexing)
-        sim_vec <- tryCatch({
-          as.numeric(feature_graph[i, spatial_nn_indices, drop = TRUE])
-        }, error = function(e) {
-          # robust fallback via summary lookup for this row
-          tmp <- Matrix::summary(feature_graph[i, , drop = TRUE])
-          mapped <- rep(0, length(spatial_nn_indices))
-          if (nrow(tmp) > 0) {
-            idx_map <- setNames(tmp$x, tmp$j)
-            present <- intersect(as.character(spatial_nn_indices), names(idx_map))
-            if (length(present) > 0) {
-              mapped[match(as.integer(present), spatial_nn_indices)] <- as.numeric(idx_map[present])
-            }
-          }
-          mapped
-        })
-
-        # compute direct distance and clamp
-        direct_dist <- 1 - sim_vec
-        direct_dist[is.na(direct_dist)] <- 1   # treat missing/no-edge as max distance
-        direct_dist[direct_dist < 0] <- 0
-        direct_dist[direct_dist > 1] <- 1
-
-        graph_dist_vals <- direct_dist
-      }
-
-      # Final assignment: median graph distance for this cell (use na.rm; if all NA then set NA)
-      if (all(is.na(graph_dist_vals))) {
-        median_graph_dist_of_spatial_neighbors_vec[i] <- NA_real_
-      } else {
-        median_graph_dist_of_spatial_neighbors_vec[i] <- median(graph_dist_vals, na.rm = TRUE)
-      }
-      
+    # For each query cell, get its top-k neighbors by similarity (x)
+    # Ensure k_neighbors is not larger than available neighbors for a cell
+    graph_neighbors_ranked <- gs[, head(.SD[order(-x)], k_neighbors), by = query_cell_idx]
+    
+    if (nrow(graph_neighbors_ranked) > 0) {
+        # Calculate median spatial distance to these graph neighbors (Metric 1)
+        median_spatial_results <- graph_neighbors_ranked[, .(median_dist = median(spatial_distance, na.rm = TRUE)), by = query_cell_idx]
+        # Calculate median graph similarity to these graph neighbors (Metric 3)
+        median_graph_sim_results_of_graph_nn <- graph_neighbors_ranked[, .(median_graph_sim = median(x, na.rm = TRUE)), by = query_cell_idx]
+        
+        # Map results back to the full vector
+        median_spatial_dist_of_graph_neighbors_vec[median_spatial_results$query_cell_idx] <- median_spatial_results$median_dist
+        median_graph_sim_of_graph_neighbors_vec[median_graph_sim_results_of_graph_nn$query_cell_idx] <- median_graph_sim_results_of_graph_nn$median_graph_sim
     } else {
-      # These will remain NA_real_ as initialized
+        message("Warning: No graph neighbors found for any cell to rank. Metrics 1 & 3 will be NA.")
     }
+  } else {
+    warning("Symmetrized feature_graph contains no edges (after removing self-loops). Metrics 1 & 3 will be NA.")
   }
+  
+  # --- Prepare spatial nearest neighbors (RANN) ---
+  all_spatial_nn_results <- RANN::nn2(data = spatial_coords_mat, k = k_neighbors + 1)
+  all_nn_idx <- all_spatial_nn_results$nn.idx
+  
+  # Pre-allocate result vectors for metrics calculated in batches
+  median_graph_sim_of_spatial_neighbors_vec <- rep(NA_real_, num_cells) # Metric 2
+  median_graph_dist_of_spatial_neighbors_vec <- rep(NA_real_, num_cells) # Metric 4 (REVERTED LOGIC)
+  
+  # --- Batch processing function (per-batch) ---
+  # This function calculates Metric 2 (MFS-SN) and Metric 4 (MFD-SN)
+  process_batch_fast <- function(sources) {
+    nb <- length(sources)
+    res_metric2 <- numeric(nb) # Median Feature Similarity to Spatial Neighbors (MFS-SN)
+    res_metric4 <- numeric(nb) # Median Feature-Graph Distance to Spatial Neighbors (MFD-SN)
 
-  # Assemble results into a data frame
+    for (ii in seq_along(sources)) {
+      i <- sources[ii] # Current cell index
+      
+      # Get spatial neighbors for cell 'i'
+      raw_targets <- all_nn_idx[i, ]
+      raw_targets <- raw_targets[raw_targets != i & raw_targets > 0] # Remove self, ensure valid indices
+      raw_targets <- head(raw_targets, k_neighbors) # Take top k spatial neighbors
+      
+      if (length(raw_targets) == 0) {
+        res_metric2[ii] <- NA_real_
+        res_metric4[ii] <- NA_real_
+        next # Skip if no spatial neighbors found
+      }
+      
+      # --- Metric 2: Median Feature Similarity to Spatial Neighbors (MFS-SN) ---
+      vec1 <- feature_matrix_for_similarity_to_use[, i, drop = FALSE]
+      mat2 <- feature_matrix_for_similarity_to_use[, cell_ids[raw_targets], drop = FALSE]
+      dot_products <- as.vector(crossprod(vec1, mat2))
+      norm1 <- feature_matrix_norms[i]
+      norm2 <- feature_matrix_norms[raw_targets]
+      denom <- norm1 * norm2
+      cos_sim <- ifelse(denom == 0, 0, dot_products / denom)
+      res_metric2[ii] <- median(cos_sim, na.rm = TRUE)
+      
+      # --- Metric 4: Median Feature-Graph Distance to Spatial Neighbors (MFD-SN) ---
+      # Using the symmetrized graph for consistency
+      graph_sim_to_spatial_nn <- feature_graph_sym[i, raw_targets, drop = TRUE]
+      
+      # Ensure numeric and handle potential NAs from sparse matrix access (if cell i is not connected to spatial neighbors)
+      graph_sim_to_spatial_nn <- as.numeric(graph_sim_to_spatial_nn)
+      graph_sim_to_spatial_nn[is.na(graph_sim_to_spatial_nn)] <- 0 # Treat no connection as similarity 0
+      
+      # Convert similarity to distance: distance = 1 - similarity
+      graph_dist_to_spatial_nn <- 1 - graph_sim_to_spatial_nn
+      # Clamp distances to [0, 1] range
+      graph_dist_to_spatial_nn[graph_dist_to_spatial_nn < 0] <- 0 
+      graph_dist_to_spatial_nn[graph_dist_to_spatial_nn > 1] <- 1
+      
+      # Calculate median distance
+      res_metric4[ii] <- median(graph_dist_to_spatial_nn, na.rm = TRUE)
+    }
+    list(idx = sources, metric2_med = res_metric2, metric4_med = res_metric4)
+  }
+  
+  # --- Run batches in parallel ---
+  seq_starts <- seq(1L, num_cells, by = batch_size)
+  batch_idx_list <- lapply(seq_starts, function(s) {
+    e <- min(s + batch_size - 1L, num_cells)
+    seq.int(s, e)
+  })
+  
+  message("  Calculating Metric 2 (MFS-SN) and Metric 4 (MFD-SN) in parallel batches...")
+  batch_results <- future.apply::future_lapply(batch_idx_list, FUN = process_batch_fast)
+  
+  # Collect results into the preallocated vectors
+  for (br in batch_results) {
+    median_graph_sim_of_spatial_neighbors_vec[br$idx] <- br$metric2_med
+    median_graph_dist_of_spatial_neighbors_vec[br$idx] <- br$metric4_med
+  }
+  
+  # --- Assemble coherence dataframe ---
   coherence_df <- data.frame(
     cell_id = cell_ids,
     modality = modality_name,
-    median_spatial_dist_of_graph_neighbors = median_spatial_dist_of_graph_neighbors_vec,
-    median_graph_sim_of_spatial_neighbors = median_graph_sim_of_spatial_neighbors_vec,
-    median_graph_sim_of_graph_neighbors = median_graph_sim_of_graph_neighbors_vec,
-    median_graph_dist_of_spatial_neighbors = median_graph_dist_of_spatial_neighbors_vec
+    median_spatial_dist_of_graph_neighbors = median_spatial_dist_of_graph_neighbors_vec, # Metric 1
+    median_graph_sim_of_spatial_neighbors = median_graph_sim_of_spatial_neighbors_vec,     # Metric 2
+    median_graph_sim_of_graph_neighbors = median_graph_sim_of_graph_neighbors_vec,         # Metric 3
+    median_graph_dist_of_spatial_neighbors = median_graph_dist_of_spatial_neighbors_vec, # Metric 4
+    stringsAsFactors = FALSE
   )
-  
   data.table::setDT(coherence_df)
   
-  message("  DEBUG: NA counts per metric before na.omit():")
-  print(coherence_df[, lapply(.SD, function(x) sum(is.na(x)))])
-
+  # Calculate number of available metrics per cell (useful for diagnostics)
+  coherence_df$num_metrics_available <- rowSums(!is.na(coherence_df[, .(
+    median_spatial_dist_of_graph_neighbors,
+    median_graph_sim_of_spatial_neighbors,
+    median_graph_sim_of_graph_neighbors,
+    median_graph_dist_of_spatial_neighbors
+  )]))
+  message("Per-cell metrics availability summary:")
+  print(table(coherence_df$num_metrics_available))
+  
+  # --- Remove cells with NA in any of the core metrics ---
+  # This step is crucial. If all metrics are NA for all cells, the df becomes empty.
   initial_nrow_coherence_df <- nrow(coherence_df)
-  coherence_df <- na.omit(coherence_df) # Remove any rows with NA in any metric
+  coherence_df <- na.omit(coherence_df) 
   
   if (nrow(coherence_df) < initial_nrow_coherence_df) {
       message(paste0("Info: Removed ", initial_nrow_coherence_df - nrow(coherence_df), " cells with NA coherence metrics via na.omit()."))
   }
   
+  # Return empty plots if no data remains after NA removal
   if (nrow(coherence_df) == 0) {
       message("CRITICAL WARNING: coherence_df is empty after removing NAs. All plots will be empty.")
-      # Return empty plot objects, avoiding further processing that requires data
+      empty_plots <- function() ggplot2::ggplot() + ggplot2::annotate("text", x = 0.5, y = 0.5, label = "No data") + ggplot2::theme_void()
       return(list(
         coherence_df = data.data.frame(cell_id = character(0), modality = character(0),
                                   median_spatial_dist_of_graph_neighbors = numeric(0),
@@ -1951,97 +1861,81 @@ assessSpatialGraphCoherenceOverall <- function(feature_graph, feature_matrix_for
                                   median_graph_sim_of_graph_neighbors = numeric(0),
                                   median_graph_dist_of_spatial_neighbors = numeric(0),
                                   combined_coherence_score = numeric(0)), 
-        plot_dist_spatial_for_graph_nn = ggplot() + annotate("text", x = 0.5, y = 0.5, label = "No data") + theme_void(),
-        plot_sim_graph_for_spatial_nn = ggplot() + annotate("text", x = 0.5, y = 0.5, label = "No data") + theme_void(),
-        plot_sim_graph_for_graph_nn = ggplot() + annotate("text", x = 0.5, y = 0.5, label = "No data") + theme_void(),
-        plot_dist_graph_for_spatial_nn = ggplot() + annotate("text", x = 0.5, y = 0.5, label = "No data") + theme_void(),
-        plot_spatial_coherence_metrics = ggplot() + annotate("text", x = 0.5, y = 0.5, label = "No data") + theme_void()
+        plot_dist_spatial_for_graph_nn = empty_plots(),
+        plot_sim_graph_for_spatial_nn = empty_plots(),
+        plot_sim_graph_for_graph_nn = empty_plots(),
+        plot_dist_graph_for_spatial_nn = empty_plots(),
+        plot_spatial_coherence_metrics = empty_plots(),
+        diagnostics = list(note = "Empty coherence_df after NA removal")
       ))
   }
 
-
   # --- Calculate Combined Coherence Score (Metric 5) ---
-  msd_fgn_vals <- coherence_df[["median_spatial_dist_of_graph_neighbors"]]
-  min_msd_fgn <- min(msd_fgn_vals, na.rm = TRUE)
-  max_msd_fgn <- max(msd_fgn_vals, na.rm = TRUE)
+  # This score combines the two distance metrics (Metric 1 and Metric 4)
+  # Higher score means better coherence (lower distance for both)
   
-  norm_msd_fgn <- if (max_msd_fgn == min_msd_fgn) {
-      rep(0.5, length(msd_fgn_vals))
-  } else {
-      1 - (msd_fgn_vals - min_msd_fgn) / (max_msd_fgn - min_msd_fgn)
-  }
-
-  mfd_sn_vals <- coherence_df[["median_graph_dist_of_spatial_neighbors"]]
-  min_mfd_sn <- min(mfd_sn_vals, na.rm = TRUE)
-  max_mfd_sn <- max(mfd_sn_vals, na.rm = TRUE)
+  # Initialize score column
+  coherence_df$combined_coherence_score <- NA_real_
   
-  norm_mfd_sn <- if (max_mfd_sn == min_mfd_sn) {
-      rep(0.5, length(mfd_sn_vals))
-  } else {
-      1 - (mfd_sn_vals - min_mfd_sn) / (max_mfd_sn - min_mfd_sn)
+  # Calculate only if there are cells with valid data for both metrics
+  valid_idx_for_combined <- which(!is.na(coherence_df$median_spatial_dist_of_graph_neighbors) & !is.na(coherence_df$median_graph_dist_of_spatial_neighbors))
+  
+  if (length(valid_idx_for_combined) > 0) {
+      msd_vals <- coherence_df$median_spatial_dist_of_graph_neighbors[valid_idx_for_combined]
+      mfd_vals <- coherence_df$median_graph_dist_of_spatial_neighbors[valid_idx_for_combined]
+      
+      # Normalize distances to [0,1] and invert so higher is better (lower distance -> higher score)
+      # Min-max normalization
+      min_msd <- min(msd_vals, na.rm = TRUE)
+      max_msd <- max(msd_vals, na.rm = TRUE)
+      norm_msd <- if (max_msd == min_msd) rep(0.5, length(msd_vals)) else 1 - (msd_vals - min_msd) / (max_msd - min_msd)
+      
+      min_mfd <- min(mfd_vals, na.rm = TRUE)
+      max_mfd <- max(mfd_vals, na.rm = TRUE)
+      norm_mfd <- if (max_mfd == min_mfd) rep(0.5, length(mfd_vals)) else 1 - (mfd_vals - min_mfd) / (max_mfd - min_mfd)
+      
+      # Average the normalized, inverted scores
+      coherence_df$combined_coherence_score[valid_idx_for_combined] <- (norm_msd + norm_mfd) / 2
   }
   
-  coherence_df$combined_coherence_score <- (norm_msd_fgn + norm_mfd_sn) / 2
-
-
-  # --- Plotting Distributions (Density Plots) ---
-  plot_dist_spatial_for_graph_nn <- ggplot(coherence_df, aes(x = median_spatial_dist_of_graph_neighbors)) +
-    geom_density(fill = "lightblue", alpha = 0.7) +
-    labs(title = paste0(modality_name, ": Spatial Dist to Feature-Graph NN (k=", k_neighbors, ")"), # More descriptive
-         x = "Median Spatial Distance", y = "Density") +
-    theme_minimal() +
-    theme(plot.title = element_text(hjust = 0.5))
-
-  plot_sim_graph_for_spatial_nn <- ggplot(coherence_df, aes(x = median_graph_sim_of_spatial_neighbors)) +
-    geom_density(fill = "lightcoral", alpha = 0.7) +
-    labs(title = paste0(modality_name, ": Feature Sim to Spatial NN (k=", k_neighbors, ")"), # More descriptive
-         x = "Median Feature Similarity", y = "Density") +
-    theme_minimal() +
-    theme(plot.title = element_text(hjust = 0.5))
-
-  plot_sim_graph_for_graph_nn <- ggplot(coherence_df, aes(x = median_graph_sim_of_graph_neighbors)) +
-    geom_density(fill = "lightgreen", alpha = 0.7) +
-    labs(title = paste0(modality_name, ": Feature Sim to Feature-Graph NN (k=", k_neighbors, ")"), # More descriptive
-         x = "Median Feature Similarity", y = "Density") +
-    theme_minimal() +
-    theme(plot.title = element_text(hjust = 0.5))
-
-  plot_dist_graph_for_spatial_nn <- ggplot(coherence_df, aes(x = median_graph_dist_of_spatial_neighbors)) +
-    geom_density(fill = "lightgoldenrod", alpha = 0.7) + 
-    labs(title = paste0(modality_name, ": Feature-Graph Dist to Spatial NN (k=", k_neighbors, ")"), # More descriptive
-         x = "Median Feature-Graph Distance", y = "Density") +
-    theme_minimal() +
-    theme(plot.title = element_text(hjust = 0.5))
-
-  # --- Spatial Plot with Color Gradients for all Metrics ---
-  message("  Generating spatial plot with coherence metric gradients...")
-
-  spatial_coords_df_for_merge <- as.data.frame(spatial_coords_df) 
-  if (!"cell_id" %in% colnames(spatial_coords_df_for_merge)) {
-    spatial_coords_df_for_merge$cell_id <- rownames(spatial_coords_df_for_merge)
-  }
+  # --- Create density plots ---
+  plot_dist_spatial_for_graph_nn <- ggplot2::ggplot(coherence_df, ggplot2::aes(x = median_spatial_dist_of_graph_neighbors)) +
+    ggplot2::geom_density(fill = "lightblue", alpha = 0.7, na.rm = TRUE) +
+    ggplot2::labs(title = paste0(modality_name, ": Spatial Dist to Feature-Graph NN (k=", k_neighbors, ")"), x = "Median Spatial Distance", y = "Density") +
+    ggplot2::theme_minimal() + ggplot2::theme(plot.title = ggplot2::element_text(hjust = 0.5))
+  
+  plot_sim_graph_for_spatial_nn <- ggplot2::ggplot(coherence_df, ggplot2::aes(x = median_graph_sim_of_spatial_neighbors)) +
+    ggplot2::geom_density(fill = "lightcoral", alpha = 0.7, na.rm = TRUE) +
+    ggplot2::labs(title = paste0(modality_name, ": Feature Sim to Spatial NN (k=", k_neighbors, ")"), x = "Median Feature Similarity", y = "Density") +
+    ggplot2::theme_minimal() + ggplot2::theme(plot.title = ggplot2::element_text(hjust = 0.5))
+  
+  plot_sim_graph_for_graph_nn <- ggplot2::ggplot(coherence_df, ggplot2::aes(x = median_graph_sim_of_graph_neighbors)) +
+    ggplot2::geom_density(fill = "lightgreen", alpha = 0.7, na.rm = TRUE) +
+    ggplot2::labs(title = paste0(modality_name, ": Feature Sim to Feature-Graph NN (k=", k_neighbors, ")"), x = "Median Feature Similarity", y = "Density") +
+    ggplot2::theme_minimal() + ggplot2::theme(plot.title = ggplot2::element_text(hjust = 0.5))
+  
+  plot_dist_graph_for_spatial_nn <- ggplot2::ggplot(coherence_df, ggplot2::aes(x = median_graph_dist_of_spatial_neighbors)) +
+    ggplot2::geom_density(fill = "lightgoldenrod", alpha = 0.7, na.rm = TRUE) +
+    ggplot2::labs(title = paste0(modality_name, ": Feature-Graph Dist to Spatial NN (k=", k_neighbors, ")"), x = "Median Feature-Graph Distance", y = "Density") +
+    ggplot2::theme_minimal() + ggplot2::theme(plot.title = ggplot2::element_text(hjust = 0.5))
+  
+  # --- Spatial plot: pivot long ---
+  spatial_coords_df_for_merge <- as.data.frame(spatial_coords_df)
+  if (!"cell_id" %in% colnames(spatial_coords_df_for_merge)) spatial_coords_df_for_merge$cell_id <- rownames(spatial_coords_df_for_merge)
   
   # Default empty plot if no data is available
-  p_spatial_metrics <- ggplot() + annotate("text", x = 0.5, y = 0.5, label = "No data for spatial plot") + theme_void() 
+  p_spatial_metrics <- ggplot2::ggplot() + ggplot2::annotate("text", x = 0.5, y = 0.5, label = "No data for spatial plot") + ggplot2::theme_void() 
   
-  # Only attempt to create the spatial plot if coherence_df has data
   if (nrow(coherence_df) > 0) {
       plot_data_spatial <- merge(spatial_coords_df_for_merge, coherence_df, by = "cell_id", all.x = TRUE)
       
-      # It's possible for some original cells not to have been included in coherence_df if they had NAs.
-      # These will show as NA for metrics but should still be plotted as grey.
-      
       plot_data_long <- plot_data_spatial %>%
-        tidyr::pivot_longer(
-          cols = c(median_spatial_dist_of_graph_neighbors, 
-                   median_graph_sim_of_spatial_neighbors, 
-                   median_graph_sim_of_graph_neighbors, 
-                   median_graph_dist_of_spatial_neighbors,
-                   combined_coherence_score),
-          names_to = "metric_type",
-          values_to = "metric_value"
-        )
-
+        tidyr::pivot_longer(cols = c(median_spatial_dist_of_graph_neighbors,
+                                     median_graph_sim_of_spatial_neighbors,
+                                     median_graph_sim_of_graph_neighbors,
+                                     median_graph_dist_of_spatial_neighbors,
+                                     combined_coherence_score),
+                            names_to = "metric_type", values_to = "metric_value")
       metric_labels <- c(
         median_spatial_dist_of_graph_neighbors = "Spatial Dist. to Feature-Graph NN",
         median_graph_sim_of_spatial_neighbors = "Feature Sim. to Spatial NN",
@@ -2049,64 +1943,58 @@ assessSpatialGraphCoherenceOverall <- function(feature_graph, feature_matrix_for
         median_graph_dist_of_spatial_neighbors = "Feature-Graph Dist. to Spatial NN",
         combined_coherence_score = "Combined Coherence Score"
       )
-      
       plot_data_long$metric_type <- factor(plot_data_long$metric_type, levels = names(metric_labels), labels = metric_labels)
-
+      
       plot_data_long_normalized <- plot_data_long %>%
-        group_by(metric_type) %>%
-        mutate(
-          val_min = min(metric_value, na.rm = TRUE),
-          val_max = max(metric_value, na.rm = TRUE),
-          norm_val = case_when(
-              val_max == val_min ~ rep(0.5, n()),
+        dplyr::group_by(metric_type) %>%
+        dplyr::mutate(
+          val_min = suppressWarnings(min(metric_value, na.rm = TRUE)),
+          val_max = suppressWarnings(max(metric_value, na.rm = TRUE)),
+          norm_val = dplyr::case_when(
+              val_max == val_min ~ rep(0.5, n()), # Handle constant values
               TRUE ~ (metric_value - val_min) / (val_max - val_min)
           ),
-          plot_color_value = case_when(
+          # For distance metrics, higher normalized value means closer (1-norm_val)
+          # For similarity and score metrics, higher normalized value is better (norm_val)
+          plot_color_value = dplyr::case_when(
             grepl("Dist", metric_type) ~ 1 - norm_val, 
             TRUE ~ norm_val 
           )
         ) %>%
-        ungroup()
+        dplyr::ungroup()
       
-      # Final check before plotting the spatial facets
-      # If plot_data_long_normalized is empty or all plot_color_value are NA, it will remain the default empty plot
       if (nrow(plot_data_long_normalized) > 0 && !all(is.na(plot_data_long_normalized$plot_color_value))) {
-          p_spatial_metrics <- ggplot(plot_data_long_normalized, aes(x = x, y = y, color = plot_color_value)) +
-            geom_point(size = 0.1, alpha = 0.6) +
-            facet_wrap(~metric_type, ncol = 3) +
-            scale_color_viridis_c(
-              option = "viridis",
-              direction = 1, # High plot_color_value (good coherence) will be bright yellow/green
-              na.value = "grey80", # Cells with NA metrics will be grey
-              name = "Coherence (Normalized)" 
-            ) +
-            labs(title = paste0(modality_name, ": Spatial Coherence Metrics (k=", k_neighbors, ")"),
-                 x = "Spatial X", y = "Spatial Y") +
-            coord_fixed() +
-            theme_minimal() +
-            theme(plot.title = element_text(hjust = 0.5), legend.position = "bottom")
+          p_spatial_metrics <- ggplot2::ggplot(plot_data_long_normalized, ggplot2::aes(x = x, y = y, color = plot_color_value)) +
+            ggplot2::geom_point(size = 0.1, alpha = 0.6) +
+            ggplot2::facet_wrap(~metric_type, ncol = 3) +
+            ggplot2::scale_color_viridis_c(option = "viridis", direction = 1, na.value = "grey80", name = "Coherence (Normalized)") +
+            ggplot2::labs(title = paste0(modality_name, ": Spatial Coherence Metrics (k=", k_neighbors, ")"), x = "Spatial X", y = "Spatial Y") +
+            ggplot2::coord_fixed() + ggplot2::theme_minimal() + ggplot2::theme(plot.title = ggplot2::element_text(hjust = 0.5), legend.position = "bottom")
       } else {
           message("Warning: Spatial plot data (after normalization/NA handling) is empty or all NA for coloring. Returning empty spatial plot for this modality.")
       }
   }
-
-  message("Overall spatial-graph coherence assessment complete for ", modality_name, ".")
-
+  
+  # --- Diagnostics ---
+  diagnostics <- list(
+    n_cells = num_cells,
+    k_neighbors = k_neighbors,
+    n_workers = n_workers,
+    batch_size = batch_size,
+    used_pca_embedding = exists("feature_matrix_embed"),
+    pca_dims = if (exists("feature_matrix_embed")) nrow(feature_matrix_embed) else NA_integer_
+  )
+  
+  # --- Return ---
   out_list <- list(
     coherence_df = coherence_df,
     plot_dist_spatial_for_graph_nn = plot_dist_spatial_for_graph_nn,
     plot_sim_graph_for_spatial_nn = plot_sim_graph_for_spatial_nn,
     plot_sim_graph_for_graph_nn = plot_sim_graph_for_graph_nn,
     plot_dist_graph_for_spatial_nn = plot_dist_graph_for_spatial_nn,
-    plot_spatial_coherence_metrics = p_spatial_metrics
+    plot_spatial_coherence_metrics = p_spatial_metrics,
+    diagnostics = diagnostics
   )
-
-  if (exists("igraph_qc")) {
-    out_list$igraph_qc <- igraph_qc
-  } else {
-    out_list$igraph_qc <- NULL
-  }
-
   return(out_list)
 }
 ```
@@ -2329,7 +2217,8 @@ rna_coherence_results <- assessSpatialGraphCoherenceOverall(
   feature_matrix_for_similarity = rna_feature_matrix_for_sim, 
   spatial_coords_df = rna_spatial_coords_filtered,
   k_neighbors = k_coherence_neighbors,
-  modality_name = "RNA"
+  modality_name = "RNA",
+  n_workers = 8
 )
 print(rna_coherence_results$plot_dist_spatial_for_graph_nn)
 print(rna_coherence_results$plot_sim_graph_for_spatial_nn)
