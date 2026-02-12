@@ -905,7 +905,7 @@ createRNACellGraph <- function(seurat_obj, dims = 1:30, k_neighbors = 20) {
 #' \code{createATACCellGraph()} computes a cell-to-cell similarity matrix based on
 #' ATAC-seq gene activity scores. It performs sparse PCA on the gene activity matrix
 #' and then constructs a K-nearest neighbors (KNN) graph from the PCA embeddings,
-#' using `FNN::get.knn`.
+#' using `FNN::get.knn` with a Gaussian kernel for similarity calculation.
 #'
 #' @param atac_gene_activity_matrix Sparse matrix of ATAC-seq gene activity scores (cells x genes).
 #' @param atac_pca_dims Integer, number of principal components to use for ATAC graph construction.
@@ -918,7 +918,7 @@ createRNACellGraph <- function(seurat_obj, dims = 1:30, k_neighbors = 20) {
 #' @importFrom irlba prcomp_irlba
 #' @export
 createATACCellGraph <- function(atac_gene_activity_matrix, atac_pca_dims = 30, atac_k_neighbors = 20) {
-  message("Computing ATAC-based cell-cell graph from gene activity matrix using PCA+KNN...")
+  message("Computing ATAC-based cell-cell graph from gene activity matrix using PCA+kNN+Gaussian Kernel...")
 
   num_cells <- nrow(atac_gene_activity_matrix)
   cell_ids <- rownames(atac_gene_activity_matrix)
@@ -948,16 +948,21 @@ createATACCellGraph <- function(atac_gene_activity_matrix, atac_pca_dims = 30, a
     return(Matrix::Matrix(0, num_cells, num_cells, sparse = TRUE, dimnames = list(cell_ids, cell_ids)))
   }
   
-  effective_atac_pca_dims <- min(atac_pca_dims, num_features_for_pca - 1) 
-  if (effective_atac_pca_dims < 2) {
-      warning("Not enough dimensions (", effective_atac_pca_dims, ") for ATAC PCA after adjustments. Returning empty matrix for ATAC graph.")
+  # Adjust PCA dimensions based on available features, ensuring at least 2 dimensions if possible.
+  effective_atac_pca_dims <- min(atac_pca_dims, num_features_for_pca)
+  if (effective_atac_pca_dims < 2 && num_features_for_pca >= 2) { # If requested dims < 2 but we have >= 2 features
+      effective_atac_pca_dims <- 2 
+  } else if (effective_atac_pca_dims < 1) { # If even after adjustment, it's less than 1
+      warning("Not enough dimensions (", effective_atac_pca_dims, ") for ATAC PCA. Returning empty matrix for ATAC graph.")
       return(Matrix::Matrix(0, num_cells, num_cells, sparse = TRUE, dimnames = list(cell_ids, cell_ids)))
   }
   
+  # Use irlba for sparse PCA
   atac_pca_res <- irlba::prcomp_irlba(atac_mat_for_dimred, n = effective_atac_pca_dims, center = TRUE, scale. = FALSE)
   pca_embeddings_atac <- atac_pca_res$x
   rownames(pca_embeddings_atac) <- cell_ids 
 
+  # Adjust k_neighbors if it exceeds cell count
   if (atac_k_neighbors >= num_cells) {
     warning("'atac_k_neighbors' (", atac_k_neighbors, ") is greater than or equal to the number of cells (", num_cells, "). Setting k_neighbors to num_cells - 1.")
     atac_k_neighbors <- num_cells - 1
@@ -980,34 +985,37 @@ createATACCellGraph <- function(atac_gene_activity_matrix, atac_pca_dims = 30, a
   
   adj_list_i_all <- rep(1:num_cells, each = atac_k_neighbors)
 
-  initial_valid_entries <- !is.na(adj_list_j_raw) & adj_list_j_raw > 0 & adj_list_j_raw <= num_cells & 
+  # Filter for valid indices and finite, non-negative distances
+  initial_valid_entries <- !is.na(adj_list_j_raw) & adj_list_j_raw > 0 & adj_list_j_raw <= num_cells &
                            is.finite(distances_raw) & distances_raw >= 0
   
   adj_list_i <- adj_list_i_all[initial_valid_entries]
   adj_list_j <- adj_list_j_raw[initial_valid_entries]
-  distances <- distances_raw[initial_valid_entries]
+  distances <- distances_raw[initial_valid_entries] # Use these distances for Gaussian kernel
 
   if (length(adj_list_i) == 0) {
       message("  WARNING ATAC: No valid neighbors found after initial filtering FNN results. Returning an empty sparse matrix.")
       return(Matrix::Matrix(0, num_cells, num_cells, sparse = TRUE, dimnames = list(rownames(pca_embeddings_atac), rownames(pca_embeddings_atac))))
   }
   
-  max_dist_in_knn <- max(distances, na.rm=TRUE)
+  # Robust Similarity Logic (Gaussian Kernel)
+  sigma <- median(distances, na.rm = TRUE)
+  if (sigma <= 0) sigma <- max(distances, na.rm = TRUE) # Fallback for low-variance data
+  if (sigma <= 0) sigma <- 1 # Final absolute fallback to prevent division by zero
   
-  if (max_dist_in_knn <= 0 || !is.finite(max_dist_in_knn)) { 
-    similarity <- rep(1, length(distances)) 
-    message("  DEBUG ATAC: max_dist_in_knn was problematic (<=0 or non-finite), setting all similarities to 1.")
-  } else {
-    similarity <- 1 - (distances / max_dist_in_knn)
-  }
+  # Gaussian similarity formula: exp(-d^2 / (2 * sigma^2))
+  similarity <- exp(- (distances^2) / (2 * sigma^2))
   
-  similarity[similarity < 0] <- 0
-  similarity[similarity > 1] <- 1
+  # Ensure similarities are finite and positive. Gaussian similarity should be in [0, 1].
+  # Handle any potential NaN/Inf results from exp() or division by zero sigma.
+  similarity[is.na(similarity) | !is.finite(similarity)] <- 0 # Set to 0 if not finite
+  similarity[similarity < 0] <- 0 # Safety check, though exp() is usually non-negative.
   
-  final_similarity_valid_idx <- which(is.finite(similarity) & similarity > 0)
+  # Filter for positive similarities before sparse matrix construction
+  final_similarity_valid_idx <- which(similarity > 0)
   
   if (length(final_similarity_valid_idx) == 0) {
-      message("  WARNING ATAC: No positive similarities after final filtering. Returning an empty sparse matrix.")
+      message("  WARNING ATAC: No positive similarities after Gaussian kernel calculation. Returning an empty sparse matrix.")
       return(Matrix::Matrix(0, num_cells, num_cells, sparse = TRUE, dimnames = list(rownames(pca_embeddings_atac), rownames(pca_embeddings_atac))))
   }
 
@@ -1015,9 +1023,12 @@ createATACCellGraph <- function(atac_gene_activity_matrix, atac_pca_dims = 30, a
   adj_list_j <- adj_list_j[final_similarity_valid_idx]
   similarity <- similarity[final_similarity_valid_idx]
   
-  if (!is.integer(adj_list_i)) adj_list_i <- as.integer(adj_list_i)
-  if (!is.integer(adj_list_j)) adj_list_j <- as.integer(adj_list_j)
+  # Ensure indices and similarities are in the correct format for sparseMatrix
+  if(!is.integer(adj_list_i)) adj_list_i <- as.integer(adj_list_i)
+  if(!is.integer(adj_list_j)) adj_list_j <- as.integer(adj_list_j)
+  if(!is.numeric(similarity)) similarity <- as.numeric(similarity)
 
+  # Critical checks before sparseMatrix construction
   if(any(is.na(adj_list_i)) || any(adj_list_i < 1) || any(adj_list_i > num_cells)) {
        stop("CRITICAL ATAC: Invalid row indices (NA/out-of-bounds) detected right before sparseMatrix construction!")
   }
@@ -1025,6 +1036,7 @@ createATACCellGraph <- function(atac_gene_activity_matrix, atac_pca_dims = 30, a
        stop("CRITICAL ATAC: Invalid col indices (NA/out-of-bounds) detected right before sparseMatrix construction!")
   }
   if(any(is.na(similarity)) || any(!is.finite(similarity)) || any(similarity <= 0) || any(similarity > 1)) {
+       # Gaussian similarity should be <= 1, so this check is also important.
        stop("CRITICAL ATAC: Invalid similarity values (NA/non-finite/out-of-range) detected right before sparseMatrix construction!")
   }
 
@@ -1034,11 +1046,14 @@ createATACCellGraph <- function(atac_gene_activity_matrix, atac_pca_dims = 30, a
     x = similarity,
     dims = c(num_cells, num_cells),
     dimnames = list(rownames(pca_embeddings_atac), rownames(pca_embeddings_atac)),
-    giveCsparse = TRUE 
+    giveCsparse = TRUE
   )
   
+  # Ensure diagonal is 1
   diag(atac_cell_graph_init) <- 1
 
+  # Robust Symmetrization (using max rule, same as RNA)
+  message("  Symmetrizing graph using max rule...")
   atac_triplets <- summary(atac_cell_graph_init)
 
   combined_triplets_df <- data.frame(
@@ -1061,10 +1076,10 @@ createATACCellGraph <- function(atac_gene_activity_matrix, atac_pca_dims = 30, a
     x = symmetric_edges$x,
     dims = dim(atac_cell_graph_init),
     dimnames = dimnames(atac_cell_graph_init),
-    giveCsparse = TRUE 
+    giveCsparse = TRUE
   )
   
-  message("ATAC-based cell graph created. Graph dimensions: ", paste(dim(atac_cell_graph), collapse = "x"))
+  message("ATAC-based cell graph created using Gaussian Kernel. Graph dimensions: ", paste(dim(atac_cell_graph), collapse = "x"))
   return(atac_cell_graph)
 }
 
@@ -1306,7 +1321,7 @@ changedCellWalkercomputeTypeEdges <- function(exprMat_norm, markers, pval.cutoff
   # This might not be strictly necessary if .SD[['gene']] is always correctly indexed,
   # but it's a good practice to be aware of potential indexing mismatches with sparse matrices.
   
-  # --- CRITICAL FIX HERE: Use drop = FALSE to ensure subsetting always returns a matrix-like object ---
+  # Use drop = FALSE to ensure subsetting always returns a matrix-like object
   labelEdges = markers_inter[, {
     # Extract genes for the current cluster
     current_genes <- .SD[['gene']]
@@ -1341,8 +1356,7 @@ changedCellWalkercomputeTypeEdges <- function(exprMat_norm, markers, pval.cutoff
                  
     list("score" = score_val, "cell" = colnames(exprMat_norm))
   }, by = cluster]
-  # --- END CRITICAL FIX ---
-  
+
   labelEdges = reshape2::acast(labelEdges, cell~cluster, value.var = 'score')
   labelEdges[labelEdges <0] = 0
 
@@ -1647,6 +1661,7 @@ assessSpatialGraphCoherenceOverall <- function(
     if (n_workers < 1L) n_workers <- 1L
   }
   old_plan <- future::plan()
+  options(future.globals.maxSize = +Inf)
   future::plan(future::multisession, workers = n_workers)
   on.exit(try(future::plan(old_plan), silent = TRUE), add = TRUE)
   
@@ -1756,7 +1771,7 @@ assessSpatialGraphCoherenceOverall <- function(
   }
   
   # --- Prepare spatial nearest neighbors (RANN) ---
-  all_spatial_nn_results <- RANN::nn2(data = spatial_coords_mat, k = k_neighbors + 1)
+  all_spatial_nn_results <- RANN::nn2(data = spatial_coords_mat_normalized, k = k_neighbors + 1)
   all_nn_idx <- all_spatial_nn_results$nn.idx
   
   # Pre-allocate result vectors for metrics calculated in batches
@@ -1783,13 +1798,67 @@ assessSpatialGraphCoherenceOverall <- function(
       }
       
       # --- Metric 2: Median Feature Similarity to Spatial Neighbors (MFS-SN) ---
-      vec1 <- feature_matrix_for_similarity_to_use[, i, drop = FALSE]
-      mat2 <- feature_matrix_for_similarity_to_use[, cell_ids[raw_targets], drop = FALSE]
+      
+      # Get the cell NAMES for the spatial neighbors using the indices from raw_targets
+      neighbor_cell_names <- cell_ids[raw_targets] 
+      
+      # Get the column names of the matrix we are indexing into
+      matrix_colnames <- colnames(feature_matrix_for_similarity_to_use)
+      
+      # Find the NUMERICAL COLUMN INDICES in matrix_colnames that match neighbor_cell_names.
+      # This is crucial for robustly avoiding "subscript out of bounds" if name resolution is faulty.
+      neighbor_col_indices_in_matrix <- match(neighbor_cell_names, matrix_colnames)
+      
+      # Check if any names were not found. This would result in NA in neighbor_col_indices_in_matrix.
+      # If NAs are present, we need to filter them out to avoid errors.
+      if (any(is.na(neighbor_col_indices_in_matrix))) {
+          # Identify which names were not found and their corresponding original raw_targets indices.
+          missing_names_mask <- is.na(neighbor_col_indices_in_matrix)
+          missing_names <- neighbor_cell_names[missing_names_mask]
+          corresponding_raw_targets <- raw_targets[missing_names_mask]
+          
+          warning("Cell names from spatial neighbors (indices: ", 
+                  paste(corresponding_raw_targets, collapse=", "), 
+                  "; names: ", paste(missing_names, collapse=", "), 
+                  ") not found in column names of feature_matrix_for_similarity_to_use. Setting metrics to NA for these neighbors.")
+          
+          # Filter out NA indices to only use valid numerical indices for matrix subsetting.
+          valid_neighbor_col_indices <- na.omit(neighbor_col_indices_in_matrix)
+          
+          if (length(valid_neighbor_col_indices) == 0) {
+              # If no valid neighbors could be found after filtering, return NA for metrics
+              res_metric2[ii] <- NA_real_
+              next # Skip to the next source cell
+          }
+          # Use the valid numerical column indices for sparse matrix column selection.
+          mat2 <- feature_matrix_for_similarity_to_use[, valid_neighbor_col_indices, drop = FALSE]
+          
+      } else {
+          # All neighbor cell names were found as column names.
+          # Use the numerical indices derived from match() to subset the matrix.
+          mat2 <- feature_matrix_for_similarity_to_use[, neighbor_col_indices_in_matrix, drop = FALSE]
+          valid_neighbor_col_indices = neighbor_col_indices_in_matrix
+      }
+
+      # Indexing for the query cell `i` (which is a numerical index into cell_ids and columns of the matrix)
+      vec1 <- feature_matrix_for_similarity_to_use[, i, drop = FALSE] 
+      
+      # Calculate dot products and cosine similarity
       dot_products <- as.vector(crossprod(vec1, mat2))
-      norm1 <- feature_matrix_norms[i]
-      norm2 <- feature_matrix_norms[raw_targets]
+      
+      # Norms for the query cell `i`
+      norm1 <- feature_matrix_norms[i] # `i` is a 1-based numerical index
+      
+      # Norms for the neighbor cells (using the valid numerical column indices)
+      norm2 <- feature_matrix_norms[valid_neighbor_col_indices] # Use indices found by match
+      
       denom <- norm1 * norm2
       cos_sim <- ifelse(denom == 0, 0, dot_products / denom)
+      
+      # Clip cosine similarity values to be within [0, 1] range.
+      # This addresses cases where values might exceed 1 due to numerical precision or unusual data characteristics.
+      cos_sim <- pmax(0, pmin(1, cos_sim)) 
+      
       res_metric2[ii] <- median(cos_sim, na.rm = TRUE)
       
       # --- Metric 4 (median_graph_dist_of_spatial_neighbors) is REMOVED. ---
@@ -2075,7 +2144,7 @@ message("ATAC Graph dimensions: ", paste(dim(atac_graph), collapse = "x"))
 ```
 
 ```{r Save and load graph}
-file_path <- file.path(output_dir, "separate_graphs.rds")
+file_path <- file.path(output_dir, "separate_graphs_new.rds")
 
 # Save the 'separate_graphs' object
 message("Saving separate_graphs object to: ", file_path)
@@ -2287,3 +2356,345 @@ ggsave("/projectnb/paxlab/phitro/CellWalkR2/R/figure/p_scatter_metrics.png", plo
 ```
 
 
+```{r Analys Graphs}
+#' Analyze and Compare Sparse Feature Graphs
+#'
+#' \code{analyze_feature_graph()} analyzes the properties of a sparse feature graph
+#' (e.g., cell-cell similarity graph) and generates metrics and plots for interpretation.
+#' It calculates sparsity, edge count, similarity distribution, and captures graph construction details.
+#'
+#' @param graph A sparse matrix representing the cell-to-cell similarity graph.
+#' @param modality_name Character string for the modality (e.g., "RNA", "ATAC").
+#' @param k_neighbors Integer, the k value used for KNN graph construction.
+#' @param graph_method Character string describing the graph construction method (e.g., "PCA + kNN + Gaussian Similarity").
+#' @param similarity_decay Character string describing the similarity decay function used (e.g., "Gaussian", "Linear").
+#' @return A list containing analysis results: modality, num_cells, sparsity, edge count,
+#'   similarity range/median/mean, graph construction parameters, and a plot of similarity distribution.
+#' @export
+analyze_feature_graph <- function(graph, modality_name, k_neighbors, graph_method, similarity_decay) {
+  message("\n--- Analyzing Feature Graph for ", modality_name, " ---")
+  
+  # --- 1. Sparsity and Basic Edge Count ---
+  num_cells_graph <- nrow(graph)
+  total_possible_edges <- as.numeric(num_cells_graph) * as.numeric(num_cells_graph)
+  num_non_zero_edges <- Matrix::nnzero(graph)
+  
+  # Calculate sparsity as percentage of zeros.
+  # If num_cells_graph is 0 or 1, total_possible_edges might be 0 or 1.
+  if (total_possible_edges == 0) {
+      sparsity_percent_zeros <- 0 # Or NA, but 0 is reasonable if no cells.
+      connectivity_density <- 0
+  } else {
+      sparsity_percent_zeros <- 100 * (1 - num_non_zero_edges / total_possible_edges)
+      connectivity_density <- 100 * (num_non_zero_edges / total_possible_edges)
+  }
+
+  message("Graph Dimensions: ", num_cells_graph, "x", num_cells_graph)
+  message("Number of non-zero edges (connections): ", num_non_zero_edges)
+  message("Graph Sparsity (percentage of zeros): ", round(sparsity_percent_zeros, 2), "%")
+  message("Graph Connectivity Density (percentage of non-zeros): ", round(connectivity_density, 4), "%")
+  
+  # --- 2. Analyze Non-zero Similarity Values ---
+  # Extracting similarities assumes graph stores similarities
+  
+  graph_sims_dt <- data.table::as.data.table(Matrix::summary(graph))
+  non_zero_sims <- graph_sims_dt$x
+  
+  # Initialize results with NA/defaults for cases with no valid data
+  analysis_results_list <- list(
+    modality = modality_name,
+    num_cells = num_cells_graph,
+    sparsity_percent_zeros = round(sparsity_percent_zeros, 2),
+    num_edges = num_non_zero_edges,
+    min_sim = NA_real_, max_sim = NA_real_, mean_sim = NA_real_, median_sim = NA_real_,
+    k_neighbors = k_neighbors,
+    graph_method = graph_method,
+    similarity_decay = similarity_decay,
+    sim_hist_plot = NULL # Placeholder for plot
+  )
+  
+  if (length(non_zero_sims) == 0 || num_cells_graph <= 1) {
+    message("No non-zero similarities found or too few cells for similarity analysis.")
+    analysis_results_list$sim_hist_plot <- ggplot2::ggplot() + 
+      ggplot2::annotate("text", x = 0.5, y = 0.5, label = "No valid similarities to plot") + 
+      ggplot2::theme_void()
+    return(analysis_results_list)
+  }
+  
+  message("Analysis of Non-Zero Similarities:")
+  message("  Range: [", round(min(non_zero_sims), 3), ", ", round(max(non_zero_sims), 3), "]")
+  message("  Median: ", round(median(non_zero_sims), 3))
+  message("  Mean: ", round(mean(non_zero_sims), 3))
+  
+  analysis_results_list$min_sim <- round(min(non_zero_sims), 3)
+  analysis_results_list$max_sim <- round(max(non_zero_sims), 3)
+  analysis_results_list$mean_sim <- round(mean(non_zero_sims), 3)
+  analysis_results_list$median_sim <- round(median(non_zero_sims), 3)
+  
+  # --- 3. Histogram/Density Plot of non-zero similarities ---
+  # Adjust binwidth dynamically based on range, but cap it.
+  sim_range <- max(non_zero_sims) - min(non_zero_sims)
+  binwidth <- if (sim_range > 0) min(0.05, sim_range / 10) else 0.05
+  if (binwidth <= 0) binwidth <- 0.05 # Ensure binwidth is positive
+
+  sim_hist_plot <- ggplot2::ggplot(data.table::data.table(sim = non_zero_sims), ggplot2::aes(x = sim)) +
+    ggplot2::geom_histogram(aes(y = ..density..), binwidth = binwidth, fill = "skyblue", alpha = 0.7, color = "black") + 
+    ggplot2::geom_density(alpha = 0.4, fill = "blue") +
+    ggplot2::labs(title = paste0(modality_name, ": Similarity Distribution\n",
+                                 graph_method, " (k=", k_neighbors, ", Decay: ", similarity_decay, ")"),
+                  x = "Similarity Score", y = "Density") +
+    ggplot2::theme_minimal() +
+    ggplot2::theme(plot.title = ggplot2::element_text(hjust = 0.5, size = 10))
+  
+  analysis_results_list$sim_hist_plot <- sim_hist_plot
+  
+  return(analysis_results_list)
+}
+
+# --- Analysis of ATAC Gene Activity Matrix ---
+message("\n--- Analyzing ATAC Gene Activity Matrix ---")
+if (exists("atac_gene_activity_matrix") && !is.null(atac_gene_activity_matrix) && nrow(atac_gene_activity_matrix) > 0 && ncol(atac_gene_activity_matrix) > 0) {
+  
+  n_atac_cells <- nrow(atac_gene_activity_matrix)
+  n_atac_genes <- ncol(atac_gene_activity_matrix)
+  
+  # Calculate sparsity of the gene activity matrix
+  num_non_zero_atac_entries <- Matrix::nnzero(atac_gene_activity_matrix)
+  sparsity_atac_zeros <- 100 * (1 - num_non_zero_atac_entries / (n_atac_cells * n_atac_genes))
+  
+  message("ATAC Gene Activity Matrix Dimensions: ", n_atac_cells, "x", n_atac_genes)
+  message("Number of non-zero gene activity entries: ", num_non_zero_atac_entries)
+  message("ATAC Gene Activity Sparsity (zeros): ", round(sparsity_atac_zeros, 2), "%")
+  
+  # Gene activity per cell
+  genes_per_cell_atac <- Matrix::rowSums(atac_gene_activity_matrix > 0)
+  message("Average genes with non-zero activity per cell: ", round(mean(genes_per_cell_atac), 2))
+  message("Median genes with non-zero activity per cell: ", round(median(genes_per_cell_atac), 2))
+  
+  # Distribution of gene activity scores (non-zero values)
+  atac_gene_activity_scores <- atac_gene_activity_matrix@x # Access non-zero values
+  
+  if (length(atac_gene_activity_scores) > 0) {
+    message("Analysis of ATAC Gene Activity Scores (non-zero):")
+    message("  Range: [", round(min(atac_gene_activity_scores), 3), ", ", round(max(atac_gene_activity_scores), 3), "]")
+    message("  Median: ", round(median(atac_gene_activity_scores), 3))
+    message("  Mean: ", round(mean(atac_gene_activity_scores), 3))
+    
+    # Plot distribution of ATAC gene activity scores
+    activity_score_plot <- ggplot2::ggplot(data.table::data.table(score = atac_gene_activity_scores), ggplot2::aes(x = score)) +
+      ggplot2::geom_histogram(aes(y = ..density..), binwidth = 0.1, fill = "lightblue", alpha = 0.7, color = "black") +
+      ggplot2::geom_density(alpha = 0.4, fill = "blue") +
+      ggplot2::labs(title = "Distribution of ATAC Gene Activity Scores (Non-Zero)",
+                    x = "Gene Activity Score", y = "Density") +
+      ggplot2::theme_minimal() +
+      ggplot2::theme(plot.title = ggplot2::element_text(hjust = 0.5))
+    print(activity_score_plot)
+    
+  } else {
+    message("No non-zero ATAC gene activity scores found.")
+  }
+  
+} else {
+  message("ATAC gene activity matrix not found or is empty. Skipping analysis.")
+}
+
+# --- Analysis of ATAC PCA ---
+message("\n--- Analyzing ATAC PCA ---")
+# 'atac_pca_res' should be available if createATACCellGraph was run successfully.
+# It is returned by irlba::prcomp_irlba. Assuming it's named 'atac_pca_res'.
+if (exists("atac_pca_res") && !is.null(atac_pca_res) && !is.null(atac_pca_res$sdev)) {
+  # Variance explained by each PC
+  var_explained_atac <- atac_pca_res$sdev^2 / sum(atac_pca_res$sdev^2)
+  
+  # Plot elbow plot for ATAC PCA
+  atac_pca_elbow_plot <- ggplot2::ggplot(data.table::data.table(PC = seq_along(var_explained_atac), Variance = var_explained_atac), ggplot2::aes(x = PC, y = Variance)) +
+    ggplot2::geom_point(size = 3, color = "darkblue") +
+    ggplot2::geom_line(color = "darkblue") +
+    ggplot2::labs(title = "ATAC PCA Variance Explained", x = "Principal Component", y = "Proportion of Variance Explained") +
+    ggplot2::theme_minimal() +
+    ggplot2::theme(plot.title = ggplot2::element_text(hjust = 0.5))
+  
+  message("First 5 PCs explain: ", paste(round(var_explained_atac[1:5]*100, 2), "%", collapse = ", "))
+  print(atac_pca_elbow_plot)
+  
+} else {
+  message("ATAC PCA results ('atac_pca_res') not found or not properly computed. Skipping PCA analysis.")
+  message("Ensure that 'createATACCellGraph' correctly stores and makes 'atac_pca_res' available if you want to analyze it.")
+}
+
+# --- Storing Graph Construction Info ---
+graph_construction_details <- list()
+
+# RNA Graph Info
+rna_method <- "PCA + kNN + Gaussian Similarity"
+rna_similarity_decay <- "Gaussian"
+rna_graph_params_details <- list(
+  k_neighbors = graph_params$rna_feature_k_neighbors,
+  pca_dims = graph_params$rna_feature_dims # Representing PC usage
+)
+# Populate RNA PCA variance if available from Seurat object
+if (!is.null(seurat_obj_rna_preprocessed) && !is.null(seurat_obj_rna_preprocessed@reductions$pca)) {
+  rna_pca_obj <- seurat_obj_rna_preprocessed@reductions$pca
+  if (!is.null(rna_pca_obj) && !is.null(rna_pca_obj@stdev)) {
+    rna_var_explained <- rna_pca_obj@stdev^2 / sum(rna_pca_obj@stdev^2)
+    dims_for_rna <- graph_params$rna_feature_dims
+    if (length(dims_for_rna) > 0 && !is.null(dims_for_rna) && length(rna_var_explained) >= max(dims_for_rna)) {
+      rna_graph_params_details$pca_variance_explained <- rna_var_explained[dims_for_rna]
+    } else {
+      rna_graph_params_details$pca_variance_explained <- rna_var_explained
+    }
+  }
+}
+graph_construction_details$RNA <- list(method = rna_method, similarity_decay = rna_similarity_decay, params = rna_graph_params_details)
+
+
+# ATAC Graph Info
+# NOW CHANGED TO MATCH RNA'S GAUSSIAN KERNEL APPROACH
+atac_method <- "Gene Activity + PCA + kNN + Gaussian Similarity"
+atac_similarity_decay <- "Gaussian" # Changed to Gaussian
+atac_graph_params_details <- list(
+  pca_dims = graph_params$atac_pca_dims,
+  k_neighbors = graph_params$atac_k_neighbors
+)
+# Populate ATAC PCA variance if available (assuming 'atac_pca_res' is created and stored in the environment)
+if (exists("atac_pca_res") && !is.null(atac_pca_res) && !is.null(atac_pca_res$sdev)) {
+  var_explained_atac <- atac_pca_res$sdev^2 / sum(atac_pca_res$sdev^2)
+  dims_for_atac <- graph_params$atac_pca_dims
+  if (length(dims_for_atac) > 0 && !is.null(dims_for_atac) && length(var_explained_atac) >= max(dims_for_atac)) {
+    atac_graph_params_details$pca_variance_explained <- var_explained_atac[dims_for_atac]
+  } else {
+    atac_graph_params_details$pca_variance_explained <- var_explained_atac
+  }
+}
+graph_construction_details$ATAC <- list(method = atac_method, similarity_decay = atac_similarity_decay, params = atac_graph_params_details)
+
+
+# --- Analyze Graphs and Store Results ---
+analysis_results <- list()
+
+# RNA Graph Analysis
+if (exists("rna_graph") && !is.null(rna_graph) && Matrix::nnzero(rna_graph) > 0) {
+  analysis_results$RNA <- analyze_feature_graph(
+    graph = rna_graph,
+    modality_name = "RNA",
+    k_neighbors = graph_params$rna_feature_k_neighbors, # Pass k
+    graph_method = graph_construction_details$RNA$method, # Pass method
+    similarity_decay = graph_construction_details$RNA$similarity_decay # Pass decay
+  )
+  analysis_results$RNA$construction_info <- graph_construction_details$RNA # Store detailed params
+} else {
+  message("RNA graph is missing or empty. Skipping its analysis.")
+}
+
+# ATAC Graph Analysis
+if (exists("atac_graph") && !is.null(atac_graph) && Matrix::nnzero(atac_graph) > 0) {
+  analysis_results$ATAC <- analyze_feature_graph(
+    graph = atac_graph,
+    modality_name = "ATAC",
+    k_neighbors = graph_params$atac_k_neighbors, # Pass k
+    graph_method = graph_construction_details$ATAC$method, # Use the updated ATAC method description
+    similarity_decay = graph_construction_details$ATAC$similarity_decay # Use the updated ATAC decay
+  )
+  analysis_results$ATAC$construction_info <- graph_construction_details$ATAC # Store detailed params
+} else {
+  message("ATAC graph is missing or empty. Skipping its analysis.")
+}
+
+# --- Compile and Print Summary Table of Graphs ---
+# This section relies on the analysis_results being populated correctly.
+# It will now correctly pull 'k_neighbors', 'method', 'similarity_decay' etc.
+summary_table_graphs <- do.call(rbind, lapply(names(analysis_results), function(mod_name) {
+  res <- analysis_results[[mod_name]]
+  dt <- data.table::data.table(
+    Modality = mod_name,
+    Method = res$graph_method,
+    Sim_Decay = res$similarity_decay,
+    Num_Cells = res$num_cells,
+    Sparsity_Pct_Zeros = res$sparsity_percent_zeros,
+    Num_Edges = res$num_edges,
+    Min_Sim = res$min_sim,
+    Median_Sim = res$median_sim,
+    Mean_Sim = res$mean_sim,
+    Max_Sim = res$max_sim,
+    k_neighbors = res$k_neighbors
+  )
+  # Add PCA dim info if available
+  if (!is.null(res$construction_info$params$pca_dims)) {
+      pca_dims_value <- res$construction_info$params$pca_dims
+      dt[, PCA_Dims := as.character(paste(pca_dims_value, collapse = ","))]
+  } else if (!is.null(res$construction_info$params$dims)) { # For RNA graph
+      dt[, PCA_Dims := paste(res$construction_info$params$dims, collapse = "," )]
+  }
+  else {
+      dt[, PCA_Dims := NA]
+  }
+  return(dt)
+}))
+
+print("--- Feature Graph Construction and Similarity Summary ---")
+print(summary_table_graphs)
+
+# --- Plot Comparison of Similarity Distributions ---
+# This section should also work now, as plot titles are dynamically generated.
+if (!is.null(analysis_results$RNA) && !is.null(analysis_results$ATAC)) {
+  
+  # Extracting data for plotting densities
+  rna_sim_data <- if (!is.null(analysis_results$RNA) && !is.null(analysis_results$RNA$sim_hist_plot) && !is.null(analysis_results$RNA$sim_hist_plot$data)) {
+      analysis_results$RNA$sim_hist_plot$data
+  } else {
+      data.table::data.table(sim = numeric(0), modality = factor(levels = c("RNA", "ATAC")))
+  }
+  atac_sim_data <- if (!is.null(analysis_results$ATAC) && !is.null(analysis_results$ATAC$sim_hist_plot) && !is.null(analysis_results$ATAC$sim_hist_plot$data)) {
+      analysis_results$ATAC$sim_hist_plot$data
+  } else {
+      data.table::data.table(sim = numeric(0), modality = factor(levels = c("RNA", "ATAC")))
+  }
+
+  # Combine sim data, ensure modalities are factors with correct levels
+  combined_sim_dt <- data.table::data.table(
+    sim = c(rna_sim_data$sim, atac_sim_data$sim),
+    modality = factor(rep(c("RNA", "ATAC"), each = nrow(rna_sim_data) + nrow(atac_sim_data)), levels = c("RNA", "ATAC"))
+  )
+  
+  rna_method_short <- gsub(" .*$", "", analysis_results$RNA$method) # e.g., "PCA"
+  atac_method_short <- gsub(" .*$", "", analysis_results$ATAC$method) # e.g., "Gene"
+  
+  sim_comparison_plot <- ggplot2::ggplot(combined_sim_dt, ggplot2::aes(x = sim, color = modality, fill = modality)) +
+    ggplot2::geom_density(alpha = 0.5) +
+    ggplot2::labs(title = paste0("Comparison of Non-Zero Similarity Distributions\n",
+                                 "RNA: ", rna_method_short, " (k=", graph_params$rna_feature_k_neighbors, ") ",
+                                 "ATAC: ", atac_method_short, " (k=", graph_params$atac_k_neighbors, ")"),
+                  x = "Similarity Score", y = "Density") +
+    ggplot2::theme_minimal() +
+    ggplot2::theme(plot.title = ggplot2::element_text(hjust = 0.5, size = 10))
+    
+  print(sim_comparison_plot)
+  
+} else if (!is.null(analysis_results$RNA)) {
+  print(analysis_results$RNA$sim_hist_plot)
+} else if (!is.null(analysis_results$ATAC)) {
+  print(analysis_results$ATAC$sim_hist_plot)
+}
+
+# --- Interpretation Guidance ---
+message("\n--- Interpretation Guidance ---")
+message("1. Graph Construction Parameters:")
+message("   - Compare 'PCA_Dims', 'k_neighbors', 'Method', 'Sim_Decay' for RNA vs. ATAC in the summary table.")
+message("   - RNA: Uses PCA on gene expression, kNN with Gaussian similarity, k=", graph_params$rna_feature_k_neighbors)
+message("   - ATAC: Uses Gene Activity + PCA on ATAC data, kNN with Gaussian similarity, k=", graph_params$atac_k_neighbors)
+message("   - Note the similar use of Gaussian kernel and PCA, allowing for more direct comparison of connectivity patterns.")
+message("2. Sparsity and Edge Count:")
+message("   - High 'Sparsity_Pct_Zeros' or low 'Num_Edges' means the graph is sparse/disconnected.")
+message("   - Expect ATAC to potentially remain sparser due to inherent differences in how ATAC profiles relate to cell states.")
+message("3. Similarity Distribution:")
+message("   - After applying the Gaussian kernel, ATAC similarities should now show a broader range, potentially with peaks at high values but less extreme concentration compared to the linear decay.")
+message("   - Compare the shape, peaks, and spread of RNA and ATAC similarity distributions to understand how cell relationships differ between modalities.")
+message("4. ATAC Gene Activity Analysis:")
+message("   - The 'ATAC Gene Activity Matrix' sparsity and 'genes_per_cell_atac' metrics are crucial.")
+message("   - If ATAC has very high sparsity or few active genes per cell, it suggests ATAC profiles might be highly specific, leading to fewer connections even with Gaussian similarity.")
+message("   - The 'ATAC PCA Variance Explained' plot shows how much information is captured by early PCs. This helps justify the chosen `atac_pca_dims`.")
+message("5. Conclusion for PI:")
+message("   - Summarize findings: 'By applying a Gaussian kernel for similarity in ATAC graph construction (similar to RNA), we observed that ATAC connections are still sparser but show a more continuous range of similarities. The RNA graph reflects broader cell relationships, while ATAC highlights tighter connections between cells with highly similar regulatory states.'")
+message("   - Discuss whether these differences align with biological expectations for ATAC vs. RNA data in your context.")
+
+```
