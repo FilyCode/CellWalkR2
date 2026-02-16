@@ -1862,7 +1862,8 @@ assessSpatialGraphCoherenceOverall <- function(
   modality_name = "Modality",
   n_workers = NULL,        # number of parallel workers; NULL -> auto (detectCores - 1)
   batch_size = 1000L,      # batch size for parallel processing
-  n_pca_embed = 50L        # set NA to skip PCA embedding
+  n_pca_embed = 50L,      # set NA to skip PCA embedding
+  neighbor_rank_range = c(1, 10)
 ) {
   
   # --- Dependencies check ---
@@ -1880,6 +1881,16 @@ assessSpatialGraphCoherenceOverall <- function(
   if (is.null(rownames(feature_graph)) || is.null(rownames(spatial_coords_df)) || is.null(colnames(feature_matrix_for_similarity))) {
     stop("All inputs must have matching cell IDs (rownames for graph/spatial, colnames for feature matrix).")
   }
+  if (!is.numeric(neighbor_rank_range) || length(neighbor_rank_range) != 2) {
+    stop("`neighbor_rank_range` must be an integer-like numeric vector of length 2, e.g. c(1,10) or c(11,20).")
+  }
+  neighbor_rank_range <- as.integer(neighbor_rank_range)
+  if (any(neighbor_rank_range < 1) || neighbor_rank_range[1] > neighbor_rank_range[2]) {
+    stop("`neighbor_rank_range` must be positive with neighbor_rank_range[1] <= neighbor_rank_range[2].")
+  }
+  
+   # Derive effective k_neighbors based on neighbor_rank_range upper bound for any internal nn computations
+  required_k_for_internal_nn <- max(k_neighbors, neighbor_rank_range[2])
   
   # Align cell sets
   graph_cell_ids <- rownames(feature_graph)
@@ -2016,11 +2027,22 @@ assessSpatialGraphCoherenceOverall <- function(
     gs[, spatial_distance := sqrt((x1 - x2)^2 + (y1 - y2)^2)]
     
     # Ensure k_neighbors doesn't exceed number of available neighbors for a cell
-    # This can happen if graph is sparse. Use data.table::fcase for conditional head.
-    graph_neighbors_ranked <- gs[, {
-        current_k <- min(k_neighbors, .N) # .N is number of rows in group
-        if (current_k > 0) head(.SD[order(-x)], current_k) else .SD[0]
+    # Rank neighbors globally, then select the subset corresponding to neighbor_rank_range
+    graph_neighbors_ranked_all <- gs[, .SD[order(-x)], by = query_cell_idx]
+    # For each query cell, take rows from neighbor_rank_range[1]..neighbor_rank_range[2] (bounded by available neighbors)
+    graph_neighbors_ranked <- graph_neighbors_ranked_all[, {
+        start_r <- neighbor_rank_range[1]
+        end_r   <- neighbor_rank_range[2]
+        available <- .N
+        if (available < start_r) {
+          # no neighbors in this rank range -> return zero rows
+          .SD[0]
+        } else {
+          end_sel <- min(end_r, available)
+          .SD[start_r:end_sel]
+        }
       }, by = query_cell_idx]
+
     
     if (nrow(graph_neighbors_ranked) > 0) {
         median_spatial_results <- graph_neighbors_ranked[, .(median_dist = median(spatial_distance, na.rm = TRUE)), by = query_cell_idx]
@@ -2053,9 +2075,17 @@ assessSpatialGraphCoherenceOverall <- function(
       i <- sources[ii] # Current cell index
       
       # Get spatial neighbors for cell 'i'
-      raw_targets <- all_nn_idx[i, ]
-      raw_targets <- raw_targets[raw_targets != i & raw_targets > 0] # Remove self, ensure valid indices
-      raw_targets <- head(raw_targets, k_neighbors) # Take top k spatial neighbors
+      # use the same neighbor_rank_range to select spatial neighbors (by rank)
+      raw_targets_full <- all_nn_idx[i, ]
+      raw_targets_full <- raw_targets_full[raw_targets_full != i & raw_targets_full > 0]
+      # select neighbors by the requested rank range
+      sel_start <- neighbor_rank_range[1]
+      sel_end   <- neighbor_rank_range[2]
+      if (length(raw_targets_full) < sel_start) {
+        raw_targets <- integer(0)
+      } else {
+        raw_targets <- raw_targets_full[sel_start:min(sel_end, length(raw_targets_full))]
+      }
       
       if (length(raw_targets) == 0) {
         res_metric2[ii] <- NA_real_
@@ -2230,20 +2260,23 @@ assessSpatialGraphCoherenceOverall <- function(
       coherence_df$combined_coherence_score[valid_idx_for_combined] <- (norm_m1 + norm_m2) / 2
   }
   
+  # create human-readable neighbor range label for titles
+  neighbor_range_label <- paste0("(NN: ", neighbor_rank_range[1], ":", neighbor_rank_range[2], ")")
+  
   # --- Create density plots ---
   plot_dist_spatial_for_graph_nn <- ggplot2::ggplot(coherence_df, ggplot2::aes(x = median_spatial_dist_of_graph_neighbors)) +
     ggplot2::geom_density(fill = "lightblue", alpha = 0.7, na.rm = TRUE) +
-    ggplot2::labs(title = paste0(modality_name, ": Spatial Dist to Feature-Graph NN (k=", k_neighbors, ")"), x = "Median Spatial Distance", y = "Density") +
+    ggplot2::labs(title = paste0(modality_name, ": Spatial Dist to Feature-Graph ", neighbor_range_label), x = "Median Spatial Distance", y = "Density") +
     ggplot2::theme_minimal() + ggplot2::theme(plot.title = ggplot2::element_text(hjust = 0.5))
   
   plot_sim_graph_for_spatial_nn <- ggplot2::ggplot(coherence_df, ggplot2::aes(x = median_graph_sim_of_spatial_neighbors)) +
     ggplot2::geom_density(fill = "lightcoral", alpha = 0.7, na.rm = TRUE) +
-    ggplot2::labs(title = paste0(modality_name, ": Feature Sim to Spatial NN (k=", k_neighbors, ")"), x = "Median Feature Similarity", y = "Density") +
+    ggplot2::labs(title = paste0(modality_name, ": Feature Sim to Spatial  ", neighbor_range_label), x = "Median Feature Similarity", y = "Density") +
     ggplot2::theme_minimal() + ggplot2::theme(plot.title = ggplot2::element_text(hjust = 0.5))
   
   plot_sim_graph_for_graph_nn <- ggplot2::ggplot(coherence_df, ggplot2::aes(x = median_graph_sim_of_graph_neighbors)) +
     ggplot2::geom_density(fill = "lightgreen", alpha = 0.7, na.rm = TRUE) +
-    ggplot2::labs(title = paste0(modality_name, ": Feature Sim to Feature-Graph NN (k=", k_neighbors, ")"), x = "Median Feature Similarity", y = "Density") +
+    ggplot2::labs(title = paste0(modality_name, ": Feature Sim to Feature-Graph  ", neighbor_range_label), x = "Median Feature Similarity", y = "Density") +
     ggplot2::theme_minimal() + ggplot2::theme(plot.title = ggplot2::element_text(hjust = 0.5))
   
   # plot_dist_graph_for_spatial_nn is REMOVED from the output list.
@@ -2315,6 +2348,7 @@ assessSpatialGraphCoherenceOverall <- function(
   diagnostics <- list(
     n_cells = num_cells,
     k_neighbors = k_neighbors,
+    neighbor_rank_range = neighbor_rank_range,
     n_workers = n_workers,
     batch_size = batch_size,
     used_pca_embedding = exists("feature_matrix_embed"),
@@ -2870,24 +2904,33 @@ rna_feature_matrix_for_sim <- GetAssayData(seurat_obj_rna_preprocessed, assay = 
 # for cosine similarity calculation with sparse matrices.
 atac_feature_matrix_for_sim <- t(atac_gene_activity_matrix_final)
 
+# --- Compute coherence for two neighbor rank ranges and compare with Random baseline plots ---
+rangeA <- c(1,10)
+rangeB <- c(11,20)
 
 # --- For RNA ---
-rna_coherence_results <- assessSpatialGraphCoherenceOverall(
+rna_res_A <- assessSpatialGraphCoherenceOverall(
   feature_graph = rna_graph,
-  feature_matrix_for_similarity = rna_feature_matrix_for_sim, 
+  feature_matrix_for_similarity = rna_feature_matrix_for_sim,
   spatial_coords_df = rna_spatial_coords_filtered,
-  k_neighbors = k_coherence_neighbors,
+  k_neighbors = max(rangeA[2], rangeB[2]), # internal k used for some operations; function uses neighbor_rank_range for selection
   modality_name = "RNA",
-  n_workers = 8
+  n_workers = 8,
+  neighbor_rank_range = rangeA
 )
-print(rna_coherence_results$plot_dist_spatial_for_graph_nn)
-print(rna_coherence_results$plot_sim_graph_for_spatial_nn)
-print(rna_coherence_results$plot_sim_graph_for_graph_nn)
-print(rna_coherence_results$plot_spatial_coherence_metrics)
-ggsave("/projectnb/paxlab/phitro/CellWalkR2/R/figure/RNA_plot_dist_spatial_for_graph_nn.png", plot = rna_coherence_results$plot_dist_spatial_for_graph_nn)
-ggsave("/projectnb/paxlab/phitro/CellWalkR2/R/figure/RNA_plot_sim_graph_for_spatial_nn.png", plot = rna_coherence_results$plot_sim_graph_for_spatial_nn)
-ggsave("/projectnb/paxlab/phitro/CellWalkR2/R/figure/RNA_plot_sim_graph_for_graph_nn.png", plot = rna_coherence_results$plot_sim_graph_for_graph_nn)
-ggsave("/projectnb/paxlab/phitro/CellWalkR2/R/figure/RNA_plot_spatial_coherence_metrics.png", plot = rna_coherence_results$plot_spatial_coherence_metrics)
+rna_res_B <- assessSpatialGraphCoherenceOverall(
+  feature_graph = rna_graph,
+  feature_matrix_for_similarity = rna_feature_matrix_for_sim,
+  spatial_coords_df = rna_spatial_coords_filtered,
+  k_neighbors = max(rangeA[2], rangeB[2]),
+  modality_name = "RNA",
+  n_workers = 8,
+  neighbor_rank_range = rangeB
+)
+ggsave("/projectnb/paxlab/phitro/CellWalkR2/R/figure/RNA_plot_dist_spatial_for_graph_nn.png", plot = rna_res_A$plot_dist_spatial_for_graph_nn)
+ggsave("/projectnb/paxlab/phitro/CellWalkR2/R/figure/RNA_plot_sim_graph_for_spatial_nn.png", plot = rna_res_A$plot_sim_graph_for_spatial_nn)
+ggsave("/projectnb/paxlab/phitro/CellWalkR2/R/figure/RNA_plot_sim_graph_for_graph_nn.png", plot = rna_res_A$plot_sim_graph_for_graph_nn)
+ggsave("/projectnb/paxlab/phitro/CellWalkR2/R/figure/RNA_plot_spatial_coherence_metrics.png", plot = rna_res_A$plot_spatial_coherence_metrics)
 
 rna_coherence_results_random <- validateGraphCoherenceWithRandom(
   feature_graph = rna_graph,
@@ -2901,22 +2944,74 @@ print(rna_coherence_results_random$plot_comparison)
 ggsave("/projectnb/paxlab/phitro/CellWalkR2/R/figure/RNA_plot_comparison_rand.png", plot = rna_coherence_results_random$plot_comparison)
 
 
-# --- For ATAC ---
-atac_coherence_results <- assessSpatialGraphCoherenceOverall(
-  feature_graph = atac_graph,
-  feature_matrix_for_similarity = atac_feature_matrix_for_sim, 
-  spatial_coords_df = atac_spatial_coords_filtered,
-  k_neighbors = k_coherence_neighbors,
-  modality_name = "ATAC"
+
+# Combine coherence_df from the two runs and the random baseline
+dfA <- rna_res_A$coherence_df
+dfA$group <- paste0("RNA ", rangeA[1], ":", rangeA[2], " NN")
+dfB <- rna_res_B$coherence_df
+dfB$group <- paste0("RNA ", rangeB[1], ":", rangeB[2], " NN")
+# validateGraphCoherenceWithRandom returns per-graph/random combined df in $coherence_df
+dfRand <- NULL
+if (!is.null(rna_coherence_results_random$coherence_df)) {
+  # rna_coherence_results_random returns rows for both Graph Neighbors and Random Cells; extract Random
+  if ("graph_type" %in% colnames(rna_coherence_results_random$coherence_df)) {
+    dfRand_tmp <- rna_coherence_results_random$coherence_df
+    dfRand_tmp <- dfRand_tmp[dfRand_tmp$graph_type == "Random Cells", , drop = FALSE]
+    dfRand <- data.frame(cell_id = dfRand_tmp$cell_id,
+                         median_spatial_dist_of_graph_neighbors = dfRand_tmp$median_spatial_dist,
+                         median_graph_sim_of_spatial_neighbors = dfRand_tmp$median_graph_sim,
+                         group = paste0("RNA Random"))
+  } else {
+    # fallback: if structure differs, skip
+    dfRand <- NULL
+  }
+}
+
+combined_rna_compare <- dplyr::bind_rows(
+  dfA[, c("cell_id", "median_spatial_dist_of_graph_neighbors", "median_graph_sim_of_spatial_neighbors", "group")],
+  dfB[, c("cell_id", "median_spatial_dist_of_graph_neighbors", "median_graph_sim_of_spatial_neighbors", "group")],
+  dfRand
 )
-print(atac_coherence_results$plot_dist_spatial_for_graph_nn)
-print(atac_coherence_results$plot_sim_graph_for_spatial_nn)
-print(atac_coherence_results$plot_sim_graph_for_graph_nn)
-print(atac_coherence_results$plot_spatial_coherence_metrics)
-ggsave("/projectnb/paxlab/phitro/CellWalkR2/R/figure/ATAC_plot_dist_spatial_for_graph_nn.png", plot = atac_coherence_results$plot_dist_spatial_for_graph_nn)
-ggsave("/projectnb/paxlab/phitro/CellWalkR2/R/figure/ATAC_plot_sim_graph_for_spatial_nn.png", plot = atac_coherence_results$plot_sim_graph_for_spatial_nn)
-ggsave("/projectnb/paxlab/phitro/CellWalkR2/R/figure/ATAC_plot_sim_graph_for_graph_nn.png", plot = atac_coherence_results$plot_sim_graph_for_graph_nn)
-ggsave("/projectnb/paxlab/phitro/CellWalkR2/R/figure/ATAC_plot_spatial_coherence_metrics.png", plot = atac_coherence_results$plot_spatial_coherence_metrics)
+
+# Plot combined densities for RNA
+p_rna_combined_spatial <- ggplot2::ggplot(combined_rna_compare, ggplot2::aes(x = median_spatial_dist_of_graph_neighbors, fill = group)) +
+  ggplot2::geom_density(alpha = 0.5, na.rm = TRUE) +
+  ggplot2::labs(title = "RNA: Median Spatial Distance — Neighbor Rank Ranges vs Random", x = "Median Spatial Distance", y = "Density", fill = "Group") +
+  ggplot2::theme_minimal() + ggplot2::theme(plot.title = ggplot2::element_text(hjust = 0.5))
+print(p_rna_combined_spatial)
+ggsave(file.path(output_dir, "RNA_neighbor_ranges_vs_random_spatial_dist.png"), plot = p_rna_combined_spatial)
+
+p_rna_combined_sim <- ggplot2::ggplot(combined_rna_compare, ggplot2::aes(x = median_graph_sim_of_spatial_neighbors, fill = group)) +
+  ggplot2::geom_density(alpha = 0.5, na.rm = TRUE) +
+  ggplot2::labs(title = "RNA: Median Graph Similarity — Neighbor Rank Ranges vs Random", x = "Median Graph Similarity", y = "Density", fill = "Group") +
+  ggplot2::theme_minimal() + ggplot2::theme(plot.title = ggplot2::element_text(hjust = 0.5))
+print(p_rna_combined_sim)
+ggsave(file.path(output_dir, "RNA_neighbor_ranges_vs_random_graph_sim.png"), plot = p_rna_combined_sim)
+
+
+# --- For ATAC ---
+aatac_res_A <- assessSpatialGraphCoherenceOverall(
+  feature_graph = atac_graph,
+  feature_matrix_for_similarity = atac_feature_matrix_for_sim,
+  spatial_coords_df = atac_spatial_coords_filtered,
+  k_neighbors = max(rangeA[2], rangeB[2]),
+  modality_name = "ATAC",
+  n_workers = 8,
+  neighbor_rank_range = rangeA
+)
+atac_res_B <- assessSpatialGraphCoherenceOverall(
+  feature_graph = atac_graph,
+  feature_matrix_for_similarity = atac_feature_matrix_for_sim,
+  spatial_coords_df = atac_spatial_coords_filtered,
+  k_neighbors = max(rangeA[2], rangeB[2]),
+  modality_name = "ATAC",
+  n_workers = 8,
+  neighbor_rank_range = rangeB
+)
+ggsave("/projectnb/paxlab/phitro/CellWalkR2/R/figure/ATAC_plot_dist_spatial_for_graph_nn.png", plot = aatac_res_A$plot_dist_spatial_for_graph_nn)
+ggsave("/projectnb/paxlab/phitro/CellWalkR2/R/figure/ATAC_plot_sim_graph_for_spatial_nn.png", plot = aatac_res_A$plot_sim_graph_for_spatial_nn)
+ggsave("/projectnb/paxlab/phitro/CellWalkR2/R/figure/ATAC_plot_sim_graph_for_graph_nn.png", plot = aatac_res_A$plot_sim_graph_for_graph_nn)
+ggsave("/projectnb/paxlab/phitro/CellWalkR2/R/figure/ATAC_plot_spatial_coherence_metrics.png", plot = aatac_res_A$plot_spatial_coherence_metrics)
 
 atac_coherence_results_random <- validateGraphCoherenceWithRandom(
   feature_graph = atac_graph,
@@ -2928,6 +3023,42 @@ atac_coherence_results_random <- validateGraphCoherenceWithRandom(
 )
 print(atac_coherence_results_random$plot_comparison)
 ggsave("/projectnb/paxlab/phitro/CellWalkR2/R/figure/ATAC_plot_comparison_rand.png", plot = atac_coherence_results_random$plot_comparison)
+
+dfA_atac <- atac_res_A$coherence_df
+dfA_atac$group <- paste0("ATAC ", rangeA[1], ":", rangeA[2], " NN")
+dfB_atac <- atac_res_B$coherence_df
+dfB_atac$group <- paste0("ATAC ", rangeB[1], ":", rangeB[2], " NN")
+
+dfRand_atac <- NULL
+if (!is.null(atac_coherence_results_random$coherence_df) && "graph_type" %in% colnames(atac_coherence_results_random$coherence_df)) {
+  dfRand_tmp2 <- atac_coherence_results_random$coherence_df
+  dfRand_tmp2 <- dfRand_tmp2[dfRand_tmp2$graph_type == "Random Cells", , drop = FALSE]
+  dfRand_atac <- data.frame(cell_id = dfRand_tmp2$cell_id,
+                            median_spatial_dist_of_graph_neighbors = dfRand_tmp2$median_spatial_dist,
+                            median_graph_sim_of_spatial_neighbors = dfRand_tmp2$median_graph_sim,
+                            group = paste0("ATAC Random"))
+}
+
+combined_atac_compare <- dplyr::bind_rows(
+  dfA_atac[, c("cell_id", "median_spatial_dist_of_graph_neighbors", "median_graph_sim_of_spatial_neighbors", "group")],
+  dfB_atac[, c("cell_id", "median_spatial_dist_of_graph_neighbors", "median_graph_sim_of_spatial_neighbors", "group")],
+  dfRand_atac
+)
+
+p_atac_combined_spatial <- ggplot2::ggplot(combined_atac_compare, ggplot2::aes(x = median_spatial_dist_of_graph_neighbors, fill = group)) +
+  ggplot2::geom_density(alpha = 0.5, na.rm = TRUE) +
+  ggplot2::labs(title = "ATAC: Median Spatial Distance — Neighbor Rank Ranges vs Random", x = "Median Spatial Distance", y = "Density", fill = "Group") +
+  ggplot2::theme_minimal() + ggplot2::theme(plot.title = ggplot2::element_text(hjust = 0.5))
+print(p_atac_combined_spatial)
+ggsave(file.path(output_dir, "ATAC_neighbor_ranges_vs_random_spatial_dist.png"), plot = p_atac_combined_spatial)
+
+p_atac_combined_sim <- ggplot2::ggplot(combined_atac_compare, ggplot2::aes(x = median_graph_sim_of_spatial_neighbors, fill = group)) +
+  ggplot2::geom_density(alpha = 0.5, na.rm = TRUE) +
+  ggplot2::labs(title = "ATAC: Median Graph Similarity — Neighbor Rank Ranges vs Random", x = "Median Graph Similarity", y = "Density", fill = "Group") +
+  ggplot2::theme_minimal() + ggplot2::theme(plot.title = ggplot2::element_text(hjust = 0.5))
+print(p_atac_combined_sim)
+ggsave(file.path(output_dir, "ATAC_neighbor_ranges_vs_random_graph_sim.png"), plot = p_atac_combined_sim)
+
 
 
 # --- Analyze Smoothed RNA Graph ---
