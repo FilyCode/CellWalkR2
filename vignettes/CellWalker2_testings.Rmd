@@ -650,7 +650,7 @@ imputeATACtoRNAbySpatial <- function(rna_spatial_coords, atac_spatial_coords, at
 #' averaged to form a pseudo-bulk profile. A separate pseudo-bulk matrix is
 #' generated for each requested neighborhood size.
 #'
-#' @param seurat_obj Seurat object containing RNA counts (assay = "RNA", slot = "counts").
+#' @param seurat_obj Seurat object containing RNA counts (assay = "RNA", layer = "counts").
 #' @param rna_spatial_coords data.frame with rownames matching RNA cell IDs and
 #'   columns \code{x}, \code{y} giving spatial coordinates.
 #' @param sample_sizes Integer vector of neighborhood sizes (including self) to aggregate,
@@ -671,7 +671,7 @@ simulatePseudoBulkRNA <- function(seurat_obj,
   method <- match.arg(method)
 
   # Extract counts matrix: genes x cells
-  mat <- as.matrix(Seurat::GetAssayData(seurat_obj, assay = "RNA", slot = "counts"))
+  mat <- as.matrix(Seurat::GetAssayData(seurat_obj, assay = "RNA", layer = "counts"))
   cell_ids <- colnames(mat)
 
   # Check and align spatial coordinates
@@ -1639,11 +1639,14 @@ plot_spatial_rna_atac <- function(rna_spatial_coords_df, atac_spatial_coords_df,
 #' @param query_pt_size Numeric, point size for query cells.
 #' @return A ggplot object visualizing query cells, their graph neighbors, and their spatial neighbors.
 #' @export
-plotSpatialGraphCoherence <- function(combined_rna_atac_graph, rna_spatial_coords_df,
-                                      n_query_cells = 5,
-                                      k_top_neighbors = 10, # New parameter
-                                      k_next_neighbors = 10, # New parameter
-                                      background_alpha = 0.05, neighbor_pt_size = 1.8, query_pt_size = 3.5) {
+plotSpatialGraphCoherence <- function(combined_rna_atac_graph,
+                                      rna_spatial_coords_df,
+                                      n_query_cells = 4,
+                                      k_top_neighbors = 10,
+                                      k_next_neighbors = 10,
+                                      background_alpha = 0.05,
+                                      neighbor_pt_size = 1.8,
+                                      query_pt_size = 3.5) {
   # Distinguish Top vs Next neighbor groups, and to visualize overlaps between Graph and Spatial neighbor ranks.
   
   if (nrow(rna_spatial_coords_df) == 0 || nrow(combined_rna_atac_graph) == 0) {
@@ -1720,7 +1723,12 @@ plotSpatialGraphCoherence <- function(combined_rna_atac_graph, rna_spatial_coord
     }
 
     current_query_cells_df_base <- data.frame(
-      cell = cell_ids, query_id = q_id, type_final = "Other", stringsAsFactors = FALSE
+      cell      = cell_ids,
+      x         = rna_spatial_coords_df[cell_ids, "x"],
+      y         = rna_spatial_coords_df[cell_ids, "y"],
+      query_id  = q_id,
+      type_final = "Other",
+      stringsAsFactors = FALSE
     )
     current_query_cells_df_base$type_final[current_query_cells_df_base$cell == q_id] <- "Query"
 
@@ -3009,7 +3017,9 @@ to_bind <- list(
   safe_bind(smoothed_rna_coherence_results_random, "SmoothedRNA_random")
 )
 to_bind <- to_bind[!sapply(to_bind, is.null)]
-if (length(to_bind) > 0) combined_coherence_df <- do.call(rbind, to_bind) else combined_coherence_df <- data.frame()
+if (length(to_bind) > 0) { 
+  combined_coherence_df <- dplyr::bind_rows(Filter(Negate(is.null), to_bind))
+} else combined_coherence_df <- data.frame()
 
 # Re-plot combined densities to include Smoothed RNA
 p_joint_spatial_dist <- ggplot(combined_coherence_df, aes(x = median_spatial_dist_of_graph_neighbors, fill = modality)) +
