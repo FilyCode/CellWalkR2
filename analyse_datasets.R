@@ -121,81 +121,124 @@ analyze_perturbation_signatures_from_anndata <- function(
   }
   
   # --- Iterate OmicSignature objects: extract DE statistics and counts ---
-  for (sig_name in names(omic_collection$OmicSigList)) {
-    sig_obj <- omic_collection$OmicSigList[[sig_name]]
-    difexp <- get_difexp_table(sig_obj)
+  sig_list <- omic_collection$OmicSigList
+  
+  get_pval_col <- function(difexp) {
+    pval_col <- intersect(
+      c("adj.P.Val", "padj", "adj_p", "p_adj", "p.adjust", "FDR"),
+      colnames(difexp)
+    )
+    if (length(pval_col) > 0) pval_col[1] else NULL
+  }
+  
+  # vectorized helper over signatures (no growing lists in the loop)
+  sig_names <- names(sig_list)
+  
+  de_list <- lapply(sig_list, get_difexp_table)
+  
+  # pre‑determine DE column and pval column per signature
+  chosen_cols <- vapply(
+    de_list,
+    FUN.VALUE = character(1),
+    function(difexp) {
+      if (is.null(difexp)) return(NA_character_)
+      de_col_found <- intersect(preferred_de_cols, colnames(difexp))
+      if (length(de_col_found) > 0) {
+        de_col_found[1]
+      } else {
+        numeric_cols <- colnames(difexp)[vapply(difexp, is.numeric, logical(1))]
+        if (length(numeric_cols) == 0) NA_character_ else numeric_cols[1]
+      }
+    }
+  )
+  
+  pval_cols <- vapply(
+    de_list,
+    FUN.VALUE = character(1),
+    function(difexp) {
+      if (is.null(difexp)) return(NA_character_)
+      get_pval_col(difexp)
+    }
+  )
+  
+  # compute summaries and collect DE stats for plotting
+  per_signature_summary <- vector("list", length(sig_list))
+  de_stats_for_plotting_data <- vector("list", length(sig_list))
+  names(per_signature_summary) <- sig_names
+  names(de_stats_for_plotting_data) <- sig_names
+  
+  for (i in seq_along(sig_list)) {
+    sig_name <- sig_names[i]
+    difexp  <- de_list[[i]]
     
     if (is.null(difexp)) {
-      # collect blank summary but continue
-      per_signature_summary[[sig_name]] <- data.frame(signature = sig_name,
-                                                      n_genes = NA_integer_,
-                                                      n_sig_genes = NA_integer_,
-                                                      de_stat_col = NA_character_,
-                                                      trade_approx = NA_real_,
-                                                      stringsAsFactors = FALSE)
+      per_signature_summary[[i]] <- data.frame(
+        signature   = sig_name,
+        n_genes     = NA_integer_,
+        n_sig_genes = NA_integer_,
+        de_stat_col = NA_character_,
+        trade_approx = NA_real_,
+        stringsAsFactors = FALSE
+      )
       next
     }
     
-    # Find which column to use for plotting / stats
-    de_col_found <- intersect(preferred_de_cols, colnames(difexp))
-    if (length(de_col_found) == 0) {
-      # attempt to find any numeric column that looks like a stat
-      numeric_cols <- colnames(difexp)[sapply(difexp, is.numeric)]
-      if (length(numeric_cols) == 0) {
-        warning(sprintf("No numeric DE-stat columns found for signature '%s'; skipping plotting for this signature.", sig_name))
-        per_signature_summary[[sig_name]] <- data.frame(signature = sig_name,
-                                                        n_genes = nrow(difexp),
-                                                        n_sig_genes = NA_integer_,
-                                                        de_stat_col = NA_character_,
-                                                        trade_approx = NA_real_,
-                                                        stringsAsFactors = FALSE)
-        next
-      } else {
-        chosen_col <- numeric_cols[1]
-      }
-    } else {
-      chosen_col <- de_col_found[1]
+    chosen_col <- chosen_cols[i]
+    if (is.na(chosen_col) || !(chosen_col %in% colnames(difexp))) {
+      per_signature_summary[[i]] <- data.frame(
+        signature   = sig_name,
+        n_genes     = nrow(difexp),
+        n_sig_genes = NA_integer_,
+        de_stat_col = NA_character_,
+        trade_approx = NA_real_,
+        stringsAsFactors = FALSE
+      )
+      next
     }
     
-    # Ensure adjusted p-value column exists (common names)
-    pval_col <- intersect(c("adj.P.Val", "padj", "adj_p", "p_adj", "p.adjust", "FDR"), colnames(difexp))
-    pval_col <- if (length(pval_col) > 0) pval_col[1] else NULL
-    
-    # Collect DE stat vector and prepare for plotting
+    pval_col <- pval_cols[i]
     de_vec <- difexp[[chosen_col]]
-    # filter NAs
     de_vec <- de_vec[!is.na(de_vec)]
     
-    # Store DE statistics for density plotting if sufficient data exists
     if (length(de_vec) > 2) {
-      de_stats_for_plotting_data[[sig_name]] <- data.frame(signature = sig_name, de_statistic = de_vec, stringsAsFactors = FALSE)
-    }
-    
-    # Count affected genes using adjusted p-value if available, else use effect-size threshold
-    if (!is.null(pval_col)) {
-      sig_count <- sum(!is.na(difexp[[pval_col]]) & difexp[[pval_col]] <= adj_p_threshold)
+      de_stats_for_plotting_data[[i]] <- data.frame(
+        signature = sig_name,
+        de_statistic = de_vec,
+        stringsAsFactors = FALSE
+      )
     } else {
-      # fallback threshold: abs(effect) >= 1 (loosish)
-      sig_count <- sum(!is.na(difexp[[chosen_col]]) & abs(difexp[[chosen_col]]) >= 1)
+      de_stats_for_plotting_data[[i]] <- NULL
     }
     
-    # TRADE-like approximate metric: proportion of genes with |effect| > median(|effect|) + 2*sd(|effect|)
+    if (!is.na(pval_col) && pval_col %in% colnames(difexp)) {
+      pvals <- difexp[[pval_col]]
+      sig_count <- sum(!is.na(pvals) & pvals <= adj_p_threshold)
+    } else {
+      eff <- difexp[[chosen_col]]
+      sig_count <- sum(!is.na(eff) & abs(eff) >= 1)
+    }
+    
     trade_approx_val <- NA_real_
     if (compute_trade_approx && length(de_vec) >= 10) {
       abs_effects <- abs(de_vec)
-      thr <- stats::median(abs_effects, na.rm = TRUE) + 2 * stats::sd(abs_effects, na.rm = TRUE)
-      trade_approx_val <- mean(abs_effects > thr, na.rm = TRUE) # proportion of genes with large effect
+      md  <- stats::median(abs_effects)
+      sdd <- stats::sd(abs_effects)
+      thr <- md + 2 * sdd
+      trade_approx_val <- mean(abs_effects > thr)
     }
     
-    per_signature_summary[[sig_name]] <- data.frame(signature = sig_name,
-                                                    n_genes = nrow(difexp),
-                                                    n_sig_genes = sig_count,
-                                                    de_stat_col = chosen_col,
-                                                    trade_approx = trade_approx_val,
-                                                    stringsAsFactors = FALSE)
-  } # end signature loop
+    per_signature_summary[[i]] <- data.frame(
+      signature   = sig_name,
+      n_genes     = nrow(difexp),
+      n_sig_genes = sig_count,
+      de_stat_col = chosen_col,
+      trade_approx = trade_approx_val,
+      stringsAsFactors = FALSE
+    )
+  }
   
-  # Combine signature summaries into a data.frame
+  de_stats_for_plotting_data <- Filter(Negate(is.null), de_stats_for_plotting_data)
+  
   all_de_results_summary_df <- if (length(per_signature_summary) > 0) {
     dplyr::bind_rows(per_signature_summary)
   } else {
@@ -217,31 +260,38 @@ analyze_perturbation_signatures_from_anndata <- function(
     
     # Compute density estimates for each signature on a common grid
     all_vals <- plot_data_all$de_statistic
-    grid_x <- seq(stats::quantile(all_vals, 0.005, na.rm = TRUE),
-                  stats::quantile(all_vals, 0.995, na.rm = TRUE),
-                  length.out = 512)
+    grid_x <- seq(
+      stats::quantile(all_vals, 0.005, na.rm = TRUE),
+      stats::quantile(all_vals, 0.995, na.rm = TRUE),
+      length.out = 512
+    )
     
-    # Helper to get density on grid for a df
-    get_density_on_grid <- function(df, xcol = "de_statistic", grid = grid_x) {
-      v <- df[[xcol]]
+    get_density_on_grid <- function(v, grid = grid_x) {
       v <- v[!is.na(v)]
       if (length(v) < 5) return(rep(NA_real_, length(grid)))
-      # Using bw = "nrd0" is a common default bandwidth selection
       d <- stats::density(v, from = min(grid), to = max(grid), n = length(grid), bw = "nrd0")
-      # Interpolate to ensure values match the grid exactly
-      density_vals <- approx(d$x, d$y, xout = grid, rule = 2)$y
-      return(density_vals)
+      # d$x should already be ~grid; avoid approx() for speed
+      d$y
     }
     
-    # Build matrix: rows = signatures, cols = grid points
-    sig_names <- names(de_stats_for_plotting_data)
-    dens_mat <- t(sapply(sig_names, function(s) get_density_on_grid(de_stats_for_plotting_data[[s]], "de_statistic", grid_x)))
-    rownames(dens_mat) <- sig_names
+    sig_names_plot <- names(de_stats_for_plotting_data)
     
-    # Compute summary stats across signatures at each x: mean, 10th/90th percentiles
-    mean_density <- apply(dens_mat, 2, mean, na.rm = TRUE)
-    q10_density <- apply(dens_mat, 2, stats::quantile, probs = 0.10, na.rm = TRUE)
-    q90_density <- apply(dens_mat, 2, stats::quantile, probs = 0.90, na.rm = TRUE)
+    # pre‑extract vectors to avoid repeated data.frame indexing
+    dens_mat <- matrix(
+      NA_real_,
+      nrow = length(sig_names_plot),
+      ncol = length(grid_x),
+      dimnames = list(sig_names_plot, NULL)
+    )
+    
+    for (i in seq_along(sig_names_plot)) {
+      s <- sig_names_plot[i]
+      dens_mat[i, ] <- get_density_on_grid(de_stats_for_plotting_data[[s]]$de_statistic, grid_x)
+    }
+    
+    mean_density <- colMeans(dens_mat, na.rm = TRUE)
+    q10_density  <- apply(dens_mat, 2, stats::quantile, probs = 0.10, na.rm = TRUE)
+    q90_density  <- apply(dens_mat, 2, stats::quantile, probs = 0.90, na.rm = TRUE)
     
     density_summary_df <- data.frame(x = grid_x,
                                      mean_density = mean_density,
@@ -369,97 +419,59 @@ analyze_perturbation_signatures_from_anndata <- function(
       pca_mat <- NULL
       if (!is.null(pca_key) && pca_key %in% adata$obsm_keys()) {
         pca_mat <- adata$obsm[[pca_key]]
-        message(sprintf("Using pre-computed PCA '%s' from AnnData '%s'.", pca_key, adnm))
         if (ncol(pca_mat) > e_distance_pc) {
-          pca_mat <- pca_mat[, 1:e_distance_pc, drop = FALSE]
+          pca_mat <- pca_mat[, seq_len(e_distance_pc), drop = FALSE]
         }
       } else if (!is.null(adata$X)) {
-        message(sprintf("PCA key '%s' not found or NULL in AnnData '%s'. Attempting to compute PCA from adata$X.", pca_key, adnm))
-        
         target_pcs_to_compute <- min(e_distance_pc, max_pcs_compute)
         
         X <- adata$X
-        pca_mat <- NULL
+        # ensure matrix / sparseMatrix once
+        if (inherits(X, "python.builtin.object")) {
+          X_input <- as.matrix(X)
+        } else if (is.matrix(X) || inherits(X, "sparseMatrix")) {
+          X_input <- X
+        } else {
+          X_input <- as.matrix(X)
+        }
         
-        tryCatch({
-          if (inherits(X, "python.builtin.object")) {
-            X_input <- as.matrix(X)
-          } else if (is.matrix(X) || inherits(X, "sparseMatrix")) {
-            X_input <- X
-          } else {
-            X_input <- as.matrix(X)
+        n_cells  <- nrow(X_input)
+        n_genes  <- ncol(X_input)
+        if (n_cells < 2L || target_pcs_to_compute < 1L) {
+          warning(sprintf(
+            "Cannot compute PCA for AnnData '%s' (cells=%d, pcs=%d).",
+            adnm, n_cells, target_pcs_to_compute
+          ))
+          next
+        }
+        
+        is_sparse_r <- inherits(X_input, "sparseMatrix")
+        if (!is_sparse_r) {
+          # cheap sparsity check; avoid sum(X == 0) for huge matrices
+          sample_idx <- matrix(
+            sample.int(length(X_input), min(1e6L, length(X_input))),
+            ncol = 1
+          )
+          sparsity_est <- mean(X_input[sample_idx] == 0)
+          if (sparsity_est > 0.95) {
+            X_input <- Matrix::Matrix(X_input, sparse = TRUE)
+            is_sparse_r <- TRUE
           }
-          
-          is_sparse_r <- inherits(X_input, "sparseMatrix")
-          
-          if (is_sparse_r) {
-            message(sprintf("adata$X in '%s' is sparse. Using irlba for PCA.", adnm))
-            if (nrow(X_input) < 2) {
-              warning("Cannot compute PCA with fewer than 2 cells.")
-              next
-            }
-            col_means <- Matrix::colMeans(X_input)
-            X_centered <- sweep(X_input, 2, col_means, "-")
-            
-            actual_npc_to_compute <- min(nrow(X_input), ncol(X_input), target_pcs_to_compute)
-            if (actual_npc_to_compute < 1) {
-              warning(sprintf("Cannot compute PCA for AnnData '%s' (insufficient dimensions or requested PCs < 1); skipping E-distance for this object.", adnm))
-              next
-            }
-            
-            svd_res <- irlba::irlba(X_centered, nv = actual_npc_to_compute, maxiter = 1000, tol = 1e-6)
-            pca_mat <- X_centered %*% svd_res$v[, 1:actual_npc_to_compute, drop = FALSE]
-            message(sprintf("Computed PCA from sparse adata$X for '%s' (used %d PCs, requested %d).", adnm, actual_npc_to_compute, target_pcs_to_compute))
-            
-          } else {
-            sparsity_threshold <- 0.95 
-            num_zeros <- sum(X_input == 0)
-            sparsity <- num_zeros / length(X_input)
-            
-            if (sparsity > sparsity_threshold) {
-              message(sprintf("Dense adata$X in '%s' is highly sparse (%.2f%% zeros). Converting to sparse format and using irlba.", adnm, sparsity * 100))
-              X_sparse <- Matrix::Matrix(X_input, sparse = TRUE)
-              if (nrow(X_sparse) < 2) {
-                warning("Cannot compute PCA with fewer than 2 cells.")
-                next
-              }
-              col_means_sparse <- Matrix::colMeans(X_sparse)
-              X_centered_sparse <- sweep(X_sparse, 2, col_means_sparse, "-")
-              
-              actual_npc_to_compute <- min(nrow(X_sparse), ncol(X_sparse), target_pcs_to_compute)
-              if (actual_npc_to_compute < 1) {
-                warning(sprintf("Cannot compute PCA for AnnData '%s' (insufficient dimensions or requested PCs < 1); skipping E-distance for this object.", adnm))
-                next
-              }
-              
-              svd_res <- irlba::irlba(X_centered_sparse, nv = actual_npc_to_compute, maxiter = 1000, tol = 1e-6)
-              pca_mat <- X_centered_sparse %*% svd_res$v[, 1:actual_npc_to_compute, drop = FALSE]
-              message(sprintf("Computed PCA from converted-sparse adata$X for '%s' (used %d PCs, requested %d).", adnm, actual_npc_to_compute, target_pcs_to_compute))
-              
-            } else {
-              message(sprintf("Dense adata$X in '%s' (sparsity %.2f%%) is not highly sparse. Using irlba directly on dense matrix for PCA.", adnm, sparsity * 100))
-              if (nrow(X_input) < 2) {
-                warning("Cannot compute PCA with fewer than 2 cells.")
-                next
-              }
-              col_means_dense <- colMeans(X_input)
-              X_centered_dense <- X_input - matrix(col_means_dense, nrow = nrow(X_input), ncol = ncol(X_input), byrow = TRUE)
-              
-              actual_npc_to_compute <- min(ncol(X_input), nrow(X_input), target_pcs_to_compute)
-              if (actual_npc_to_compute < 1) {
-                warning(sprintf("Cannot compute PCA for AnnData '%s' (too few dimensions or requested PCs < 1); skipping E-distance for this object.", adnm))
-                next
-              }
-              
-              svd_res <- irlba::irlba(X_centered_dense, nv = actual_npc_to_compute, maxiter = 1000, tol = 1e-6)
-              pca_mat <- X_centered_dense %*% svd_res$v[, 1:actual_npc_to_compute, drop = FALSE]
-              message(sprintf("Computed PCA from dense adata$X for '%s' (used %d PCs, requested %d).", adnm, actual_npc_to_compute, target_pcs_to_compute))
-            }
-          }
-        }, error = function(e) {
-          warning(sprintf("Failed to compute PCA from AnnData$X for '%s': %s", adnm, e$message))
-          pca_mat <- NULL
-        })
+        }
+        
+        if (is_sparse_r) {
+          col_means <- Matrix::colMeans(X_input)
+          X_centered <- X_input
+          X_centered@x <- X_centered@x - rep(col_means, diff(X_centered@p))
+        } else {
+          col_means <- colMeans(X_input)
+          X_centered <- sweep(X_input, 2, col_means, "-")
+        }
+        
+        actual_npc_to_compute <- min(n_cells, n_genes, target_pcs_to_compute)
+        
+        svd_res <- irlba::irlba(X_centered, nv = actual_npc_to_compute, maxiter = 1000, tol = 1e-6)
+        pca_mat <- X_centered %*% svd_res$v[, seq_len(actual_npc_to_compute), drop = FALSE]
       } else {
         warning(sprintf("No PCA key '%s' and no AnnData$X present for '%s' — cannot compute E-distance.", pca_key, adnm))
       }
@@ -481,58 +493,44 @@ analyze_perturbation_signatures_from_anndata <- function(
         next
       }
       
-      # Compute E-distance using energy::eudist + formula:
-      # E(X, Y) = 2 * mean(||X - Y||) - mean(||X - X'||) - mean(||Y - Y'||)
+      # Compute E-distance once per perturbation vs control per AnnData
       obs_col_chr <- as.character(obs_col)
-      candidate_groups <- intersect(unique(obs_col_chr), valid_groups)
+      ctrl_idx <- which(obs_col_chr == control_group_label)
+      if (length(ctrl_idx) < min_cells_for_e_distance) {
+        warning(sprintf(
+          "Control group '%s' has too few cells (%d) in '%s'; skipping.",
+          control_group_label, length(ctrl_idx), adnm
+        ))
+        next
+      }
       
-      for (grp in setdiff(candidate_groups, control_group_label)) {
+      ctrl_pcs <- pca_mat_subset[ctrl_idx, , drop = FALSE]
+      
+      grp_tab <- table(obs_col_chr)
+      valid_groups <- names(grp_tab[grp_tab >= min_cells_for_e_distance])
+      candidate_groups <- setdiff(intersect(valid_groups, unique(obs_col_chr)), control_group_label)
+      
+      for (grp in candidate_groups) {
         pert_idx <- which(obs_col_chr == grp)
-        ctrl_idx <- which(obs_col_chr == control_group_label)
-        
-        if (length(pert_idx) < min_cells_for_e_distance || length(ctrl_idx) < min_cells_for_e_distance) {
-          next
-        }
+        if (length(pert_idx) < min_cells_for_e_distance) next
         
         pert_pcs <- pca_mat_subset[pert_idx, , drop = FALSE]
-        ctrl_pcs <- pca_mat_subset[ctrl_idx, , drop = FALSE]
         
         ed_val <- tryCatch({
           combined_pcs <- rbind(pert_pcs, ctrl_pcs)
-          
-          # Compute the full Euclidean distance matrix for the combined data
-          dist_matrix_combined <- as.matrix(stats::dist(combined_pcs))
-          
-          # Extract the relevant sub-matrices:
           n_pert <- nrow(pert_pcs)
           n_ctrl <- nrow(ctrl_pcs)
           
-          # d_xy: pairwise distances between perturbation group (first n_pert rows)
-          #       and control group (next n_ctrl rows).
-          d_xy <- dist_matrix_combined[1:n_pert, (n_pert + 1):(n_pert + n_ctrl), drop = FALSE]
-          
-          # d_xx: distances within the perturbation group.
-          d_xx <- dist_matrix_combined[1:n_pert, 1:n_pert, drop = FALSE]
-          
-          # d_yy: distances within the control group.
-          d_yy <- dist_matrix_combined[(n_pert + 1):(n_pert + n_ctrl), (n_pert + 1):(n_pert + n_ctrl), drop = FALSE]
-
-          # off-diagonal means for within distances
-          # mean() on a matrix calculates the mean of all its elements.
-          # We need to exclude the diagonal elements for d_xx and d_yy before averaging.
-          mean_xy <- mean(d_xy)
-          mean_xx <- mean(d_xx[row(d_xx) != col(d_xx)]) # Excludes diagonal elements
-          mean_yy <- mean(d_yy[row(d_yy) != col(d_yy)]) # Excludes diagonal elements
-          
-          # Calculate the energy distance component using the formula
-          2 * mean_xy - mean_xx - mean_yy
-          
+          dmat <- stats::dist(combined_pcs)
+          ed_res <- energy::edist(dmat, sizes = c(n_pert, n_ctrl), distance = TRUE, alpha = 1)
+          ed_numeric <- as.numeric(ed_res)
+          if (!length(ed_numeric)) NA_real_ else pmax(ed_numeric, 0)
         }, error = function(e) {
           warning(sprintf("Error computing energy distance for group '%s' in '%s': %s", grp, adnm, e$message))
-          NA_real_ # Return NA if computation fails
+          NA_real_
         })
         
-        e_dist_results[[paste0(grp, "_", adnm)]] <- data.frame(
+        e_dist_results[[length(e_dist_results) + 1L]] <- data.frame(
           perturbation = grp,
           annobj = adnm,
           energy_distance = ed_val,
@@ -660,6 +658,7 @@ e_dist_fig <- function(e_distances_df) {
 # Load the OmicSignatureCollection
 # Ensure the path is correct and the file exists.
 omic_collection <- readRDS("/restricted/projectnb/agedisease/projects/challenge2025/results/perturbational_omic_sigs/replogle_2022/Replogle_Perturb_Combined_OmicSignatureCollection.rds")
+output_dir = "/restricted/projectnb/agedisease/projects/challenge2025/results/perturbational_omic_sigs/replogle_2022"
 
 # Define paths to AnnData objects
 k562_h5ad_path <- "/restricted/projectnb/agedisease/CBMrepositoryData/replogle_2022/K562_essential_raw_singlecell_01.h5ad"
@@ -695,12 +694,16 @@ if (!is.null(results$e_distances) && nrow(results$e_distances) > 0) {
   if (!is.null(e_dist_plots)) {
     print("Energy distance dot plot:")
     print(e_dist_plots$dot)
+    ggsave(paste0(output_dir, "/e_dist_dotplot.png"), e_dist_plots$dot)
     
     print("Energy distance distribution per AnnData object:")
     print(e_dist_plots$violin)
+    ggsave(paste0(output_dir, "/e_dist_violinplot.png"), e_dist_plots$violin)
     
     print("Top perturbations by energy distance:")
     print(e_dist_plots$top_bar)
+    ggsave(paste0(output_dir, "/e_dist_barplot.png"), e_dist_plots$top_bar)
+    
   }
   
 } else {
@@ -723,24 +726,32 @@ if (!is.null(results$de_stat_plots) && length(results$de_stat_plots) > 0) {
   if (!is.null(results$de_stat_plots$pooled)) {
     print("Pooled DE statistic density:")
     plot(results$de_stat_plots$pooled)
+    ggsave(paste0(output_dir, "/de_stat_density_pooled.png"), results$de_stat_plots$pooled)
+    
   }
   
   # Display density envelope plot
   if (!is.null(results$de_stat_plots$envelope)) {
     print("DE statistic density envelope:")
     plot(results$de_stat_plots$envelope)
+    ggsave(paste0(output_dir, "/de_stat_density_envelope.png"), results$de_stat_plots$envelope)
+    
   }
   
   # Display representative signature density plots
   if (!is.null(results$de_stat_plots$examples)) {
     print("Representative signature density curves:")
     plot(results$de_stat_plots$examples)
+    ggsave(paste0(output_dir, "/de_stat_density_examples.png"), results$de_stat_plots$examples)
+    
   }
   
   # Display summary metrics plot
   if (!is.null(results$de_stat_plots$summary_metrics)) {
     print("Distribution of number of significant genes per signature:")
     plot(results$de_stat_plots$summary_metrics)
+    ggsave(paste0(output_dir, "/de_stat_summary_metrics.png"), results$de_stat_plots$summary_metrics)
+    
   }
   
 } else {
@@ -751,6 +762,7 @@ if (!is.null(results$de_stat_plots) && length(results$de_stat_plots) > 0) {
 if (!is.null(results$all_de_results_summary) && nrow(results$all_de_results_summary) > 0) {
   print("--- Comprehensive DE Results Summary (first few rows) ---")
   print(head(results$all_de_results_summary))
+
 } else {
   print("--- No comprehensive DE results summary available. ---")
 }

@@ -80,8 +80,8 @@ config <- list(
   gene_mapping_cache_file = "gene_symbol_to_ensembl_map.rds",
   
   # External H5AD data paths for additional gene mapping
-  k562_h5ad_file = "/restricted/projectnb/agedisease/CBMrepositoryData/replogle_2022/K562_essential_raw_singlecell_01.h5ad",
-  rpe1_h5ad_file = "/restricted/projectnb/agedisease/CBMrepositoryData/replogle_2022/rpe1_raw_singlecell_01.h5ad",
+  k562_h5ad_file = "/restricted/projectnb/agedisease/CBMrepositoryData/perturbational_data/replogle_2022/K562_essential_raw_singlecell_01.h5ad",
+  rpe1_h5ad_file = "/restricted/projectnb/agedisease/CBMrepositoryData/perturbational_data/replogle_2022/rpe1_raw_singlecell_01.h5ad",
   
   # Filter parameters for OmicSignature objects (not used in this mapping script)
   adj_p_cutoff = 0.05,
