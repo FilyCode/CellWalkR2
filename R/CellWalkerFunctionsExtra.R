@@ -1,37 +1,52 @@
 # check label Edges and make labelEdges having the same rows as cellGraph
-checkLabelEdges <- function(labelEdges, groups, cellGraph, tips = NULL, suffix = NULL)
-{
-  if(missing(labelEdges) || (!is(labelEdges, "data.frame") & (!is(labelEdges, "matrix") & (!is(labelEdges, "Matrix"))))){
+checkLabelEdges <- function(labelEdges, groups, cellGraph, tips = NULL, suffix = NULL) {
+  if (missing(labelEdges) ||
+      !inherits(labelEdges, c("data.frame", "matrix", "Matrix"))) {
     stop("Must provide a dataframe or matrix of cell-to-label edges")
   }
-  if(is.null(colnames(labelEdges)) || is.null(rownames(labelEdges))){
-    stop("labelEdges must have cell barcodes as rownames and cell type labels as colnames")
+  if (is.null(colnames(labelEdges)) || is.null(rownames(labelEdges))) {
+    stop("labelEdges must have cell barcodes as rownames and labels as colnames")
   }
-  if(!is(groups, 'numeric') || length(groups) != nrow(labelEdges))
-  {
-    stop("groups must be numeric and length of groups must be the same as the number of rows of labelEdges")
+  if (!is.numeric(groups) || length(groups) != nrow(labelEdges)) {
+    stop("groups must be numeric with length = nrow(labelEdges)")
   }
-  #groups = as.numeric(as.factor(groups)) # change groups to numeric
-  names(groups) = rownames(labelEdges)
+
+  names(groups) <- rownames(labelEdges)
   stopifnot("groups contain NA" = all(!is.na(groups)))
 
-  if(nrow(labelEdges) == nrow(cellGraph) && all(rownames(labelEdges) == rownames(cellGraph))) return(list(labelEdges, groups))
-  rowIdx = match(rownames(cellGraph), rownames(labelEdges))
-  if(all(is.na(rowIdx))) warning('no cell barcodes are common in labelEdges and cellGraph')
-  groups = groups[rowIdx]
-  labelEdges = labelEdges[rowIdx, ]
-  groups[is.na(groups)] = 0
-  labelEdges[is.na(labelEdges)] = 0
-  rownames(labelEdges) = names(groups) = rownames(cellGraph)
-  if(!is.null(tips)) {
-    if(!all(tips %in% colnames(labelEdges)))
-    {
-      stop('missing cell-to-label edges for tree tips: ', tips)
-    }
-    labelEdges = labelEdges[, tips]
+  # Early return if already aligned
+  if (nrow(labelEdges) == nrow(cellGraph) &&
+      all(rownames(labelEdges) == rownames(cellGraph))) {
+    return(list(labelEdges, groups))
   }
-  if(!is.null(suffix)) colnames(labelEdges) = paste(colnames(labelEdges), suffix, sep = '_')
-  return(list(labelEdges,groups))
+
+  # Align to cellGraph
+  rowIdx <- match(rownames(cellGraph), rownames(labelEdges))
+  if (all(is.na(rowIdx))) {
+    warning('No common cell barcodes between labelEdges and cellGraph')
+  }
+
+  groups <- groups[rowIdx]
+  labelEdges <- labelEdges[rowIdx, , drop = FALSE]
+  groups[is.na(groups)] <- 0
+  labelEdges[is.na(labelEdges)] <- 0
+  rownames(labelEdges) <- names(groups) <- rownames(cellGraph)
+
+  # Filter to tree tips if provided
+  if (!is.null(tips)) {
+    if (!all(tips %in% colnames(labelEdges))) {
+      stop('Missing cell-to-label edges for tree tips: ',
+           paste(setdiff(tips, colnames(labelEdges)), collapse = ", "))
+    }
+    labelEdges <- labelEdges[, tips, drop = FALSE]
+  }
+
+  # Add suffix if provided
+  if (!is.null(suffix)) {
+    colnames(labelEdges) <- paste(colnames(labelEdges), suffix, sep = '_')
+  }
+
+  return(list(labelEdges, groups))
 }
 
 
@@ -83,7 +98,7 @@ tree2Mat = function(tr,  w_up = 1, w_down = 1, suffix = NULL) {
   A = matrix(0, ll_all, ll_all)
   allCellTypes = c(CellTypes, rep(NA, (length(CellTypes)- 1)))
   edge_sort = tr$edge[order(-tr$edge[,1]), ]
-  for(i in 1:nrow(edge_sort)){ 
+  for(i in 1:nrow(edge_sort)){
     children =  edge_sort[i,]
     A[children[1], children[2]] = w_down
     A[children[2], children[1]] = w_up
@@ -111,44 +126,66 @@ tree2Mat = function(tr,  w_up = 1, w_down = 1, suffix = NULL) {
   list(A, allCellTypes)
 }
 
-simulate_rand0 <- function(labelEdges2)
-{
-  cell_margin = apply(labelEdges2, 1, function(x){
-    x[x > 1] = 1
-    l = sapply(seq(0,1,by = 0.2), function(y) mean(x <= y))
-    c(l[1], rep(diff(l), each = 2)/2)
-  })
-  label_margin = apply(labelEdges2, 2, function(x){
-    x[x > 1] = 1
-    l = sapply(seq(0,1,by = 0.1), function(y) sum(x <= y))
-    c(l[1], diff(l))
-  })
 
-  labelEdges2_rand = matrix(0, nrow(labelEdges2), ncol(labelEdges2))
-  cuts = seq(0,1,by = 0.1)
-  for(j in 1:ncol(label_margin))
-  {
-
-    probs = label_margin[, j]
-    idx = 1:ncol(cell_margin)
-    for(k in length(probs):2)
-    {
-      if(length(idx) == probs[k])
-      {
-        aa = idx
-      }else{
-        aa  = sample(idx, probs[k], prob = cell_margin[k, idx] + 0.01)
-      }
-      if(k > 1)
-      {
-        labelEdges2_rand[aa, j] = runif(length(aa), cuts[k-1], cuts[k])
-      }
-      idx = setdiff(idx, aa)
-    }
-
+# Optimized random permutation with proper edge case handling
+simulate_rand0 <- function(labelEdges2) {
+  # Quick returns for edge cases
+  if (nrow(labelEdges2) <= 1 || ncol(labelEdges2) == 0) {
+    return(labelEdges2)
   }
-  colnames(labelEdges2_rand) = colnames(labelEdges2)
-  rownames(labelEdges2_rand) = rownames(labelEdges2)
+
+  # Vectorized margin computations
+  labelEdges2_capped <- pmin(labelEdges2, 1)
+  cuts <- seq(0, 1, by = 0.1)
+  n_bins <- length(cuts)
+
+  # Cell margins: probability distribution across bins for each cell
+  cell_margin <- apply(labelEdges2_capped, 1, function(x) {
+    cumsum_bins <- sapply(cuts, function(y) mean(x <= y))
+    bin_probs <- diff(c(0, cumsum_bins))
+    rep(bin_probs, each = 2) / 2
+  })
+
+  # Label margins: count of values in each bin for each label
+  label_margin <- apply(labelEdges2_capped, 2, function(x) {
+    cumsum_bins <- sapply(cuts, function(y) sum(x <= y))
+    diff(c(0, cumsum_bins))
+  })
+
+  # Initialize output
+  labelEdges2_rand <- matrix(0, nrow(labelEdges2), ncol(labelEdges2))
+
+  # Assign values by label
+  for (j in seq_len(ncol(labelEdges2))) {
+    probs <- label_margin[, j]
+    idx <- seq_len(nrow(labelEdges2))
+
+    # Iterate through bins from highest to lowest
+    for (k in length(probs):2) {
+      n_needed <- probs[k]
+      if (n_needed == 0 || length(idx) == 0) next
+
+      # Sample cells for this bin
+      if (length(idx) <= n_needed) {
+        sampled_idx <- idx
+      } else {
+        probs_vec <- pmax(cell_margin[k, idx], 1e-10)
+        sampled_idx <- sample(idx, n_needed, prob = probs_vec)
+      }
+
+      # Assign random values within bin range
+      labelEdges2_rand[sampled_idx, j] <- runif(
+        length(sampled_idx),
+        cuts[k - 1],
+        cuts[k]
+      )
+
+      idx <- setdiff(idx, sampled_idx)
+    }
+  }
+
+  # Preserve names
+  dimnames(labelEdges2_rand) <- dimnames(labelEdges2)
   return(labelEdges2_rand)
 }
 
@@ -209,28 +246,41 @@ simulate_rand <- function(labelEdges2) #quantile
   return(labelEdges2_rand)
 }
 
-# compute z score
-compute_zscore <- function(info, info_rand, nround)
-{
-  info_mean = matrix(0, nrow(info), ncol(info))
-  info_var = matrix(0, nrow(info), ncol(info))
-  for(i in 1:nround)
-  {
-    info_mean = info_mean + info_rand[[i]]
-    info_var = info_var + info_rand[[i]]^2
+# Compute Z-score with vectorized operations
+compute_zscore <- function(info, info_rand, nround) {
+  # Input validation
+  if (nround < 1) {
+    stop("nround must be at least 1")
   }
 
-  info_mean = info_mean/nround
-  info_var = info_var/nround
-  info_std = info_var - info_mean^2
-  if(any(info_std < 0)) {
-    message('some of variances are zero or negative when computing Z-score')
-    info_std[info_std < 0] = 0
+  dims <- dim(info)
+  if (any(sapply(info_rand, function(x) !identical(dim(x), dims)))) {
+    stop("All matrices in info_rand must have same dimensions as info")
   }
-  zscore = (info - info_mean)/sqrt(info_std)
-  zscore[zscore <0] = 0
+
+  # Vectorized computation using array operations
+  info_array <- array(unlist(info_rand), dim = c(dims, nround))
+  info_mean <- rowMeans(info_array, dims = 2)
+  info_sq_mean <- rowMeans(info_array^2, dims = 2)
+
+  # Variance: E[X²] - E[X]²
+  info_var <- info_sq_mean - info_mean^2
+
+  # Handle numerical issues
+  if (any(info_var < 0, na.rm = TRUE)) {
+    message('Some variances are negative (numerical precision issue); setting to zero')
+    info_var[info_var < 0] <- 0
+  }
+
+  # Z-score calculation
+  info_std <- sqrt(info_var)
+  info_std[info_std == 0] <- 1  # Avoid division by zero
+  zscore <- (info - info_mean) / info_std
+  zscore[zscore < 0 | is.na(zscore)] <- 0
+
   return(list('zscore' = zscore, 'mean' = info_mean, 'var' = info_var))
 }
+
 
 # Compute Cosine distance on sparse matrix between the rows
 sparseCosine = function(m) {
@@ -389,3 +439,25 @@ convertSeqnames = function(regions, sep = c(':', '-'))
 }
 
 
+# Helper function for convergence checking
+check_convergence <- function(info_rand_list, window = 20, threshold = 0.01) {
+  n <- length(info_rand_list)
+  if (n < 2 * window) return(FALSE)
+
+  # Compare recent vs. previous window
+  recent_idx <- (n - window + 1):n
+  prev_idx <- (n - 2 * window + 1):(n - window)
+
+  recent_mean <- Reduce('+', info_rand_list[recent_idx]) / window
+  prev_mean <- Reduce('+', info_rand_list[prev_idx]) / window
+
+  # Mean absolute difference
+  diff <- mean(abs(recent_mean - prev_mean))
+
+  message(sprintf(
+    "  Convergence check (round %d): MAD = %.6f (threshold = %.6f)",
+    n, diff, threshold
+  ))
+
+  return(diff < threshold)
+}
